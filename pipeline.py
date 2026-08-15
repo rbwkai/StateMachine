@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import asdict
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from generator import (
     CountQuery,
@@ -11,7 +11,9 @@ from generator import (
     build_redo_validity_example,
     select_query,
 )
+
 from analysis import QuerySpec
+
 from render import (
     NameRegistry,
     make_distractor_sentences,
@@ -21,47 +23,80 @@ from render import (
     render_narrative,
     splice_distractors,
 )
+
 from sampler import sample_sequence
+
 from trajectory import (
     build_trajectory_and_gold,
     trajectory_summary,
 )
-from world import Operation, Redo, Undo, replay_trace
+
+from world import (
+    Operation,
+    Redo,
+    Undo,
+    replay_trace,
+)
 
 
-def _op_to_dict(op: Operation) -> Dict:
+# ============================================================
+# Serialization helpers
+# ============================================================
+
+def _op_to_dict(
+    op: Operation,
+) -> Dict[str, Any]:
     """Serialize an Operation into a JSON-safe dictionary."""
+
     d = asdict(op)
     d["type"] = type(op).__name__.upper()
+
     return d
 
 
-def _state_to_dict(state) -> Dict:
+def _state_to_dict(
+    state,
+) -> Dict[str, Any]:
     """Serialize a WorldState into a JSON-safe dictionary."""
+
     return {
         "object_type": dict(
-            sorted(state.object_type.items())
+            sorted(
+                state.object_type.items()
+            )
         ),
         "location": dict(
-            sorted(state.location.items())
+            sorted(
+                state.location.items()
+            )
         ),
-        "containers": sorted(state.containers),
+        "containers": sorted(
+            state.containers
+        ),
         "step_index": state.step_index,
     }
 
+
+# ============================================================
+# Redo trajectory
+# ============================================================
 
 def _build_redo_trajectory(
     ops: Sequence[Operation],
     containers,
     op_sentences: Sequence[str],
-) -> list[Dict]:
+) -> list[Dict[str, Any]]:
     """
     Build the symbolic trajectory for a redo-validity probe.
 
-    Redo-validity is a meta-query about whether a redo operation
-    would be valid, so it does not have the normal query projection
-    used by LocationQuery or CountQuery.
+    Redo-validity is a meta-query about whether a Redo operation
+    would be valid, so it does not use a normal Query.read()
+    projection.
+
+    Therefore answer_before/answer_after are None and
+    query_changed is also None.
     """
+
     trace, _, _ = replay_trace(
         ops,
         containers,
@@ -73,16 +108,25 @@ def _build_redo_trajectory(
             "have different lengths"
         )
 
-    trajectory: list[Dict] = []
+    trajectory: list[Dict[str, Any]] = []
 
-    for step, (op, before, after) in enumerate(trace):
+    for step, (
+        op,
+        before,
+        after,
+    ) in enumerate(trace):
+
         trajectory.append(
             {
                 "step": step,
 
-                "operation": _op_to_dict(op),
+                "operation": _op_to_dict(
+                    op
+                ),
 
-                "sentence": op_sentences[step],
+                "sentence": op_sentences[
+                    step
+                ],
 
                 "state_before": _state_to_dict(
                     before
@@ -107,6 +151,10 @@ def _build_redo_trajectory(
     return trajectory
 
 
+# ============================================================
+# Main generation function
+# ============================================================
+
 def generate_example(
     rng: random.Random,
     example_id: str,
@@ -118,7 +166,7 @@ def generate_example(
     include_counterfactual: bool = True,
     force_redo_probe: bool = False,
     max_trajectory_attempts: int = 200,
-) -> Dict:
+) -> Dict[str, Any]:
     """
     Generate one DWS-Bench instance.
 
@@ -136,10 +184,27 @@ def generate_example(
             ↓
         inject distractors
             ↓
+        construct causal counterfactual probes
+            ↓
         export benchmark record
 
     The symbolic WorldState/replay trace is the source of truth.
+
+    Factor terminology:
+
+        E = number of entities
+
+        U = number of state-update operations in the
+            generated symbolic trajectory
+
+        N = number of distractor sentences
+
+        R = number of Undo/Redo operations
     """
+
+    # ========================================================
+    # Default QuerySpec
+    # ========================================================
 
     if query_spec is None:
         query_spec = QuerySpec(
@@ -149,10 +214,12 @@ def generate_example(
             min_state_changes=1,
         )
 
-    # ============================================================
+    # ========================================================
     # SPECIAL REDO-VALIDITY PROBE
-    # ============================================================
+    # ========================================================
+
     if force_redo_probe:
+
         (
             ops,
             final_state,
@@ -171,16 +238,31 @@ def generate_example(
             containers,
         )
 
-        op_sentences, replay_final = render_narrative(
+        (
+            op_sentences,
+            replay_final,
+        ) = render_narrative(
             ops,
             containers,
             names,
         )
 
-        if replay_final.location != final_state.location:
+        # ----------------------------------------------------
+        # Renderer consistency
+        # ----------------------------------------------------
+
+        if (
+            replay_final.location
+            != final_state.location
+        ):
             raise AssertionError(
-                "canonical replay disagrees with sampled state"
+                "canonical replay disagrees "
+                "with sampled state"
             )
+
+        # ----------------------------------------------------
+        # Canonical trajectory
+        # ----------------------------------------------------
 
         trajectory = _build_redo_trajectory(
             ops,
@@ -188,12 +270,18 @@ def generate_example(
             op_sentences,
         )
 
+        # ----------------------------------------------------
+        # Distractors
+        # ----------------------------------------------------
+
         distractors = make_distractor_sentences(
             rng,
             distractor_count,
             names,
             sorted(
-                set(final_state.object_type.values())
+                set(
+                    final_state.object_type.values()
+                )
             ),
         )
 
@@ -203,6 +291,10 @@ def generate_example(
             distractors,
         )
 
+        # ----------------------------------------------------
+        # Redo record
+        # ----------------------------------------------------
+
         return {
             "id": example_id,
 
@@ -210,12 +302,21 @@ def generate_example(
 
             "factors": {
                 "E": entity_count,
+
+                # U explicitly means the number of
+                # operations actually present.
                 "U": len(ops),
+
                 "N": distractor_count,
+
                 "R": sum(
-                    isinstance(op, (Undo, Redo))
+                    isinstance(
+                        op,
+                        (Undo, Redo),
+                    )
                     for op in ops
                 ),
+
                 "query_spec": None,
             },
 
@@ -228,23 +329,30 @@ def generate_example(
 
             "query": {
                 "type": "redo_validity",
+
                 "canonical": {
                     "type": "REDO_VALIDITY",
                 },
             },
 
-            "question": question_redo_validity(),
+            "question": (
+                question_redo_validity()
+            ),
 
-            "gold_answer": redo_info[
-                "would_be_valid"
-            ],
+            "gold_answer": (
+                redo_info[
+                    "would_be_valid"
+                ]
+            ),
 
             "trajectory": trajectory,
 
             "trajectory_summary": {
-                "length": len(trajectory),
+                "length": len(
+                    trajectory
+                ),
 
-                "state_change_count": sum(
+                "world_state_change_count": sum(
                     step["state_changed"]
                     for step in trajectory
                 ),
@@ -261,19 +369,22 @@ def generate_example(
             "counterfactual_probes": [],
         }
 
-    # ============================================================
+    # ========================================================
     # NORMAL TRAJECTORY GENERATION
-    # ============================================================
-    last_error = None
+    # ========================================================
+
+    last_error: Optional[Exception] = None
 
     for attempt in range(
         max_trajectory_attempts
     ):
+
         try:
 
-            # ----------------------------------------------------
+            # ==================================================
             # 1. Generate symbolic operation sequence
-            # ----------------------------------------------------
+            # ==================================================
+
             (
                 ops,
                 final_state,
@@ -286,10 +397,14 @@ def generate_example(
                 operations_enabled,
             )
 
-            # ----------------------------------------------------
-            # 2. Select query satisfying QuerySpec
-            # ----------------------------------------------------
-            query, analysis = select_query(
+            # ==================================================
+            # 2. Select QuerySpec-compatible query
+            # ==================================================
+
+            (
+                query,
+                analysis,
+            ) = select_query(
                 rng,
                 ops,
                 final_state,
@@ -297,9 +412,10 @@ def generate_example(
                 query_spec,
             )
 
-            # ----------------------------------------------------
-            # 3. Render actual operations
-            # ----------------------------------------------------
+            # ==================================================
+            # 3. Render symbolic operations
+            # ==================================================
+
             names = NameRegistry(
                 rng,
                 containers,
@@ -314,9 +430,10 @@ def generate_example(
                 names,
             )
 
-            # ----------------------------------------------------
+            # ==================================================
             # 4. Verify renderer replay
-            # ----------------------------------------------------
+            # ==================================================
+
             if (
                 replay_final_state.location
                 != final_state.location
@@ -326,9 +443,10 @@ def generate_example(
                     "final state disagree"
                 )
 
-            # ----------------------------------------------------
-            # 5. Build canonical trajectory AND gold answers
-            # ----------------------------------------------------
+            # ==================================================
+            # 5. Build canonical trajectory + step-wise gold
+            # ==================================================
+
             (
                 trajectory,
                 step_wise,
@@ -339,15 +457,18 @@ def generate_example(
                 op_sentences=op_sentences,
             )
 
-            # ----------------------------------------------------
-            # 6. Verify final trajectory answer
-            # ----------------------------------------------------
+            # ==================================================
+            # 6. Verify trajectory final answer
+            # ==================================================
+
             if not step_wise:
                 raise AssertionError(
                     "trajectory produced no steps"
                 )
 
-            trajectory_final_answer = step_wise[-1]
+            trajectory_final_answer = (
+                step_wise[-1]
+            )
 
             direct_final_answer = query.read(
                 final_state
@@ -362,12 +483,13 @@ def generate_example(
                     "with final state"
                 )
 
-            # ----------------------------------------------------
-            # 7. Add natural-language distractors
+            # ==================================================
+            # 7. Generate distractor sentences
             #
-            # IMPORTANT:
-            # Distractors are NOT added to trajectory.
-            # ----------------------------------------------------
+            # Distractors are deliberately NOT represented
+            # as symbolic trajectory steps.
+            # ==================================================
+
             used_types = sorted(
                 set(
                     final_state.object_type.values()
@@ -387,18 +509,25 @@ def generate_example(
                 distractors,
             )
 
-            # ----------------------------------------------------
-            # 8. Build base record
-            # ----------------------------------------------------
-            record: Dict = {
+            # ==================================================
+            # 8. Build base benchmark record
+            # ==================================================
+
+            record: Dict[str, Any] = {
                 "id": example_id,
 
                 "attempt": attempt,
 
                 "factors": {
                     "E": entity_count,
-                    "U": update_count,
+
+                    # Explicit definition:
+                    # U = number of state-update operations
+                    # actually generated.
+                    "U": len(ops),
+
                     "N": distractor_count,
+
                     "R": sum(
                         isinstance(
                             op,
@@ -406,6 +535,7 @@ def generate_example(
                         )
                         for op in ops
                     ),
+
                     "query_spec": asdict(
                         query_spec
                     ),
@@ -436,12 +566,15 @@ def generate_example(
                     )
                 ),
 
-                "analysis": analysis.to_dict(),
+                "analysis": (
+                    analysis.to_dict()
+                ),
             }
 
-            # ----------------------------------------------------
+            # ==================================================
             # 9. Serialize query
-            # ----------------------------------------------------
+            # ==================================================
+
             if isinstance(
                 query,
                 LocationQuery,
@@ -454,6 +587,7 @@ def generate_example(
 
                     "canonical": {
                         "type": "FINAL_LOCATION",
+
                         "entity": query.obj_id,
                     },
                 }
@@ -475,14 +609,25 @@ def generate_example(
                     "type": "count",
 
                     "target": {
-                        "container": query.container,
-                        "type": query.obj_type,
+                        "container": (
+                            query.container
+                        ),
+
+                        "type": (
+                            query.obj_type
+                        ),
                     },
 
                     "canonical": {
                         "type": "COUNT",
-                        "container": query.container,
-                        "object_type": query.obj_type,
+
+                        "container": (
+                            query.container
+                        ),
+
+                        "object_type": (
+                            query.obj_type
+                        ),
                     },
                 }
 
@@ -500,16 +645,28 @@ def generate_example(
                     f"{type(query).__name__}"
                 )
 
-            # ----------------------------------------------------
+            # ==================================================
             # 10. Counterfactual probes
-            # ----------------------------------------------------
+            # ==================================================
+
             if include_counterfactual:
 
-                raw = build_counterfactual_probes(
-                    rng,
-                    ops,
-                    containers,
-                    query,
+                raw = (
+                    build_counterfactual_probes(
+                        rng,
+                        ops,
+                        containers,
+                        query,
+                    )
+                )
+
+                # ------------------------------------------------
+                # Analysis already computed the causally
+                # sensitive operation indices.
+                # ------------------------------------------------
+
+                sensitive_steps = set(
+                    analysis.counterfactual_sensitive_steps
                 )
 
                 counterfactuals = []
@@ -532,6 +689,49 @@ def generate_example(
                             f"range 0..{len(op_sentences) - 1}"
                         )
 
+                    # --------------------------------------------
+                    # Verify the causal label.
+                    # --------------------------------------------
+
+                    expected_changed = (
+                        probe[
+                            "original_answer"
+                        ]
+                        != probe[
+                            "counterfactual_answer"
+                        ]
+                    )
+
+                    if (
+                        probe[
+                            "answer_changed"
+                        ]
+                        != expected_changed
+                    ):
+                        raise AssertionError(
+                            "counterfactual "
+                            "answer_changed label "
+                            "is inconsistent with "
+                            "the two answers"
+                        )
+
+                    # --------------------------------------------
+                    # A sensitive probe should correspond to
+                    # the analysis-derived sensitive steps.
+                    # --------------------------------------------
+
+                    if probe[
+                        "answer_changed"
+                    ]:
+                        if idx not in sensitive_steps:
+                            raise AssertionError(
+                                "counterfactual probe "
+                                f"step {idx} is labelled "
+                                "sensitive but is absent "
+                                "from analysis."
+                                "counterfactual_sensitive_steps"
+                            )
+
                     counterfactuals.append(
                         {
                             "remove_step": idx,
@@ -540,9 +740,21 @@ def generate_example(
                                 op_sentences[idx]
                             ),
 
-                            "gold_answer": (
+                            "original_answer": (
                                 probe[
-                                    "gold_answer"
+                                    "original_answer"
+                                ]
+                            ),
+
+                            "counterfactual_answer": (
+                                probe[
+                                    "counterfactual_answer"
+                                ]
+                            ),
+
+                            "answer_changed": (
+                                probe[
+                                    "answer_changed"
                                 ]
                             ),
                         }
@@ -553,13 +765,17 @@ def generate_example(
                 ] = counterfactuals
 
             else:
+
                 record[
                     "counterfactual_probes"
                 ] = []
 
-            # ----------------------------------------------------
+            # ==================================================
             # 11. Final consistency checks
-            # ----------------------------------------------------
+            # ==================================================
+
+            # Main gold answer must equal the final trajectory
+            # answer.
             if (
                 record["gold_answer"]
                 != step_wise[-1]
@@ -569,22 +785,65 @@ def generate_example(
                     "step_wise_gold disagree"
                 )
 
-            if len(trajectory) != len(ops):
+            # U must always mean actual operation count.
+            if (
+                record["factors"]["U"]
+                != len(ops)
+            ):
+                raise AssertionError(
+                    "factor U must equal "
+                    "number of generated operations"
+                )
+
+            # Trajectory must contain one entry per operation.
+            if (
+                len(trajectory)
+                != len(ops)
+            ):
                 raise AssertionError(
                     "trajectory length must equal "
                     "operation count"
                 )
 
-            if len(step_wise) != len(ops):
+            # Step-wise gold must contain one answer per operation.
+            if (
+                len(step_wise)
+                != len(ops)
+            ):
                 raise AssertionError(
                     "step_wise_gold length must equal "
                     "operation count"
                 )
 
+            # Counterfactual labels must remain internally
+            # consistent in the exported record.
+            for probe in record[
+                "counterfactual_probes"
+            ]:
+
+                assert (
+                    probe[
+                        "answer_changed"
+                    ]
+                    == (
+                        probe[
+                            "original_answer"
+                        ]
+                        != probe[
+                            "counterfactual_answer"
+                        ]
+                    )
+                )
+
             return record
 
         except Exception as exc:
+
             last_error = exc
+
+    # ========================================================
+    # Generation failure
+    # ========================================================
 
     raise RuntimeError(
         f"could not generate a trajectory "

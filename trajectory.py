@@ -11,7 +11,8 @@ def _state_to_dict(state: WorldState) -> Dict[str, Any]:
     """
     Convert a WorldState into a JSON-serializable representation.
 
-    WorldState is the source of truth. This function only serializes it.
+    WorldState is the simulator source of truth. This function only
+    serializes the state and does not modify it.
     """
     return {
         "object_type": dict(
@@ -39,10 +40,10 @@ def _safe_query_read(
     state: WorldState,
 ) -> Any:
     """
-    Read a query from a symbolic state.
+    Evaluate the benchmark query against a symbolic world state.
 
-    Kept as a small wrapper so all trajectory query evaluation
-    goes through Query.read().
+    Query.read() is the single source of truth for gold-answer
+    computation.
     """
     return query.read(state)
 
@@ -56,9 +57,14 @@ def build_trajectory(
     """
     Build the canonical query-conditioned world-state trajectory.
 
-    Each entry corresponds to exactly one symbolic operation.
+    Exactly one trajectory entry is produced for every successfully
+    replayed symbolic operation.
 
-    The resulting structure is:
+    Distractor sentences are deliberately excluded. The canonical
+    trajectory represents the simulator timeline, not the final
+    natural-language presentation.
+
+    Each step contains:
 
         step
         operation
@@ -69,11 +75,6 @@ def build_trajectory(
         answer_after
         state_changed
         query_changed
-
-    Important:
-        - distractor sentences are NOT part of this trajectory
-        - the symbolic replay is authoritative
-        - query answers are computed from symbolic states
     """
 
     trace, _, _ = replay_trace(
@@ -128,10 +129,12 @@ def build_trajectory(
 
                 "answer_after": answer_after,
 
+                # Whether the complete symbolic WorldState changed.
                 "state_changed": (
                     before != after
                 ),
 
+                # Whether the answer to the selected query changed.
                 "query_changed": (
                     answer_before != answer_after
                 ),
@@ -166,7 +169,7 @@ def query_change_steps(
     trajectory: Sequence[Dict[str, Any]],
 ) -> List[int]:
     """
-    Return the operation indices where the queried answer changes.
+    Return operation indices where the queried answer changes.
     """
     return [
         step["step"]
@@ -175,11 +178,16 @@ def query_change_steps(
     ]
 
 
-def state_change_steps(
+def world_state_change_steps(
     trajectory: Sequence[Dict[str, Any]],
 ) -> List[int]:
     """
-    Return the operation indices where the symbolic state changes.
+    Return operation indices where the complete symbolic WorldState
+    changes.
+
+    This is intentionally distinct from query_change_steps().
+    An operation can modify the world without affecting the selected
+    query.
     """
     return [
         step["step"]
@@ -188,13 +196,27 @@ def state_change_steps(
     ]
 
 
+# Backward-compatible alias.
+#
+# Existing code may still import state_change_steps(). Keep it working
+# while making world_state_change_steps() the canonical terminology.
+def state_change_steps(
+    trajectory: Sequence[Dict[str, Any]],
+) -> List[int]:
+    return world_state_change_steps(
+        trajectory
+    )
+
+
 def first_query_change(
     trajectory: Sequence[Dict[str, Any]],
 ) -> int | None:
     """
-    Return the first step where the query answer changes.
+    Return the first operation index where the query answer changes.
     """
-    steps = query_change_steps(trajectory)
+    steps = query_change_steps(
+        trajectory
+    )
 
     if not steps:
         return None
@@ -206,9 +228,11 @@ def last_query_change(
     trajectory: Sequence[Dict[str, Any]],
 ) -> int | None:
     """
-    Return the last step where the query answer changes.
+    Return the last operation index where the query answer changes.
     """
-    steps = query_change_steps(trajectory)
+    steps = query_change_steps(
+        trajectory
+    )
 
     if not steps:
         return None
@@ -222,24 +246,39 @@ def trajectory_summary(
     """
     Compute compact structural statistics for a trajectory.
 
-    These statistics are useful for:
-        - dataset inspection
-        - filtering
-        - debugging
-        - difficulty analysis
-        - later failure-onset analysis
+    Terminology:
+
+        length
+            Number of successfully replayed operations.
+
+        world_state_change_count
+            Number of operations that changed the complete symbolic
+            WorldState.
+
+        query_change_count
+            Number of operations that changed the answer to the
+            selected query.
+
+        first_query_change
+            First operation affecting the query answer.
+
+        last_query_change
+            Last operation affecting the query answer.
+
+    Note that world_state_change_count and query_change_count are
+    deliberately different metrics.
     """
 
     if not trajectory:
         return {
             "length": 0,
-            "state_change_count": 0,
+            "world_state_change_count": 0,
             "query_change_count": 0,
             "first_query_change": None,
             "last_query_change": None,
         }
 
-    state_steps = state_change_steps(
+    world_state_steps = world_state_change_steps(
         trajectory
     )
 
@@ -250,8 +289,8 @@ def trajectory_summary(
     return {
         "length": len(trajectory),
 
-        "state_change_count": len(
-            state_steps
+        "world_state_change_count": len(
+            world_state_steps
         ),
 
         "query_change_count": len(
@@ -296,10 +335,13 @@ def validate_trajectory(
         )
 
         assert "operation" in step
+        assert "sentence" in step
         assert "state_before" in step
         assert "state_after" in step
         assert "answer_before" in step
         assert "answer_after" in step
+        assert "state_changed" in step
+        assert "query_changed" in step
 
         assert isinstance(
             step["state_changed"],
@@ -311,8 +353,8 @@ def validate_trajectory(
             bool,
         )
 
-        # A query can only change if its answer
-        # before and after the operation differ.
+        # query_changed must be exactly equivalent to comparing
+        # the query answers before and after this operation.
         assert (
             step["query_changed"]
             == (
@@ -332,11 +374,11 @@ def build_trajectory_and_gold(
     List[Any],
 ]:
     """
-    Convenience function returning both the complete trajectory
-    and the traditional step_wise_gold representation.
+    Return both the complete canonical trajectory and step-wise gold.
 
-    This lets older code continue using step_wise_gold without
-    maintaining a second independent trajectory implementation.
+    This is retained as a compatibility helper for older pipeline code.
+    Both outputs are derived from the same trajectory, so there is no
+    second independent gold-generation implementation.
     """
 
     trajectory = build_trajectory(
