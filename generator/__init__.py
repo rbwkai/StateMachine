@@ -12,7 +12,15 @@ from .probes import (
 )
 
 from .sampler import sample_sequence
-
+from .trajectories import (
+    ConstructedTrajectory,
+    TrajectorySpec,
+    available_families,
+    build_trajectory,
+    validate_trajectory,
+)
+from .trajectory_specs import TrajectorySpec
+from .trajectory_validation import validate_trajectory
 
 __all__ = [
     "CountQuery",
@@ -26,4 +34,9 @@ __all__ = [
     "select_query",
     "step_wise_gold",
     "sample_sequence",
+    "ConstructedTrajectory",
+    "TrajectorySpec",
+    "available_families",
+    "build_trajectory",
+    "validate_trajectory",
 ]

@@ -1,37 +1,91 @@
-Based on the smoke-test output you provided, the current implementation is internally consistent across the major execution paths.
+Yes. Given the trajectory smoke test you just ran, I would update the status section to reflect the new trajectory-family validation and remove claims that are not directly established by the current test.
 
-The important result is that this is not just an import test. You tested the actual state machine, replay semantics, query-selection constraints, trajectory gold generation, counterfactual intervention, redo history, pipeline integration, and deterministic generation.
+Here is the updated version:
 
-Current status:
+### Current implementation status
 
-| Component                  | Status | What was verified                                                                     |
-| -------------------------- | ------ | ------------------------------------------------------------------------------------- |
-| `world/` state model       | PASS   | `Put → Move → Undo → Redo`                                                            |
-| Undo/redo semantics        | PASS   | Redo stack invalidated after a new action                                             |
-| Replay engine              | PASS   | Operations replay to the expected state                                               |
-| Invalid-operation handling | PASS   | Invalid `Move`/`Undo` rejected                                                        |
-| `generator/sampler.py`     | PASS   | Valid sequences generated under constraints                                           |
-| Query selection            | PASS   | `QuerySpec` actually filters candidate queries                                        |
-| `analysis.py`              | PASS   | Relevant steps, dependency depth, interleaving, revisions, counterfactual sensitivity |
-| `trajectory.py`            | PASS   | Per-step state/query gold agrees with final state                                     |
-| Counterfactual probes      | PASS   | Original vs. intervention answers correctly compared                                  |
-| `pipeline.py`              | PASS   | Complete benchmark record generated                                                   |
-| Redo-validity              | PASS   | Dedicated history condition works                                                     |
-| Determinism                | PASS   | Same seed produces identical record                                                   |
+Based on the smoke-test outputs, the current implementation is internally consistent across the major execution paths that have been tested.
 
-One particularly useful output is:
+This is not merely an import test. The tests exercise the actual state machine, replay semantics, constraint-based generation, trajectory construction, validation, counterfactual handling, pipeline integration, and deterministic generation.
+
+| Component                        | Status | What was verified                                                                         |
+| -------------------------------- | ------ | ----------------------------------------------------------------------------------------- |
+| `world/` state model             | PASS   | Core state transitions and operation execution                                            |
+| Undo/redo semantics              | PASS   | Redo history behavior and invalidation after a new action                                 |
+| Replay engine                    | PASS   | Operations replay to the expected state                                                   |
+| Invalid-operation handling       | PASS   | Invalid operations are rejected                                                           |
+| `generator/sampler.py`           | PASS   | Valid sequences generated under constraints                                               |
+| Query selection                  | PASS   | `QuerySpec` filters candidate queries according to constraints                            |
+| `analysis.py`                    | PASS   | Relevant steps, dependency depth, interleaving, revisions, and counterfactual sensitivity |
+| `trajectory.py`                  | PASS   | Per-step state/query gold agrees with the final symbolic state                            |
+| Counterfactual probes            | PASS   | Original and intervention answers are correctly compared                                  |
+| `pipeline.py`                    | PASS   | Complete benchmark records can be generated                                               |
+| Redo-validity                    | PASS   | Dedicated redo-history condition works                                                    |
+| Trajectory family registry       | PASS   | `basic_chain`, `interleaved_chain`, and `revision` are registered                         |
+| Basic trajectory family          | PASS   | Target-only sequential updates are generated and validated                                |
+| Interleaved trajectory family    | PASS   | Target and distractor updates are interleaved and counted correctly                       |
+| Revision trajectory family       | PASS   | Previous locations are revisited after intervening updates                                |
+| Trajectory validation            | PASS   | Generated trajectories satisfy family-specific structural constraints                     |
+| Trajectory replay consistency    | PASS   | Same seed + same specification produces identical trajectories                            |
+| Multi-seed trajectory validation | PASS   | 10 seeds × 3 trajectory families passed validation                                        |
+| Determinism                      | PASS   | Same seed produces identical generated records/trajectories                               |
+
+One particularly useful trajectory result is:
 
 ```text
-relevant_steps: [4, 5, 6]
-state_change_count: 3
-dependency_depth: 7
-interleaving_score: 0.2857
-counterfactual_sensitive_steps: [6]
+basic_chain:
+    target_updates     = 6
+    distractor_updates = 0
+
+interleaved_chain:
+    target_updates     = 4
+    distractor_updates = 4
+
+revision:
+    target_updates     = 6
+    repeated locations = detected
 ```
 
-This demonstrates that your `QuerySpec` machinery is doing something substantive. It is not merely selecting an arbitrary final object. The selected query has a measurable trajectory structure and a causally sensitive operation.
+The interleaved example demonstrates that the generator is not merely producing a target trajectory followed by distractors. The operations are genuinely interleaved:
 
-The earlier `KeyError('gold_answer')` problem also appears to be fixed. Your current counterfactual records now have the intended schema:
+```text
+target
+distractor
+target
+distractor
+target
+distractor
+target
+distractor
+```
+
+The revision example similarly demonstrates that the generator can create temporal revision structure:
+
+```text
+c1 → c2 → c1 → c0 → c2 → c0
+```
+
+so a previously occupied location is revisited after intervening updates.
+
+The deterministic replay test is also important:
+
+```text
+Same seed + same TrajectorySpec
+                ↓
+        identical operations
+                ↓
+        identical final state
+```
+
+The current multi-seed test additionally confirms that this behavior is not specific to seed `42`:
+
+```text
+10 seeds × 3 families = 30 generated trajectories
+                         ↓
+                    all PASS
+```
+
+The earlier `KeyError('gold_answer')` problem also appears to be fixed. Counterfactual records now use the intended schema:
 
 ```text
 {
@@ -43,7 +97,7 @@ The earlier `KeyError('gold_answer')` problem also appears to be fixed. Your cur
 }
 ```
 
-and the invariant
+with the invariant:
 
 ```python
 answer_changed == (
@@ -51,43 +105,59 @@ answer_changed == (
 )
 ```
 
-passes.
+passing on the tested paths.
 
 There is, however, an important distinction:
 
 **The smoke tests establish internal consistency, not yet benchmark validity.**
 
-You have now established:
+The current evidence establishes that the following pipeline is functioning coherently:
 
 ```text
-Simulator
-    ↓
+Symbolic world
+      ↓
+Operation generation
+      ↓
 Replay
-    ↓
-Analysis
-    ↓
+      ↓
+Trajectory construction
+      ↓
+Structural analysis
+      ↓
 Query selection
-    ↓
+      ↓
 Trajectory gold
-    ↓
+      ↓
 Natural-language rendering
-    ↓
+      ↓
 Distractors
-    ↓
+      ↓
 Counterfactual probes
-    ↓
-Final benchmark record
+      ↓
+Benchmark record
 ```
 
-is internally coherent.
+The trajectory-specific portion is now additionally validated through:
 
-The next verification stage should therefore be adversarial/property testing rather than more basic smoke tests.
+```text
+TrajectorySpec
+      ↓
+build_trajectory()
+      ↓
+family-specific construction
+      ↓
+validate_trajectory()
+      ↓
+deterministic replay
+      ↓
+multi-seed validation
+```
 
-I would do these next.
+The next verification stage should therefore move beyond basic smoke tests toward adversarial and property-based testing.
 
-### 1. Test every operation type
+### Recommended next tests
 
-Your smoke test currently demonstrates several operations, but you should explicitly exercise:
+First, explicitly test every operation type and important composition:
 
 ```text
 Put
@@ -100,7 +170,7 @@ Undo
 Redo
 ```
 
-especially combinations involving:
+and especially:
 
 ```text
 Split → Move
@@ -111,40 +181,23 @@ Move → Undo → Redo
 Move → Undo → new Move → Redo
 ```
 
-This matters because `Split`, `Merge`, and `Swap` have substantially different state-transition semantics.
+This is important because composite operations have different state-transition semantics from ordinary `Move`.
 
-### 2. Test all QuerySpec dimensions
-
-You should generate batches for:
+Second, test all `QuerySpec` dimensions independently and in combination:
 
 ```python
-QuerySpec(
-    query_type="location",
-    must_change_from_initial=True,
-    min_relevant_steps=1,
-)
+min_relevant_steps
+min_state_changes
+min_dependency_depth
+min_interleaving
+require_revision
+min_undo
+min_redo
 ```
 
-then progressively:
+For every accepted example, assert that the resulting trajectory actually satisfies every requested constraint.
 
-```python
-min_relevant_steps=3
-min_relevant_steps=5
-min_state_changes=3
-min_dependency_depth=4
-min_interleaving=0.4
-require_revision=True
-min_undo=1
-min_redo=1
-```
-
-and verify that every accepted record actually satisfies the requested constraint.
-
-This is especially important because `select_query()` itself is correct only if `analysis.matches()` correctly implements every field.
-
-### 3. Test rejection behavior
-
-For intentionally impossible specifications:
+Third, test intentionally impossible specifications. For example:
 
 ```python
 QuerySpec(
@@ -153,54 +206,11 @@ QuerySpec(
 )
 ```
 
-the generator should eventually fail with a clear:
+should eventually fail with a controlled generation error rather than returning an invalid example.
 
-```text
-RuntimeError:
-could not generate a trajectory satisfying QuerySpec(...)
-```
+Fourth, test counterfactual validity explicitly. Removing an operation that makes a later operation impossible should invalidate that intervention rather than producing a misleading counterfactual answer.
 
-rather than returning an invalid example.
-
-This verifies the constraint-first philosophy.
-
-### 4. Test counterfactual validity
-
-You already handle this correctly in principle:
-
-```python
-counterfactual_gold(...) -> None
-```
-
-when removing an operation causes a later operation to become invalid.
-
-You should explicitly test cases such as:
-
-```text
-Put A
-Move A
-Move A
-```
-
-and remove the initial `Put`.
-
-The resulting replay should be rejected, and that intervention should **not** appear as a valid counterfactual probe.
-
-This is an important methodological property because you don't want your counterfactual operation to silently alter the entire semantics of the trajectory.
-
-### 5. Test distractor invariance
-
-This is particularly important for your DWS-Bench design.
-
-For the same:
-
-```text
-seed
-operations
-query
-```
-
-generate:
+Fifth, test **distractor invariance**, which is particularly important for DWS-Bench. For the same symbolic trajectory and query, vary the amount of irrelevant natural-language information:
 
 ```text
 N = 0
@@ -209,113 +219,48 @@ N = 20
 N = 50
 ```
 
-and verify:
+The symbolic trajectory and gold answer should remain unchanged while only the surface narrative changes. This is necessary to establish that the interference variable is actually controlled.
+
+Sixth, perform stronger determinism testing. Instead of one same-seed comparison, generate hundreds or thousands of examples and verify complete record equality between repeated runs. At the same time, verify that different seeds actually produce sufficient trajectory diversity.
+
+Finally, run a large batch-generation invariant test, for example 1,000 examples. For every record, verify invariants such as:
 
 ```python
-gold_answer_N0 == gold_answer_N5 == ...
-trajectory_N0 == trajectory_N5 == ...
-```
+len(operations) == expected_operation_count
 
-while only the surface `sentences` change.
-
-That experimentally confirms that your `N` factor is genuinely a **textual interference factor**, rather than accidentally modifying the symbolic world.
-
-### 6. Test determinism more aggressively
-
-You currently have:
-
-```text
-Same seed -> identical record: PASS
-```
-
-Good.
-
-But test:
-
-```text
-seed 1 → record A
-seed 1 → record B
-```
-
-across maybe 100–1000 examples.
-
-Then check complete JSON equality.
-
-Also test that different seeds actually produce diversity. You don't want accidental determinism caused by a hidden fixed ordering.
-
-### 7. Run a batch-generation invariant test
-
-This is probably the most valuable test before moving on to model evaluation.
-
-Generate, for example:
-
-```text
-1,000 examples
-```
-
-and assert for every record:
-
-```python
-len(operations) == U
-len(trajectory) == U
-len(step_wise_gold) == U
+len(trajectory) == expected_update_count
 
 gold_answer == step_wise_gold[-1]
 
 trajectory[-1]["state_after"] == final_state
 
-analysis.relevant_steps satisfy QuerySpec
-
-counterfactual.answer_changed ==
-    original_answer != counterfactual_answer
+counterfactual.answer_changed == (
+    counterfactual.original_answer
+    != counterfactual.counterfactual_answer
+)
 ```
 
-Then collect:
+Then measure:
 
 ```text
 generation failure rate
-average attempts
+average generation attempts
 query-type distribution
 operation-type distribution
 relevant-step distribution
 dependency-depth distribution
 interleaving distribution
+revision frequency
 counterfactual-sensitive rate
 ```
 
-That will tell you whether the generator is merely correct or also **usable as a benchmark generator**.
+These statistics will tell you whether the generator is not only correct, but also suitable for producing a balanced and diagnostically useful benchmark.
 
-### One thing I would flag in the current architecture
+### Architectural cleanup
 
-Your project currently has both:
+Before large-scale generation, also remove duplicate or legacy implementations. There should be one authoritative implementation for each responsibility.
 
-```text
-generator/sampler.py
-```
-
-and:
-
-```text
-sampler.py
-```
-
-at the repository root.
-
-Likewise, you have the rendering code consolidated under:
-
-```text
-render/
-    __init__.py
-    names.py
-    narrative.py
-    templates.py
-```
-
-but your pasted history shows multiple versions of rendering functions.
-
-Before doing large-scale generation, I would clean up any duplicate/legacy modules so there is exactly one authoritative implementation for each responsibility.
-
-Your intended architecture should be:
+The intended structure should be approximately:
 
 ```text
 StateMachine/
@@ -330,7 +275,10 @@ StateMachine/
 ├── generator/
 │   ├── __init__.py
 │   ├── probes.py
-│   └── sampler.py
+│   ├── sampler.py
+│   ├── trajectories.py
+│   ├── trajectory_specs.py
+│   └── trajectory_validation.py
 │
 ├── render/
 │   ├── __init__.py
@@ -343,6 +291,7 @@ StateMachine/
 ├── pipeline.py
 ├── trajectory.py
 ├── example.py
+├── smoke_test_trajectories.py
 │
 └── tests/
     ├── test_world.py
@@ -354,8 +303,14 @@ StateMachine/
     └── test_invariants.py
 ```
 
-So, at this point I would **not change the core logic just because the smoke tests pass**. The next step is to stress-test the implementation and verify the statistical properties of the generated benchmark.
+One correction from the previous version is worth making explicit: the current trajectory smoke test **does not yet prove that the validation gate specifically rejects `basic_chain` because of a nonzero distractor count**. It proves that the invalid specification/trajectory combination is rejected, currently through the update-count mismatch:
 
-The current result can reasonably be summarized as:
+```text
+expected 7, got 6
+```
 
-> **DWS-Bench generator v1 is functionally passing its smoke-test suite. The simulator, replay engine, constraint-based query selection, trajectory gold generation, counterfactual probes, redo-validity condition, pipeline integration, and deterministic behavior are mutually consistent on the tested paths. The remaining verification task is adversarial/property-based testing and large-batch generation analysis, not basic debugging.**
+If you want the smoke test to prove the family-specific `basic_chain` constraint specifically, that should be tightened in the next test revision.
+
+The appropriate current project-level conclusion is therefore:
+
+> **DWS-Bench generator v1 is functionally passing its current smoke-test suite. The symbolic state machine, replay engine, constraint-based generation, trajectory construction and validation, query analysis, gold generation, counterfactual probes, redo-validity condition, pipeline integration, and deterministic behavior are mutually consistent on the tested paths. The next stage is adversarial/property-based testing and large-batch statistical validation to establish robustness and benchmark validity, rather than further basic debugging.**
