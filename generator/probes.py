@@ -2,22 +2,50 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from world import (
-    GenerationError, History, InvalidOperation, Merge, Move, Operation, Put,
-    Redo, Remove, Split, Swap, Undo, WorldState, apply_op, gold_count,
-    gold_location, replay_trace,
+    GenerationError,
+    History,
+    InvalidOperation,
+    Merge,
+    Move,
+    Operation,
+    Put,
+    Redo,
+    Remove,
+    Split,
+    Swap,
+    Undo,
+    WorldState,
+    apply_op,
+    gold_count,
+    gold_location,
+    replay_trace,
 )
-from .sampler import _construct_move, _construct_swap, sample_sequence
 
+from .sampler import (
+    _construct_move,
+    _construct_swap,
+    sample_sequence,
+)
+
+from analysis import QuerySpec, analyze_trajectory
+
+
+# ============================================================
+# Query definitions
+# ============================================================
 
 @dataclass
 class LocationQuery:
     obj_id: str
 
-    def read(self, state: WorldState):
-        return gold_location(state, self.obj_id)
+    def read(self, state: WorldState) -> Any:
+        return gold_location(
+            state,
+            self.obj_id,
+        )
 
 
 @dataclass
@@ -25,78 +53,231 @@ class CountQuery:
     container: str
     obj_type: str
 
-    def read(self, state: WorldState):
-        return gold_count(state, self.container, self.obj_type)
+    def read(self, state: WorldState) -> Any:
+        return gold_count(
+            state,
+            self.container,
+            self.obj_type,
+        )
 
 
-Query = Union[LocationQuery, CountQuery]
+@dataclass
+class RedoValidityQuery:
+    """
+    Marker query for redo-validity probes.
+
+    Redo validity is evaluated from History rather than
+    projected from WorldState, so this query is not used
+    by normal trajectory generation.
+    """
+
+    def read(self, state: WorldState) -> Any:
+        raise NotImplementedError(
+            "RedoValidityQuery is evaluated through History"
+        )
 
 
-def select_query(rng: random.Random, ops_applied: Sequence[Operation], final_state: WorldState) -> Query:
-    """Chooses location vs. count query based on whether the trajectory
-    contains a Split/Merge -- these make single-object location questions
-    ambiguous (which copy do you mean?), so count queries are used instead
-    whenever they occur."""
-    has_split_or_merge = any(isinstance(op, (Split, Merge)) for op in ops_applied)
-    if has_split_or_merge:
-        present_types = sorted({
-            final_state.object_type[oid] for oid in final_state.location
-        })
-        if present_types:
-            obj_type = rng.choice(present_types)
-            container = rng.choice(sorted(final_state.containers))
-            return CountQuery(container, obj_type)
-        # fallback: nothing is present anywhere (rare, e.g. everything removed)
-    present_objs = sorted(final_state.location)
-    if not present_objs:
-        # last resort: query an object that existed even if it was removed
-        all_objs = sorted(final_state.object_type)
-        if not all_objs:
-            raise GenerationError(
-                "no entity was ever created in this example (PUT likely "
-                "excluded from operations_enabled) -- nothing to query"
+Query = Union[
+    LocationQuery,
+    CountQuery,
+]
+
+
+# ============================================================
+# Candidate query generation
+# ============================================================
+
+def candidate_queries(
+    rng: random.Random,
+    ops_applied: Sequence[Operation],
+    final_state: WorldState,
+    query_type: str = "location",
+) -> List[Query]:
+    """
+    Generate candidate queries for a sampled trajectory.
+
+    QuerySpec validation is performed by select_query().
+    """
+
+    if query_type == "location":
+
+        candidates = sorted(
+            final_state.object_type
+        )
+
+        rng.shuffle(
+            candidates
+        )
+
+        return [
+            LocationQuery(obj_id)
+            for obj_id in candidates
+        ]
+
+    if query_type == "count":
+
+        types = sorted(
+            set(
+                final_state.object_type.values()
             )
-        return LocationQuery(rng.choice(all_objs))
+        )
 
-    # Prefer an object that actually appears in multiple operations, so the
-    # narrative and step-wise trajectory are informative rather than mostly
-    # nulls (e.g. an object PUT in the very last step and never touched
-    # again). Ties broken randomly for variety across examples.
-    touch_counts: Dict[str, int] = {oid: 0 for oid in present_objs}
-    for op in ops_applied:
-        oid = getattr(op, "obj_id", None) or getattr(op, "source_obj_id", None)
-        if oid in touch_counts:
-            touch_counts[oid] += 1
-    max_touches = max(touch_counts.values())
-    best_objs = [oid for oid, c in touch_counts.items() if c == max_touches]
-    return LocationQuery(rng.choice(best_objs))
+        containers = sorted(
+            final_state.containers
+        )
 
+        pairs = [
+            (container, obj_type)
+            for container in containers
+            for obj_type in types
+        ]
+
+        rng.shuffle(
+            pairs
+        )
+
+        return [
+            CountQuery(
+                container,
+                obj_type,
+            )
+            for container, obj_type in pairs
+        ]
+
+    raise GenerationError(
+        f"unknown query_type={query_type!r}"
+    )
+
+
+# ============================================================
+# Query selection
+# ============================================================
+
+def select_query(
+    rng: random.Random,
+    ops_applied: Sequence[Operation],
+    final_state: WorldState,
+    containers: Set[str],
+    query_spec: QuerySpec,
+) -> Tuple[Query, object]:
+    """
+    Select a query satisfying QuerySpec.
+
+    Query difficulty is determined by measured structural
+    properties of the canonical symbolic trajectory.
+    """
+
+    candidates = candidate_queries(
+        rng,
+        ops_applied,
+        final_state,
+        query_spec.query_type,
+    )
+
+    for query in candidates:
+
+        analysis = analyze_trajectory(
+            ops_applied,
+            containers,
+            query,
+        )
+
+        if query_spec.matches(
+            analysis
+        ):
+            return query, analysis
+
+    raise GenerationError(
+        "no query satisfied "
+        f"QuerySpec={query_spec!r} "
+        "for sampled trajectory"
+    )
+
+
+# ============================================================
+# Step-wise gold
+# ============================================================
 
 def step_wise_gold(
     ops_applied: Sequence[Operation],
     containers: Set[str],
     query: Query,
-) -> List:
-    trace, _, _ = replay_trace(ops_applied, containers)
-    return [query.read(after) for _, _before, after in trace]
+) -> List[Any]:
+    """
+    Return the query answer after every symbolic operation.
 
+    Retained for compatibility. The canonical trajectory is
+    generated by trajectory.py.
+    """
+
+    trace, _, _ = replay_trace(
+        ops_applied,
+        containers,
+    )
+
+    return [
+        query.read(after)
+        for _, _before, after in trace
+    ]
+
+
+# ============================================================
+# Counterfactual evaluation
+# ============================================================
 
 def counterfactual_gold(
     ops_applied: Sequence[Operation],
     containers: Set[str],
     remove_index: int,
     query: Query,
-) -> Optional[object]:
-    """Replays the sequence with one step removed. Returns None (probe
-    dropped) if removing that step makes a later step invalid, rather
-    than emitting a broken example."""
-    reduced = list(ops_applied[:remove_index]) + list(ops_applied[remove_index + 1:])
+) -> Optional[Any]:
+    """
+    Remove exactly one operation and replay the resulting
+    trajectory.
+
+    Returns:
+        The counterfactual final query answer.
+
+    Returns None:
+        If removing the operation causes a later operation
+        to become invalid.
+    """
+
+    if not 0 <= remove_index < len(
+        ops_applied
+    ):
+        raise IndexError(
+            f"remove_index={remove_index} outside "
+            f"trajectory length={len(ops_applied)}"
+        )
+
+    reduced = (
+        list(
+            ops_applied[:remove_index]
+        )
+        + list(
+            ops_applied[remove_index + 1:]
+        )
+    )
+
     try:
-        _, final_state, _ = replay_trace(reduced, containers)
+
+        _, final_state, _ = replay_trace(
+            reduced,
+            containers,
+        )
+
     except InvalidOperation:
         return None
-    return query.read(final_state)
 
+    return query.read(
+        final_state
+    )
+
+
+# ============================================================
+# Counterfactual probe generation
+# ============================================================
 
 def build_counterfactual_probes(
     rng: random.Random,
@@ -104,22 +285,198 @@ def build_counterfactual_probes(
     containers: Set[str],
     query: Query,
     max_probes: int = 2,
-) -> List[Dict]:
-    """Samples a few step indices to counterfactually remove and reports
-    their gold answers, skipping any that turn out to invalidate a later
-    step."""
-    candidate_indices = list(range(len(ops_applied)))
-    rng.shuffle(candidate_indices)
-    probes = []
-    for idx in candidate_indices:
-        if len(probes) >= max_probes:
-            break
-        answer = counterfactual_gold(ops_applied, containers, idx, query)
-        if answer is None:
-            continue
-        probes.append({"remove_step": idx, "gold_answer": answer})
-    return probes
+) -> List[Dict[str, Any]]:
+    """
+    Construct causally labelled counterfactual probes.
 
+    A probe removes exactly one operation and compares:
+
+        original_answer
+                    vs.
+        counterfactual_answer
+
+    Therefore:
+
+        answer_changed == True
+            operation is causally necessary for the
+            final answer under this intervention.
+
+        answer_changed == False
+            removing the operation does not alter the
+            final answer.
+
+    Selection policy:
+
+        1. Prefer one sensitive probe.
+        2. Prefer one insensitive probe.
+        3. Fill remaining slots from either category.
+
+    This produces a much more useful causal-sensitivity
+    signal than randomly selecting arbitrary removals.
+    """
+
+    if max_probes <= 0:
+        return []
+
+    if not ops_applied:
+        return []
+
+    # --------------------------------------------------------
+    # Original final answer
+    # --------------------------------------------------------
+
+    _, original_state, _ = replay_trace(
+        ops_applied,
+        containers,
+    )
+
+    original_answer = query.read(
+        original_state
+    )
+
+    # --------------------------------------------------------
+    # Evaluate every possible removal.
+    # --------------------------------------------------------
+
+    candidates: List[
+        Dict[str, Any]
+    ] = []
+
+    for idx in range(
+        len(ops_applied)
+    ):
+
+        counterfactual_answer = (
+            counterfactual_gold(
+                ops_applied,
+                containers,
+                idx,
+                query,
+            )
+        )
+
+        # The intervention produced an invalid trajectory.
+        if counterfactual_answer is None:
+            continue
+
+        answer_changed = (
+            counterfactual_answer
+            != original_answer
+        )
+
+        candidates.append(
+            {
+                "remove_step": idx,
+
+                "removed_operation": {
+                    "type": type(
+                        ops_applied[idx]
+                    ).__name__.upper(),
+                },
+
+                "original_answer": (
+                    original_answer
+                ),
+
+                "counterfactual_answer": (
+                    counterfactual_answer
+                ),
+
+                "answer_changed": (
+                    answer_changed
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Separate causal categories.
+    # --------------------------------------------------------
+
+    sensitive = [
+        probe
+        for probe in candidates
+        if probe["answer_changed"]
+    ]
+
+    insensitive = [
+        probe
+        for probe in candidates
+        if not probe["answer_changed"]
+    ]
+
+    rng.shuffle(
+        sensitive
+    )
+
+    rng.shuffle(
+        insensitive
+    )
+
+    selected: List[
+        Dict[str, Any]
+    ] = []
+
+    # --------------------------------------------------------
+    # 1. Prefer causally sensitive probe.
+    # --------------------------------------------------------
+
+    if sensitive:
+
+        selected.append(
+            sensitive.pop()
+        )
+
+    # --------------------------------------------------------
+    # 2. Prefer causally insensitive probe.
+    # --------------------------------------------------------
+
+    if (
+        insensitive
+        and len(selected) < max_probes
+    ):
+
+        selected.append(
+            insensitive.pop()
+        )
+
+    # --------------------------------------------------------
+    # 3. Fill remaining slots.
+    # --------------------------------------------------------
+
+    remaining = (
+        sensitive
+        + insensitive
+    )
+
+    rng.shuffle(
+        remaining
+    )
+
+    for probe in remaining:
+
+        if len(selected) >= max_probes:
+            break
+
+        selected.append(
+            probe
+        )
+
+    # --------------------------------------------------------
+    # Sort by trajectory position for reproducible,
+    # human-readable JSON.
+    # --------------------------------------------------------
+
+    selected.sort(
+        key=lambda probe:
+            probe["remove_step"]
+    )
+
+    return selected
+
+
+# ============================================================
+# Redo-validity probe
+# ============================================================
 
 def build_redo_validity_example(
     rng: random.Random,
@@ -127,34 +484,142 @@ def build_redo_validity_example(
     update_count: int,
     operations_enabled: Sequence[type],
     num_containers: Optional[int] = None,
-) -> Tuple[List[Operation], WorldState, History, Set[str], Dict]:
-    """Forces the subsequence [..., <op>, Undo, <new op>] so that a final
-    Redo attempt (not applied -- it's the thing being asked about) is
-    deliberately invalid. This subsequence essentially never occurs by
-    chance under normal random sampling, so it needs its own generation
-    mode rather than being left to show up organically.
+) -> Tuple[
+    List[Operation],
+    WorldState,
+    History,
+    Set[str],
+    Dict[str, Any],
+]:
     """
-    base_update_count = max(update_count - 3, 2)
-    ops, state, history, containers = sample_sequence(
-        rng, entity_count, base_update_count, operations_enabled, num_containers
+    Construct a trajectory ending in:
+
+        ... -> operation -> Undo -> new operation
+
+    The new operation invalidates the redo history.
+
+    The Redo itself is NOT applied.
+
+    The benchmark instead asks whether the undone operation
+    could be redone at the current point in history.
+    """
+
+    base_update_count = max(
+        update_count - 3,
+        2,
     )
 
-    setup_op = _construct_move(rng, state) or _construct_swap(rng, state)
+    (
+        ops,
+        state,
+        history,
+        containers,
+    ) = sample_sequence(
+        rng,
+        entity_count,
+        base_update_count,
+        operations_enabled,
+        num_containers,
+    )
+
+    # --------------------------------------------------------
+    # Establish operation to undo.
+    # --------------------------------------------------------
+
+    setup_op = (
+        _construct_move(
+            rng,
+            state,
+        )
+        or _construct_swap(
+            rng,
+            state,
+        )
+    )
+
     if setup_op is None:
-        raise RuntimeError("could not construct a setup op for redo-validity probe")
-    state = apply_op(setup_op, state, history)
-    ops.append(setup_op)
+        raise RuntimeError(
+            "could not construct a setup operation "
+            "for redo-validity probe"
+        )
+
+    state = apply_op(
+        setup_op,
+        state,
+        history,
+    )
+
+    ops.append(
+        setup_op
+    )
+
+    # --------------------------------------------------------
+    # Undo the operation.
+    # --------------------------------------------------------
 
     undo_op = Undo()
-    state = apply_op(undo_op, state, history)
-    ops.append(undo_op)
 
-    new_action = _construct_move(rng, state) or _construct_swap(rng, state)
+    state = apply_op(
+        undo_op,
+        state,
+        history,
+    )
+
+    ops.append(
+        undo_op
+    )
+
+    # --------------------------------------------------------
+    # Apply a new operation.
+    #
+    # This invalidates the redo stack.
+    # --------------------------------------------------------
+
+    new_action = (
+        _construct_move(
+            rng,
+            state,
+        )
+        or _construct_swap(
+            rng,
+            state,
+        )
+    )
+
     if new_action is None:
-        raise RuntimeError("could not construct an invalidating op for redo-validity probe")
-    state = apply_op(new_action, state, history)
-    ops.append(new_action)
+        raise RuntimeError(
+            "could not construct an invalidating operation "
+            "for redo-validity probe"
+        )
+
+    state = apply_op(
+        new_action,
+        state,
+        history,
+    )
+
+    ops.append(
+        new_action
+    )
+
+    # --------------------------------------------------------
+    # Evaluate redo validity.
+    # --------------------------------------------------------
 
     from world import can_redo
-    would_be_valid = can_redo(history)  # expected False
-    return ops, state, history, containers, {"would_be_valid": would_be_valid}
+
+    would_be_valid = can_redo(
+        history
+    )
+
+    return (
+        ops,
+        state,
+        history,
+        containers,
+        {
+            "would_be_valid": (
+                would_be_valid
+            ),
+        },
+    )
