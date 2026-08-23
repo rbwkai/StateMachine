@@ -147,13 +147,8 @@ def splice_distractors(
     return combined
 
 
-# ---------------------------------------------------------------------------
-# Questions
-# ---------------------------------------------------------------------------
-
 def question_location(obj_id: str, state: WorldState, names: NameRegistry) -> str:
-    obj_type = state.object_type[obj_id]
-    return f"Where is the {obj_type} now?"
+    return f"Where is {names.obj(obj_id, state)} now?"
 
 
 def question_count(container_id: str, obj_type: str, names: NameRegistry) -> str:

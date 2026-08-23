@@ -38,14 +38,17 @@ class NameRegistry:
 
     def obj(self, obj_id: str, state: WorldState) -> str:
         obj_type = state.object_type[obj_id]
-        loc = state.location.get(obj_id)
-        if loc is not None:
-            siblings = [
-                oid for oid, cid in state.location.items()
-                if cid == loc and state.object_type[oid] == obj_type
-            ]
-            if len(siblings) > 1:
-                return f"one of the {obj_type}s"
+        same_type_objs = sorted(
+            [oid for oid, t in state.object_type.items() if t == obj_type]
+        )
+        if len(same_type_objs) > 1:
+            idx = same_type_objs.index(obj_id)
+            if idx == 0:
+                return f"the original {obj_type}"
+            elif idx == 1:
+                return f"the duplicate {obj_type}"
+            else:
+                return f"the {idx+1}th {obj_type}"
         return f"the {obj_type}"
 
 
@@ -99,8 +102,7 @@ def splice_distractors(
 
 
 def question_location(obj_id: str, state: WorldState, names: NameRegistry) -> str:
-    # obj_id is intentionally not exposed in the surface form.
-    return f"Where is the {state.object_type[obj_id]} now?"
+    return f"Where is {names.obj(obj_id, state)} now?"
 
 
 def question_count(container_id: str, obj_type: str, names: NameRegistry) -> str:

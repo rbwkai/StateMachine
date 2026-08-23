@@ -151,7 +151,7 @@ def question_location(
     names: NameRegistry,
 ) -> str:
     """Generate a location question for an object."""
-    return f"Where is the {state.object_type[obj_id]} now?"
+    return f"Where is {names.obj(obj_id, state)} now?"
 
 
 def question_count(

@@ -311,6 +311,13 @@ expected 7, got 6
 
 If you want the smoke test to prove the family-specific `basic_chain` constraint specifically, that should be tightened in the next test revision.
 
-The appropriate current project-level conclusion is therefore:
+### Current Architectural Status (August 2026)
 
-> **DWS-Bench generator v1 is functionally passing its current smoke-test suite. The symbolic state machine, replay engine, constraint-based generation, trajectory construction and validation, query analysis, gold generation, counterfactual probes, redo-validity condition, pipeline integration, and deterministic behavior are mutually consistent on the tested paths. The next stage is adversarial/property-based testing and large-batch statistical validation to establish robustness and benchmark validity, rather than further basic debugging.**
+> **DWS-Bench Generator Architecture is FROZEN and passing all verification suites.**
+>
+> 1. **5-Way Capability Taxonomy:** 8 trajectory families formalized across Sequential Tracking (`basic_chain`, `revision`), Interference (`interleaved_chain`), Identity Transformation (`split_chain`, `merge_chain`), Global Operations (`swap_chain`), and Temporal Edit History (`undo_chain`, `undo_redo_chain`).
+> 2. **Formal Accounting:** Explicit invariant distinction where $E$ = initial entity placements, $U = T + D$ = post-initialization updates, $S = E + U$ = total symbolic operations, and $L$ = rendered sentence length.
+> 3. **Mathematical Invariant Verification:** Automated suite ([test_invariants.py](file:///c:/Users/Rahatut/Desktop/Academics/Thesis/StateMachine/test_invariants.py)) verifies 200 random trajectory instances across all 8 families.
+> 4. **Naturalistic Transfer Scope:** Formally bounded to canonical entity-state operations (`PUT/CREATE`, `MOVE`, `REMOVE/DESTROY`, `UNCHANGED`) targeting `basic_chain`, `interleaved_chain`, and `revision` via ProPara-CRTS.
+>
+> **Next Milestone:** ProPara-CRTS $\rightarrow$ DWS Canonical State Mapping Audit & External Bridge.

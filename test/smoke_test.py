@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 import random
+import sys
+
+# Ensure repository root is in sys.path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import generator
 from analysis import QuerySpec
@@ -777,36 +784,16 @@ print("Same seed -> identical record: PASS")
 
 banner("ALL SMOKE TESTS PASSED")
 
-print(
-    "World model ............... PASS"
-)
-print(
-    "Replay engine ............. PASS"
-)
-print(
-    "Sampler ................... PASS"
-)
-print(
-    "Query selection ........... PASS"
-)
-print(
-    "QuerySpec filtering ....... PASS"
-)
-print(
-    "Trajectory/gold ........... PASS"
-)
-print(
-    "Counterfactual probes ..... PASS"
-)
-print(
-    "Redo validity ............. PASS"
-)
-print(
-    "Pipeline integration ...... PASS"
-)
-print(
-    "Determinism ............... PASS"
-)
+print("World model ............... PASS")
+print("Replay engine ............. PASS")
+print("Sampler ................... PASS")
+print("Query selection ........... PASS")
+print("QuerySpec filtering ....... PASS")
+print("Trajectory/gold ........... PASS")
+print("Counterfactual probes ..... PASS")
+print("Redo validity ............. PASS")
+print("Pipeline integration ...... PASS")
+print("Determinism ............... PASS")
 
 print()
 print("DWS-Bench generator is internally consistent for the tested paths.")
