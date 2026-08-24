@@ -7,6 +7,12 @@ from .dataset_spec import (
     family_capability_group,
 )
 
+from .metadata import (
+    MeasuredFactors,
+    measure_factors,
+    verify_factors,
+)
+
 from .probes import (
     CountQuery,
     LocationQuery,
@@ -46,6 +52,10 @@ __all__ = [
     "GenerationStatus",
     "STRUCTURAL_FAMILIES",
     "family_capability_group",
+    # Metadata
+    "MeasuredFactors",
+    "measure_factors",
+    "verify_factors",
     # Queries / probes
     "CountQuery",
     "LocationQuery",

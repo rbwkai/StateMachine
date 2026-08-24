@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from world import (
     History,
@@ -20,6 +20,7 @@ from world import (
 )
 from generator.trajectory_specs import TrajectorySpec
 from .trajectory_validation import validate_trajectory
+from .metadata import MeasuredFactors, measure_factors
 
 
 # ============================================================
@@ -48,6 +49,12 @@ class ConstructedTrajectory:
 
     spec:
         Structural specification used to construct the trajectory.
+
+    measured_factors:
+        Independently measured (E, T, D, V, L) values computed from
+        the canonical replay.  Populated by build_trajectory(); None
+        if the trajectory was built directly via a constructor function
+        (bypassing build_trajectory).
     """
 
     ops: List[Operation]
@@ -56,6 +63,7 @@ class ConstructedTrajectory:
     history: History
     target_obj: str
     spec: TrajectorySpec
+    measured_factors: Optional[MeasuredFactors] = field(default=None, compare=False)
 
 
 # ============================================================
@@ -1621,6 +1629,31 @@ def build_trajectory(
             "constructed trajectory disagrees "
             "with canonical replay containers"
         )
+
+    # --------------------------------------------------------
+    # Structural validation
+    # --------------------------------------------------------
+
+    validate_trajectory(
+        result.ops,
+        result.target_obj,
+        result.spec,
+    )
+
+    # --------------------------------------------------------
+    # Measured factor computation
+    #
+    # Independently measure (E, T, D, V) from the canonical
+    # replay — do not trust the requested spec values.
+    # --------------------------------------------------------
+
+    measured = measure_factors(
+        result.ops,
+        result.containers,
+        result.target_obj,
+    )
+
+    result.measured_factors = measured
 
     return result
 

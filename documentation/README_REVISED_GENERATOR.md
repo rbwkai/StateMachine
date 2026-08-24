@@ -42,40 +42,58 @@ This makes difficulty properties explicit and measurable rather than depending o
 
 ## 2. Repository Structure
 
-The current repository is organized as follows:
+The repository is organized as follows:
 
 ```text
-STATEMACHINE/
+StateMachine/
+├── world/                       # Canonical deterministic state machine
+│   ├── errors.py                # InvalidOperation, GenerationError
+│   ├── state.py                 # WorldState, History, state readers
+│   ├── operations.py            # Put, Move, Remove, Split, Merge, Swap, Undo, Redo
+│   └── replay.py                # Deterministic trace replay engine
 │
-├── generator/
-│   ├── __init__.py
-│   ├── probes.py
-│   └── sampler.py
+├── generator/                   # Trajectory constructors & validation
+│   ├── dataset_spec.py          # Taxonomy & Condition specifications
+│   ├── metadata.py              # Measured factor (E, T, D, V, L) computation & verification
+│   ├── probes.py                # Step-wise gold, counterfactual probes, redo validity
+│   ├── sampler.py               # Constrained operation sequence sampling
+│   ├── trajectories.py          # 8 family constructors & canonical replay builder
+│   ├── trajectory_specs.py      # TrajectorySpec configuration dataclass
+│   └── trajectory_validation.py # Formal validation gates per family
 │
-├── render/
-│   ├── __init__.py
-│   ├── names.py
-│   ├── narrative.py
-│   └── templates.py
+├── render/                      # Natural language rendering
+│   ├── names.py                 # Deterministic name registries for entities & containers
+│   ├── narrative.py             # Linguistic rendering engine
+│   └── templates.py             # Surface sentence templates & distractors
 │
-├── world/
-│   ├── __init__.py
-│   ├── errors.py
-│   ├── operations.py
-│   ├── replay.py
-│   └── state.py
+├── experiments/                 # Experimental sweep generation scripts
+│   ├── _common.py               # Shared generation pipeline & JSONL serializer
+│   ├── rq1_depth.py             # RQ1 Temporal depth sweep (E=1, 600 instances)
+│   ├── rq2_revision.py          # RQ2 Revision complexity sweep (E=1, V>=2, 400 instances)
+│   ├── rq3_distractor.py        # RQ3 Distractor interference sweep (E=3, T=8, 300 instances)
+│   └── rq5_pilot.py             # RQ5 Structural pilot (5 families @ T=8, 500 instances)
 │
-├── analysis.py
-├── example.py
-├── generator.py
-├── pipeline.py
-├── sampler.py
-├── trajectory.py
+├── analysis/                    # Failure analysis & curve fitting
+│   ├── failure_onset.py         # Linear/exp/sigmoid fitting, AIC selection, L_f onset
+│   ├── first_error.py           # 5-way error classification (Local, Propagating, etc.)
+│   └── query_analysis.py        # Structural query analysis & QuerySpec
 │
-├── .gitignore
+├── eval/                        # Standardized evaluation harness
+│   ├── models.py                # 5 core SLM models & deterministic decoding configs
+│   └── eval_harness.py          # Prompt formatting, answer extraction, evaluation metrics
 │
-├── generator_renderer_implementation.md
-└── README_REVISED_GENERATOR.md
+├── data/                        # Generated benchmark datasets (JSONL)
+├── test/                        # Automated verification test suites
+│   ├── run_all.py               # Master test runner
+│   ├── smoke_test.py            # World state & pipeline integration tests
+│   ├── smoke_test_trajectories.py # All 8 families validation tests
+│   ├── test_invariants.py       # Mathematical invariant verification (200 instances)
+│   ├── test_measured_factors.py # (E, T, D, V, L) measurement unit tests
+│   └── test_analysis_and_eval.py# Curve fitting, onset, and eval harness tests
+│
+├── example.py                   # Minimal end-to-end demonstration script
+├── pipeline.py                  # End-to-end constraint generation pipeline
+└── status.md                    # Detailed verification status & architectural record
 ```
 
 There are also `__pycache__` directories created automatically by Python. They are implementation artifacts and should not be committed to Git.

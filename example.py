@@ -1,23 +1,24 @@
 """End-to-end demo: generates and prints examples for all 8 trajectory chains
-grouped by theoretical capability, plus procedural meta-probes, with explicit
-parameter and state-transition accounting.
+grouped by the Five-Group Capability Taxonomy, plus procedural meta-probes,
+with explicit parameter and measured factor accounting.
 
 Run with:
-    python example.py
+    python3 example.py
 """
 
 from __future__ import annotations
 
 import random
-from typing import Dict, Any
+from typing import Any, Dict
 
 from generator.dataset_spec import CapabilityGroup, family_capability_group
+from generator.metadata import measure_factors
 from generator.trajectories import available_families, build_trajectory
 from generator.trajectory_specs import TrajectorySpec
+from pipeline import generate_example
 from render.names import NameRegistry
 from render.narrative import question_location, render_narrative
-from pipeline import generate_example
-from world import Move, Put, Remove, Undo, Redo, Split, Merge, Swap
+from world import Merge, Move, Put, Redo, Remove, Split, Swap, Undo
 
 ALL_OPS = [Put, Move, Remove, Undo, Redo, Split, Merge, Swap]
 
@@ -25,7 +26,7 @@ ALL_OPS = [Put, Move, Remove, Undo, Redo, Split, Merge, Swap]
 def print_example_block(
     group_name: str,
     family_title: str,
-    failure_mode: str,
+    failure_hypothesis: str,
     spec: TrajectorySpec,
     rng: random.Random,
 ) -> None:
@@ -36,23 +37,29 @@ def print_example_block(
     target_container = final_state.location.get(traj.target_obj)
     target_name = names.container(target_container) if target_container else "<nowhere>"
 
-    initial_placements = len([op for op in traj.ops if isinstance(op, Put)])
-    post_init_updates = len([op for op in traj.ops if not isinstance(op, Put)])
+    # Compute measured factors
+    m = measure_factors(traj.ops, traj.containers, traj.target_obj, sentences=sentences)
+
+    initial_placements = sum(1 for op in traj.ops if isinstance(op, Put))
+    post_init_updates = sum(1 for op in traj.ops if not isinstance(op, Put))
     total_transitions = len(traj.ops)
-    rendered_text = " ".join(sentences)
-    token_count_L = len(rendered_text.split())
 
     print("=" * 74)
     print(f"CAPABILITY GROUP: {group_name}")
     print(f"FAMILY:           {spec.family.upper()} ({family_title})")
-    print(f"Tested Failure:   {failure_mode}")
+    print(f"Targeted Hypoth.: {failure_hypothesis}")
     print("-" * 74)
-    print("Parameter Accounting:")
-    print(f"  - Initial Placements (E)       = {initial_placements}")
-    print(f"  - Post-Init Operations (U)     = {post_init_updates}  (T={spec.target_updates} target ops, D={spec.distractor_updates} distractor ops)")
-    print(f"  - Total Symbolic Operations (S)= {total_transitions}  (S = E + U)")
+    print("Parameter Accounting & Measured Factors:")
+    print(f"  - Entity Load (E)              = {m.E_actual}")
+    print(f"  - Target-Relevant Ops (T)      = {m.T_actual}")
+    print(f"  - Distractor Ops (D)           = {m.D_actual}")
+    print(f"  - State Revision Count (V)     = {m.V_actual}")
+    print(f"  - Post-Init Operations (U)     = {post_init_updates}  (bookkeeping: U = T + D)")
+    print(f"  - Total Symbolic Ops (S)       = {total_transitions}  (S = E + U)")
     print(f"  - Rendered Sentences           = {len(sentences)}")
-    print(f"  - Rendered Tokens (L)          = {token_count_L} tokens  (thesis constraint: L < 600)")
+    print(f"  - Textual Distractors (N)      = {m.N_actual}")
+    print(f"  - Rendered Length (L_word)     = {m.L_word} words  (proxy for tokenizer tokens)")
+    print(f"  - Measured Factor Tuple        = (E={m.E_actual}, T={m.T_actual}, D={m.D_actual}, V={m.V_actual}, L_word={m.L_word}, N={m.N_actual})")
     print("-" * 74)
     print("Process Narrative:")
     for idx, s in enumerate(sentences, 1):
@@ -70,73 +77,73 @@ def main() -> None:
     family_demos = [
         # Group A: Sequential State Tracking
         (
-            "GROUP A: SEQUENTIAL STATE TRACKING (Core / Naturalistic Transfer Target)",
+            "GROUP A: SEQUENTIAL STATE TRACKING (Core RQ1 / Naturalistic Reference)",
             "basic_chain",
-            "Sequential Capacity (RQ1)",
-            "Forgetting or drifting over a long sequential update chain.",
+            "Temporal Depth (RQ1)",
+            "Degradation as temporal update depth increases under clean baseline conditions.",
             TrajectorySpec(family="basic_chain", entity_count=1, total_updates=4, target_updates=4),
         ),
         (
-            "GROUP A: SEQUENTIAL STATE TRACKING (Core / Naturalistic Transfer Target)",
+            "GROUP A: SEQUENTIAL STATE TRACKING (Core RQ2 / Naturalistic Reference)",
             "revision",
-            "Current-vs-Past Disambiguation (RQ4)",
-            "Reporting a stale, previously occupied location.",
+            "State Revision (RQ2)",
+            "Interference from previously established historical states at matched temporal depth.",
             TrajectorySpec(family="revision", entity_count=1, total_updates=6, target_updates=6),
         ),
         # Group B: Multi-Entity Interference
         (
-            "GROUP B: MULTI-ENTITY INTERFERENCE (Core / Naturalistic Transfer Target)",
+            "GROUP B: MULTI-ENTITY INTERFERENCE (Core RQ3 / Naturalistic Reference)",
             "interleaved_chain",
-            "Selective Tracking Under Interference (RQ3)",
-            "Attending to distractor updates instead of target updates.",
+            "Distractor Interference (RQ3)",
+            "Susceptibility to irrelevant state-transition interference at constant entity load.",
             TrajectorySpec(family="interleaved_chain", entity_count=3, total_updates=4, target_updates=2, distractor_updates=2),
         ),
-        # Group C: Identity Transformation (RQ5 Sub-theme 1)
+        # Group C: Identity Transformation (RQ5 Pilot)
         (
-            "GROUP C: IDENTITY TRANSFORMATION (RQ5 Synthetic Extension: Dynamic Cardinality)",
+            "GROUP C: IDENTITY TRANSFORMATION (RQ5 Structural Pilot: Dynamic Cardinality)",
             "split_chain",
-            "Identity Multiplication (RQ5.1)",
-            "Merging child entities back into one or losing track of post-split objects.",
+            "Identity Branching (RQ5.1)",
+            "Failure to track branched child identity separately from the original target.",
             TrajectorySpec(family="split_chain", entity_count=2, total_updates=4, target_updates=4),
         ),
         (
-            "GROUP C: IDENTITY TRANSFORMATION (RQ5 Synthetic Extension: Dynamic Cardinality)",
+            "GROUP C: IDENTITY TRANSFORMATION (RQ5 Structural Pilot: Dynamic Cardinality)",
             "merge_chain",
-            "Identity Consolidation (RQ5.1)",
-            "Over-persistence: reporting a stale location for an entity after a container merge.",
+            "State Consolidation (RQ5.1)",
+            "Over-persistence: failing to apply container-level relocation to merged entities.",
             TrajectorySpec(family="merge_chain", entity_count=2, total_updates=3, target_updates=3),
         ),
-        # Group D: Global State Operations (RQ5 Sub-theme 2)
+        # Group D: Global State Operations (RQ5 Pilot)
         (
-            "GROUP D: GLOBAL STATE OPERATIONS (RQ5 Synthetic Extension: Bilateral Exchange)",
+            "GROUP D: GLOBAL STATE OPERATIONS (RQ5 Structural Pilot: Bilateral Exchange)",
             "swap_chain",
-            "Simultaneous Bilateral Update (RQ5.2)",
-            "No-temp-variable bug: placing both entities in the same container.",
+            "Bilateral Exchange (RQ5.2)",
+            "Relational state exchange failure (unilateral overwrite error).",
             TrajectorySpec(family="swap_chain", entity_count=2, total_updates=3, target_updates=3),
         ),
-        # Group E: Temporal Edit History (RQ5 Sub-theme 3)
+        # Group E: Temporal Edit History (RQ5 Pilot)
         (
-            "GROUP E: TEMPORAL EDIT HISTORY (RQ5 Synthetic Extension: History Mutability)",
+            "GROUP E: TEMPORAL EDIT HISTORY (RQ5 Structural Pilot: History Mutability)",
             "undo_chain",
-            "Rollback / Contradiction (RQ5.3)",
+            "State Rollback (RQ5.3)",
             "Treating an undone action as if it still took effect.",
             TrajectorySpec(family="undo_chain", entity_count=1, total_updates=3, target_updates=3),
         ),
         (
-            "GROUP E: TEMPORAL EDIT HISTORY (RQ5 Synthetic Extension: History Mutability)",
+            "GROUP E: TEMPORAL EDIT HISTORY (RQ5 Structural Pilot: History Mutability)",
             "undo_redo_chain",
             "3-Way Edit History Awareness (RQ5.3)",
-            "Conflating 'undone' state with 'redone' state.",
+            "Conflating undone state with redone state during history cycles.",
             TrajectorySpec(family="undo_redo_chain", entity_count=1, total_updates=4, target_updates=4),
         ),
     ]
 
     print("\n" + "#" * 74)
-    print("# DWS-BENCH: 5-WAY THEORETICAL CAPABILITY TAXONOMY (ALL 8 FAMILIES)")
+    print("# DWS-BENCH: FIVE-GROUP CAPABILITY TAXONOMY (ALL 8 TRAJECTORY FAMILIES)")
     print("#" * 74 + "\n")
 
-    for group_name, family, title, failure_mode, spec in family_demos:
-        print_example_block(group_name, title, failure_mode, spec, rng)
+    for group_name, family, title, failure_hypothesis, spec in family_demos:
+        print_example_block(group_name, title, failure_hypothesis, spec, rng)
 
     print("#" * 74)
     print("# PROCEDURAL EXECUTION / STATE-MACHINE META-PROBE")
