@@ -122,6 +122,33 @@ Evaluates 5 core instruction-tuned small language models under identical determi
   - `allenai/OLMo-2-1124-7B-Instruct` (or `allenai/OLMo-2-1B-Instruct`)
 - **Standardized Decoding**: `temperature=0.0`, `do_sample=False`, `max_new_tokens=128`, standardized zero-shot prompt template.
 
+### Running SLMs via `run_eval.py`
+
+Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+Run evaluation across models and experimental slices:
+```bash
+# Mock dry-run on full benchmark (no GPU required)
+python3 run_eval.py --model qwen2.5-0.5b --dataset full --mock
+
+# Evaluate Qwen2.5-0.5B on RQ1 Temporal Depth Sweep
+python3 run_eval.py --model qwen2.5-0.5b --dataset rq1 --device cuda --precision bfloat16
+
+# Evaluate Llama-3.2-3B on full benchmark with 4-bit quantization
+python3 run_eval.py --model llama-3.2-3b --dataset full --device auto --precision 4bit
+
+# Evaluate with Chain-of-Thought (CoT) prompting
+python3 run_eval.py --model qwen2.5-3b --dataset full --cot --device cuda
+```
+
+Evaluation outputs stored in `results/<model_name>/`:
+- `<dataset>_predictions.jsonl`: Detailed per-instance model predictions, extracted answers, and correctness.
+- `<dataset>_metrics.json`: Aggregated accuracy, per-family breakdowns, and failure onsets ($L_T, L_D$).
+- `<dataset>_report.md`: Markdown summary table and degradation curves.
+
 ---
 
 ## 7. Naturalistic Reference & ProPara Scope
@@ -133,7 +160,12 @@ ProPara serves as an **external naturalistic reference point** rather than a syn
 
 ---
 
-## 8. Verification & Test Suites
+## 8. Benchmark Generation & Test Suites
+
+Generate the complete benchmark suite (1,800 instances):
+```bash
+python3 generate_all.py
+```
 
 Run the complete master test suite:
 ```bash
@@ -142,8 +174,6 @@ python3 test/run_all.py
 
 Run dry-run reachability probes:
 ```bash
-python3 experiments/rq1_depth.py --dry-run
-python3 experiments/rq2_revision.py --dry-run
-python3 experiments/rq3_distractor.py --dry-run
-python3 experiments/rq5_pilot.py --dry-run
+python3 generate_all.py --dry-run
 ```
+

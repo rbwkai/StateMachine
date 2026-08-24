@@ -1,0 +1,11 @@
+# Core dependencies for SLM inference and evaluation in DWS-Bench
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
+tqdm>=4.66.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Optional dependencies for accelerated / quantized inference
+# vllm>=0.4.0           # High-throughput batched inference
+# bitsandbytes>=0.43.0  # 4-bit / 8-bit quantization
