@@ -1,3 +1,12 @@
+from .dataset_spec import (
+    CapabilityGroup,
+    Condition,
+    Experiment,
+    GenerationStatus,
+    STRUCTURAL_FAMILIES,
+    family_capability_group,
+)
+
 from .probes import (
     CountQuery,
     LocationQuery,
@@ -16,13 +25,28 @@ from .trajectories import (
     ConstructedTrajectory,
     TrajectorySpec,
     available_families,
+    build_basic_chain,
+    build_interleaved_chain,
+    build_merge_chain,
+    build_revision,
+    build_split_chain,
+    build_swap_chain,
     build_trajectory,
+    build_undo_chain,
+    build_undo_redo_chain,
     validate_trajectory,
 )
-from .trajectory_specs import TrajectorySpec
-from .trajectory_validation import validate_trajectory
+
 
 __all__ = [
+    # Dataset spec
+    "CapabilityGroup",
+    "Condition",
+    "Experiment",
+    "GenerationStatus",
+    "STRUCTURAL_FAMILIES",
+    "family_capability_group",
+    # Queries / probes
     "CountQuery",
     "LocationQuery",
     "Query",
@@ -34,9 +58,18 @@ __all__ = [
     "select_query",
     "step_wise_gold",
     "sample_sequence",
+    # Trajectory construction
     "ConstructedTrajectory",
     "TrajectorySpec",
     "available_families",
+    "build_basic_chain",
+    "build_interleaved_chain",
+    "build_merge_chain",
+    "build_revision",
+    "build_split_chain",
+    "build_swap_chain",
     "build_trajectory",
+    "build_undo_chain",
+    "build_undo_redo_chain",
     "validate_trajectory",
 ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -64,6 +64,17 @@ class TrajectorySpec:
     min_unique_target_locations: int = 1
 
     # --------------------------------------------------------
+    # Structural operation vocabulary
+    # --------------------------------------------------------
+
+    # Names of operation types beyond Put/Move that this
+    # trajectory uses, e.g. frozenset({"split"}), frozenset({"undo",
+    # "redo"}).  Empty for all three original families.
+    # Values must match world operation class names lowercased:
+    # "split", "merge", "swap", "undo", "redo".
+    structural_ops: frozenset = field(default_factory=frozenset)
+
+    # --------------------------------------------------------
     # Optional deterministic target
     # --------------------------------------------------------
 
@@ -75,9 +86,16 @@ class TrajectorySpec:
         # ====================================================
 
         if self.family not in {
+            # Original RQ1-4 families
             "basic_chain",
             "interleaved_chain",
             "revision",
+            # RQ5 structural families
+            "split_chain",
+            "merge_chain",
+            "swap_chain",
+            "undo_chain",
+            "undo_redo_chain",
         }:
             raise ValueError(
                 f"unknown trajectory family: "
@@ -127,21 +145,39 @@ class TrajectorySpec:
 
         # ====================================================
         # Update-count consistency
+        #
+        # For structural families (split_chain, merge_chain,
+        # swap_chain, undo_chain, undo_redo_chain) the
+        # target_updates field counts ALL non-Put ops on the
+        # target entity, including structural ops (Split, Undo,
+        # Redo …).  The invariant still holds; we just skip
+        # the check here so that family-specific validators can
+        # enforce their own counting rules without being
+        # second-guessed at spec construction time.
         # ====================================================
 
-        expected_updates = (
-            self.target_updates
-            + self.distractor_updates
-        )
+        _structural_families = {
+            "split_chain",
+            "merge_chain",
+            "swap_chain",
+            "undo_chain",
+            "undo_redo_chain",
+        }
 
-        if expected_updates != self.total_updates:
-            raise ValueError(
-                "total_updates must equal "
-                "target_updates + distractor_updates; "
-                f"got total_updates={self.total_updates}, "
-                f"target_updates={self.target_updates}, "
-                f"distractor_updates={self.distractor_updates}"
+        if self.family not in _structural_families:
+            expected_updates = (
+                self.target_updates
+                + self.distractor_updates
             )
+
+            if expected_updates != self.total_updates:
+                raise ValueError(
+                    "total_updates must equal "
+                    "target_updates + distractor_updates; "
+                    f"got total_updates={self.total_updates}, "
+                    f"target_updates={self.target_updates}, "
+                    f"distractor_updates={self.distractor_updates}"
+                )
 
         # ====================================================
         # IMPORTANT:
