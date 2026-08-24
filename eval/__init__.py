@@ -2,6 +2,7 @@
 eval package for DWS-Bench.
 """
 
+from .engine import HuggingFaceEngine, InferenceEngine, MockInferenceEngine
 from .eval_harness import (
     ConditionEvalSummary,
     InstanceEvalResult,
@@ -20,4 +21,7 @@ __all__ = [
     "ModelConfig",
     "CORE_MODELS",
     "OPTIONAL_MODELS",
+    "InferenceEngine",
+    "HuggingFaceEngine",
+    "MockInferenceEngine",
 ]
