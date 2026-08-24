@@ -6,37 +6,37 @@ from typing import Dict
 
 
 # ============================================================
-# Capability Groupings (5-way Taxonomy)
+# Capability Groupings (Five-Group Taxonomy)
 # ============================================================
 
 class CapabilityGroup(Enum):
     """
     Theoretical taxonomy of benchmark capabilities:
 
-    A. SEQUENTIAL_STATE_TRACKING (RQ1, RQ4)
-        Basic linear chain progression and state revision.
+    A. SEQUENTIAL_STATE_TRACKING (RQ1, RQ2)
+        Linear chain progression and state revision.
         Families: basic_chain, revision.
-        Targeted by Naturalistic Transfer (ProPara-CRTS).
+        Targeted by Naturalistic Reference (ProPara).
 
     B. MULTI_ENTITY_INTERFERENCE (RQ3)
-        Selective tracking of target entity under distractor moves.
+        Tracking target entity under distractor state updates on constant entity load.
         Families: interleaved_chain.
-        Targeted by Naturalistic Transfer (ProPara-CRTS).
+        Targeted by Naturalistic Reference (ProPara).
 
-    C. IDENTITY_TRANSFORMATION (RQ5)
+    C. IDENTITY_TRANSFORMATION (RQ5 Pilot)
         Dynamic modification of entity set cardinality (branching & fusion).
         Families: split_chain, merge_chain.
         Synthetic extension benchmark.
 
-    D. GLOBAL_STATE_OPERATIONS (RQ5)
+    D. GLOBAL_STATE_OPERATIONS (RQ5 Pilot)
         Simultaneous multi-entity bilateral updates.
         Families: swap_chain.
         Synthetic extension benchmark.
 
-    E. TEMPORAL_EDIT_HISTORY (RQ5)
+    E. TEMPORAL_EDIT_HISTORY (RQ5 Pilot)
         Mutable history rollback, re-application, and contradiction resolution.
         Families: undo_chain, undo_redo_chain.
-        Synthetic procedural execution / state-machine extension.
+        Synthetic state-machine extension.
     """
 
     SEQUENTIAL_STATE_TRACKING = auto()

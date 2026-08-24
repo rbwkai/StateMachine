@@ -12,6 +12,8 @@ TEST_SCRIPTS = [
     "smoke_test.py",
     "smoke_test_trajectories.py",
     "test_invariants.py",
+    "test_measured_factors.py",
+    "test_analysis_and_eval.py",
 ]
 
 
