@@ -35,6 +35,17 @@ def test_final_answer_marker_is_strictly_compliant() -> None:
     assert result.protocol_compliant
 
 
+def test_articleless_answer_matches_article_prefixed_candidate() -> None:
+    result = extract_instance_answer(
+        "Step 1: large basket\nFinal Answer: large basket",
+        CANDIDATES,
+        chain_of_thought=True,
+    )
+    assert result.answer == "the large basket"
+    assert result.method == "final_answer"
+    assert result.protocol_compliant
+
+
 def test_ambiguous_candidate_mentions_are_invalid() -> None:
     result = extract_instance_answer(
         "The key moved from the old box to the blue shelf.",

@@ -9,7 +9,10 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 def normalize_text(value: object) -> str:
     """Normalize candidate labels without changing their semantic content."""
-    return re.sub(r"\s+", " ", str(value).strip().lower()).strip(" .,!?:;\"'")
+    normalized = re.sub(r"\s+", " ", str(value).strip().lower()).strip(
+        " .,!?:;\"'"
+    )
+    return re.sub(r"^(?:the|a|an)\s+", "", normalized)
 
 
 @dataclass(frozen=True)
