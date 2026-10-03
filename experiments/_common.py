@@ -10,6 +10,7 @@ All experiment scripts use this module to:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import sys
@@ -41,7 +42,7 @@ from world.operations import Put
 # ============================================================
 
 def generate_instance(
-    rng: random.Random,
+    seed: int,
     instance_id: str,
     family: str,
     entity_count: int,
@@ -49,40 +50,35 @@ def generate_instance(
     distractor_updates: int,
     num_containers: int,
     experiment_tag: str,
-    seed: int,
+    condition_id: str = "",
+    min_v: Optional[int] = None,
+    intended_v: Optional[int] = None,
     textual_distractor_count: int = 0,
     max_attempts: int = 50,
+    rng: Optional[random.Random] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Generate one fully-verified DWS-Bench instance.
 
     Returns a JSON-serialisable record on success, or None if
     generation fails after max_attempts.
-
-    The record schema is:
-
-        instance_id        : str
-        family             : str
-        experiment         : str
-        seed               : int
-        requested_factors  : {E, T, D}
-        measured_factors   : {E_actual, T_actual, D_actual, V_actual, L_actual}
-        canonical_trace    : list[{op_type, ...}]
-        sentences          : list[str]
-        context            : str (joined sentences)
-        question           : str
-        query_entity       : str
-        gold_container     : str   (symbolic container id)
-        gold_answer        : str   (rendered container name)
-        step_wise_gold     : list[str]  (gold container after each op)
-        final_state        : {location, containers}
-        spec               : {entity_count, target_updates, ...}
     """
 
     last_exc: Optional[Exception] = None
 
     for attempt in range(max_attempts):
         try:
+            if attempt == 0:
+                sub_seed = seed
+            else:
+                sub_seed = int(
+                    hashlib.sha1(f"{seed}|attempt_{attempt}".encode("utf-8")).hexdigest()[:8],
+                    16,
+                )
+
+            traj_rng = random.Random(sub_seed)
+            name_rng = random.Random(sub_seed * 2 + 1)
+
             total_updates = target_updates + distractor_updates
 
             spec = TrajectorySpec(
@@ -94,22 +90,22 @@ def generate_instance(
                 distractor_updates=distractor_updates,
             )
 
-            t = build_trajectory(rng, spec)
+            t = build_trajectory(traj_rng, spec)
 
-            # Render natural-language narrative.
-            names = NameRegistry(containers=t.containers, rng=rng)
+            # Render natural-language narrative using separate RNG stream for names.
+            names = NameRegistry(containers=t.containers, rng=name_rng)
             sentences, final_state = render_narrative(
                 t.ops, t.containers, names
             )
 
             if textual_distractor_count:
                 distractors = make_distractor_sentences(
-                    rng,
+                    name_rng,
                     textual_distractor_count,
                     names,
                     [op.obj_type for op in t.ops if isinstance(op, Put)],
                 )
-                sentences = splice_distractors(rng, sentences, distractors)
+                sentences = splice_distractors(name_rng, sentences, distractors)
 
             # Recompute measured factors now that sentences exist (for L_actual).
             m = measure_factors(
@@ -119,6 +115,18 @@ def generate_instance(
                 sentences=sentences,
                 textual_distractor_count=textual_distractor_count,
             )
+
+            # Requirement 2: Assert measured factors equal intended design values.
+            if m.E_actual != entity_count:
+                continue
+            if m.T_actual != target_updates:
+                continue
+            if m.D_actual != distractor_updates:
+                continue
+            if min_v is not None and m.V_actual < min_v:
+                continue
+            if intended_v is not None and m.V_actual != intended_v:
+                continue
 
             # Canonical trace (op type + fields).
             canonical_trace = []
@@ -148,6 +156,10 @@ def generate_instance(
                     d["new_obj_id"] = op.new_obj_id
                 canonical_trace.append(d)
 
+            # Requirement 3: Add trace_hash (sha1 of canonical_trace JSON).
+            trace_bytes = json.dumps(canonical_trace, ensure_ascii=False).encode("utf-8")
+            trace_hash = hashlib.sha1(trace_bytes).hexdigest()
+
             # Step-wise gold: target's symbolic container after each op.
             from world import replay_trace
             trace, _, _ = replay_trace(t.ops, t.containers)
@@ -176,7 +188,9 @@ def generate_instance(
                 "instance_id": instance_id,
                 "family": family,
                 "experiment": experiment_tag,
+                "condition_id": condition_id,
                 "seed": seed,
+                "trace_hash": trace_hash,
                 "attempt": attempt,
 
                 "requested_factors": {
@@ -238,22 +252,26 @@ def generate_condition(
     distractor_updates: int,
     num_instances: int,
     experiment_tag: str,
+    condition_id: str = "",
     base_seed: int = 0,
     num_containers: int = 3,
     condition_label: str = "",
+    min_v: Optional[int] = None,
+    intended_v: Optional[int] = None,
     textual_distractor_count: int = 0,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Generate num_instances for one experimental condition.
 
-    Each instance uses seed = base_seed + instance_index so that
-    trajectories are structurally diverse.
-
-    Returns (records, failure_count).
+    Seed calculation:
+        seed = int(sha1(f"{experiment_tag}|{condition_id}|{i}")[:8], 16)
     """
 
+    if not condition_id:
+        condition_id = f"T{target_updates}_D{distractor_updates}_E{entity_count}"
+
     label = condition_label or (
-        f"{family} E={entity_count} T={target_updates} D={distractor_updates}"
+        f"{family} {condition_id}"
     )
 
     print(f"\n  Generating {num_instances} × [{label}]")
@@ -263,16 +281,17 @@ def generate_condition(
     failures = 0
 
     for i in range(num_instances):
-        seed = base_seed + i
-        rng = random.Random(seed)
+        seed_key = f"{experiment_tag}|{condition_id}|{i}"
+        seed = int(hashlib.sha1(seed_key.encode("utf-8")).hexdigest()[:8], 16)
+
         instance_id = (
             f"{experiment_tag}_{family}"
-            f"_T{target_updates}_D{distractor_updates}"
-            f"_s{seed:04d}"
+            f"_{condition_id}"
+            f"_i{i:03d}_s{seed:08x}"
         )
 
         rec = generate_instance(
-            rng=rng,
+            seed=seed,
             instance_id=instance_id,
             family=family,
             entity_count=entity_count,
@@ -280,7 +299,9 @@ def generate_condition(
             distractor_updates=distractor_updates,
             num_containers=num_containers,
             experiment_tag=experiment_tag,
-            seed=seed,
+            condition_id=condition_id,
+            min_v=min_v,
+            intended_v=intended_v,
             textual_distractor_count=textual_distractor_count,
         )
 
@@ -340,7 +361,9 @@ def probe_reachability(
     successes = 0
     errors = []
 
-    for seed in range(n_seeds):
+    for i in range(n_seeds):
+        seed_key = f"probe|{family}|{i}"
+        seed = int(hashlib.sha1(seed_key.encode("utf-8")).hexdigest()[:8], 16)
         rng = random.Random(seed)
         try:
             total_updates = target_updates + distractor_updates
@@ -370,3 +393,4 @@ def probe_reachability(
             print(f"    {e}")
 
     return rate >= 0.8
+

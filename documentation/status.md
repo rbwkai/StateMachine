@@ -33,6 +33,7 @@ Verified via master test runner (`python3 test/run_all.py`):
 | `test/test_invariants.py` | Mathematical invariant consistency over 200 randomized instances | **PASS** |
 | `test/test_measured_factors.py` | $(E, T, D, V, L_{\text{word}}, N)_{\text{actual}}$ factor measurement & mismatch detection | **PASS** |
 | `test/test_analysis_and_eval.py` | Curve fitting (AIC), failure onset, first-error classification, and eval harness | **PASS** |
+| `test/test_scoring.py` | Single scoring engine (eval/scoring.py), candidate matching, step extraction | **PASS** |
 
 All experimental condition reachability probes (`--dry-run`) confirm 10/10 successes for RQ1, RQ2, RQ3, and RQ5 pilot conditions at $T=8$.
 

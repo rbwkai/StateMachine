@@ -147,7 +147,7 @@ assert "Narrative:" in prompt
 assert "Where is the key now?" in prompt
 
 # Answer extraction test
-assert extract_answer("The final location is the wooden shelf.", candidate_containers=["wooden shelf", "glass box"]) == "wooden shelf"
+assert extract_answer("Final Answer: the wooden shelf", candidate_containers=["wooden shelf", "glass box"]) == "wooden shelf"
 assert extract_answer("Answer: True") == "True"
 assert extract_answer("Answer: False") == "False"
 
@@ -174,12 +174,12 @@ mock_instances = [
 mock_predictions = [
     {
         "instance_id": "inst_001",
-        "pred_answer": "wooden shelf",
+        "pred_answer": "Final Answer: wooden shelf",
         "pred_trajectory": ["c0", "c1", "c2", "c0"],
     },
     {
         "instance_id": "inst_002",
-        "pred_answer": "wooden shelf",  # wrong
+        "pred_answer": "Final Answer: wooden shelf",  # wrong
         "pred_trajectory": ["c0", "c0"],  # propagating error
     },
 ]

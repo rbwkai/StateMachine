@@ -46,11 +46,11 @@ from analysis.failure_onset import (
 )
 from analysis.first_error import analyze_first_error
 from eval.engine import HuggingFaceEngine, MockInferenceEngine
-from eval.eval_harness import (
-    extract_answer,
+from eval.scoring import (
+    candidate_answers,
+    extract_instance_answer,
     extract_step_answers,
-    format_prompt,
-    normalize_answer,
+    normalize_text,
 )
 from eval.models import CORE_MODELS, OPTIONAL_MODELS, ModelConfig
 
@@ -62,6 +62,7 @@ DATASET_SHORTCUTS = {
     "rq1": _REPO_ROOT / "data" / "rq1_depth" / "rq1_depth.jsonl",
     "rq2": _REPO_ROOT / "data" / "rq2_revision" / "rq2_revision.jsonl",
     "rq3": _REPO_ROOT / "data" / "rq3_distractor" / "rq3_distractor.jsonl",
+    "rq4": _REPO_ROOT / "data" / "rq4_entity_load" / "rq4_entity_load.jsonl",
     "rq5": _REPO_ROOT / "data" / "rq5_pilot" / "rq5_pilot.jsonl",
 }
 
@@ -116,9 +117,67 @@ def run_evaluation(
     batch_size: int = 8,
     chain_of_thought: bool = False,
     max_new_tokens: Optional[int] = None,
+    prompt_version: str = "v2",
+    overwrite: bool = False,
+    skip_redundant_no_cot: bool = False,
     mock: bool = False,
     hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
+    effective_max_tokens = max_new_tokens or model_config.max_new_tokens
+
+    # Checks on non-CoT and CoT token budgets
+    if not chain_of_thought and effective_max_tokens > 32:
+        logger.warning(
+            f"Warning: max_new_tokens={effective_max_tokens} > 32 for non-CoT evaluation. "
+            "Non-CoT outputs average ~10 tokens and results are budget-invariant."
+        )
+        if skip_redundant_no_cot:
+            logger.info(
+                f"[SKIP] Skipping redundant non-CoT run for {model_config.name} at max_new_tokens={effective_max_tokens}."
+            )
+            return {
+                "model_name": model_config.name,
+                "skipped": True,
+                "reason": "skip_redundant_no_cot",
+            }
+
+    if chain_of_thought:
+        max_gold_steps = max(
+            (
+                len(rec.get("step_wise_gold_answers", []))
+                or len(rec.get("step_wise_gold", []))
+                or rec.get("requested_factors", {}).get("T", 0)
+                or rec.get("measured_factors", {}).get("T_actual", 0)
+            )
+            for rec in dataset_records
+        ) if dataset_records else 0
+        recommended_tokens = 12 * (max_gold_steps + 1)
+        if effective_max_tokens < recommended_tokens:
+            logger.warning(
+                f"Warning: max_new_tokens ({effective_max_tokens}) is less than recommended minimum "
+                f"({recommended_tokens}) for CoT with max_gold_steps={max_gold_steps}. "
+                "Generation may truncate before emitting Final Answer."
+            )
+
+    # Check overwrite protection upfront before inference
+    cot_dir_name = "cot" if chain_of_thought else "no_cot"
+    token_dir_name = f"{cot_dir_name}_{effective_max_tokens}"
+    model_output_dir = output_dir / model_config.name / token_dir_name
+
+    pred_file = model_output_dir / f"{dataset_name}_predictions.jsonl"
+    csv_file = model_output_dir / f"{dataset_name}_audit.csv"
+    metrics_file = model_output_dir / f"{dataset_name}_metrics.json"
+    report_file = model_output_dir / f"{dataset_name}_report.md"
+
+    artifacts = [pred_file, csv_file, metrics_file, report_file]
+    if not overwrite:
+        existing = [str(p) for p in artifacts if p.exists()]
+        if existing:
+            raise FileExistsError(
+                f"Output artifacts already exist in '{model_output_dir}': {existing}.\n"
+                f"Pass --overwrite to overwrite existing evaluation files."
+            )
+
     t0 = time.perf_counter()
 
     # 1. Initialize engine
@@ -146,6 +205,7 @@ def run_evaluation(
             context=rec["context"],
             question=rec["question"],
             chain_of_thought=chain_of_thought,
+            prompt_version=prompt_version,
         )
         prompts.append(prompt)
 
@@ -153,7 +213,7 @@ def run_evaluation(
         batch_prompts = prompts[i : i + batch_size]
         batch_responses = engine.generate_batch(
             batch_prompts,
-            max_new_tokens=max_new_tokens or model_config.max_new_tokens,
+            max_new_tokens=effective_max_tokens,
             temperature=model_config.temperature,
             top_p=model_config.top_p,
             do_sample=model_config.do_sample,
@@ -186,26 +246,31 @@ def run_evaluation(
         gold_answer = str(rec.get("gold_answer", "")).strip()
         gold_container = str(rec.get("gold_container", "")).strip()
 
-        # Extract answer against available containers
-        containers = list(rec.get("final_state", {}).get("containers", []))
-        if gold_answer:
-            containers.append(gold_answer)
-        extracted = extract_answer(raw_pred, candidate_containers=containers)
-
-        is_correct = (
-            normalize_answer(extracted) == normalize_answer(gold_answer)
-            or normalize_answer(extracted) == normalize_answer(gold_container)
+        cands = candidate_answers(rec, dataset_context=dataset_records)
+        extraction = extract_instance_answer(
+            raw_pred,
+            candidates=cands,
+            chain_of_thought=chain_of_thought,
+            gold_answer=gold_answer,
+            instance=rec,
         )
+
+        extracted = extraction.answer
+        semantic_correct = extraction.semantic_correct
+        strict_correct = extraction.strict_correct
+        is_correct = strict_correct
+        is_correct_semantic = semantic_correct
+
         generation_info = all_generation_metadata[index] if index < len(all_generation_metadata) else {}
 
         gold_step_answers = rec.get("step_wise_gold_answers", [])
-        parsed_steps = extract_step_answers(raw_pred, gold_step_answers)
+        parsed_steps = extract_step_answers(raw_pred, cands, num_steps=len(gold_step_answers))
         step_correct = [
-            normalize_answer(pred) == normalize_answer(gold)
+            normalize_text(pred) == normalize_text(gold) if pred is not None else False
             for pred, gold in zip(parsed_steps, gold_step_answers)
         ]
         step_first_error = next(
-            (index + 1 for index, correct in enumerate(step_correct) if not correct),
+            (idx + 1 for idx, correct in enumerate(step_correct) if not correct),
             None,
         )
 
@@ -223,8 +288,14 @@ def run_evaluation(
             "gold_container": gold_container,
             "raw_prediction": raw_pred,
             "prompt": prompt_text,
+            "prompt_version": prompt_version,
             "extracted_answer": extracted,
             "is_correct": is_correct,
+            "is_correct_semantic": is_correct_semantic,
+            "semantic_correct": semantic_correct,
+            "strict_correct": strict_correct,
+            "extraction_method": extraction.method,
+            "protocol_compliant": extraction.protocol_compliant,
             "gold_step_answers": gold_step_answers,
             "predicted_step_answers": parsed_steps,
             "step_correct": step_correct,
@@ -234,7 +305,7 @@ def run_evaluation(
             ),
             "generated_tokens": generation_info.get("generated_tokens"),
             "finish_reason": generation_info.get("finish_reason"),
-            "has_final_answer": bool(generation_info.get("has_final_answer", "final answer:" in raw_pred.lower())),
+            "has_final_answer": extraction.has_final_answer,
             "predicted_answer": extracted,
         }
         instance_results.append(result_item)
@@ -322,7 +393,8 @@ def run_evaluation(
         "stepwise_accuracy": sum(step_values) / len(step_values) if step_values else None,
         "elapsed_seconds": elapsed,
         "chain_of_thought": chain_of_thought,
-        "max_new_tokens": max_new_tokens or model_config.max_new_tokens,
+        "max_new_tokens": effective_max_tokens,
+        "prompt_version": prompt_version,
         "family_accuracies": family_accuracies,
         "rq1_depth_curve": rq1_curve,
         "rq1_failure_onset_L_T": l_t_onset,
@@ -331,23 +403,18 @@ def run_evaluation(
         "rq3_failure_onset_L_D": l_d_onset,
     }
 
-    # 4. Save artifacts
-    model_output_dir = output_dir / model_config.name
+    # Save artifacts into <output-dir>/<model>/<cot_or_no_cot>_<max_new_tokens>/
     model_output_dir.mkdir(parents=True, exist_ok=True)
 
-    pred_file = model_output_dir / f"{dataset_name}_predictions.jsonl"
     with open(pred_file, "w", encoding="utf-8") as f:
         for it in instance_results:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
-    csv_file = model_output_dir / f"{dataset_name}_audit.csv"
     write_audit_csv(instance_results, csv_file)
 
-    metrics_file = model_output_dir / f"{dataset_name}_metrics.json"
     with open(metrics_file, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    report_file = model_output_dir / f"{dataset_name}_report.md"
     generate_markdown_report(metrics, report_file)
 
     logger.info(f"Saved predictions → {pred_file}")
@@ -363,6 +430,8 @@ def write_audit_csv(rows: List[Dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "instance_id", "family", "experiment", "question", "gold_answer",
         "gold_container", "raw_prediction", "extracted_answer", "is_correct",
+        "is_correct_semantic", "semantic_correct", "strict_correct",
+        "extraction_method", "protocol_compliant", "prompt_version",
         "step_accuracy", "step_first_error", "requested_factors", "measured_factors",
         "gold_step_answers", "predicted_step_answers", "step_correct", "prompt",
         "generated_tokens", "finish_reason", "has_final_answer", "predicted_answer",
@@ -387,6 +456,7 @@ def generate_markdown_report(metrics: Dict[str, Any], report_path: Path) -> None
         f"- **Total Instances**: {metrics['total_instances']}",
         f"- **Overall Accuracy (A_final)**: **{metrics['overall_accuracy'] * 100:.2f}%**",
         f"- **Runtime**: {metrics['elapsed_seconds']:.2f}s",
+        f"- **Prompt Version**: `{metrics.get('prompt_version', 'v2')}`",
         "",
         "## Trajectory Family Accuracies",
         "",
@@ -450,7 +520,7 @@ def main():
         "--dataset",
         type=str,
         default="full",
-        help="Dataset shortcut ('full', 'rq1', 'rq2', 'rq3', 'rq5') or path to JSONL",
+        help="Dataset shortcut ('full', 'rq1', 'rq2', 'rq3', 'rq4', 'rq5') or path to JSONL",
     )
     parser.add_argument("--device", type=str, default="auto", help="Device: 'auto', 'cuda', 'cpu', 'mps'")
     parser.add_argument(
@@ -463,6 +533,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for inference")
     parser.add_argument("--cot", action="store_true", help="Use structured step-by-step prompting")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Override generated token limit (default: model config)")
+    parser.add_argument("--prompt-version", type=str, default="v2", choices=["v1", "v2"], help="Prompt version ('v1' or 'v2')")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing evaluation artifacts")
+    parser.add_argument("--skip-redundant-no-cot", action="store_true", help="Skip redundant non-CoT runs with max_new_tokens > 32")
     parser.add_argument("--mock", action="store_true", help="Run mock evaluation (dry-run without model weights)")
     parser.add_argument("--limit", type=int, default=None, help="Limit to first N dataset records")
     parser.add_argument("--output-dir", type=str, default="results", help="Directory to save evaluation artifacts")
@@ -485,6 +558,7 @@ def main():
     print(f"  Precision   : {args.precision}")
     print(f"  Mode        : {'MOCK' if args.mock else 'LIVE'}")
     print(f"  CoT         : {args.cot}")
+    print(f"  Prompt Ver  : {args.prompt_version}")
     print(f"  Output Dir  : {output_dir}")
     print("=" * 75)
 
@@ -498,6 +572,9 @@ def main():
         batch_size=args.batch_size,
         chain_of_thought=args.cot,
         max_new_tokens=args.max_new_tokens,
+        prompt_version=args.prompt_version,
+        overwrite=args.overwrite,
+        skip_redundant_no_cot=args.skip_redundant_no_cot,
         mock=args.mock,
         hf_token=args.hf_token,
     )
@@ -505,8 +582,11 @@ def main():
     print("\n" + "=" * 75)
     print("EVALUATION SUMMARY")
     print("=" * 75)
-    print(f"Overall Accuracy : {metrics['overall_accuracy'] * 100:.2f}% ({metrics['total_instances']} instances)")
-    print(f"Runtime          : {metrics['elapsed_seconds']:.2f}s")
+    if metrics.get("skipped"):
+        print(f"Status           : SKIPPED ({metrics.get('reason')})")
+    else:
+        print(f"Overall Accuracy : {metrics['overall_accuracy'] * 100:.2f}% ({metrics['total_instances']} instances)")
+        print(f"Runtime          : {metrics['elapsed_seconds']:.2f}s")
     print("=" * 75)
 
 

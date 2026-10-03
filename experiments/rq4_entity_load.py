@@ -42,7 +42,6 @@ DISTRACTOR_UPDATES = 4
 NUM_CONTAINERS = 6
 INSTANCES_PER_CONDITION = 50
 EXPERIMENT_TAG = "rq4_entity_load"
-BASE_SEED = 4000
 
 
 def main() -> None:
@@ -94,6 +93,7 @@ def main() -> None:
     start = time.perf_counter()
 
     for index, entity_count in enumerate(ENTITY_LEVELS):
+        condition_id = f"E{entity_count}"
         condition_label = (
             f"{FAMILY} E={entity_count} T={TARGET_UPDATES} D={DISTRACTOR_UPDATES}"
         )
@@ -104,7 +104,7 @@ def main() -> None:
             distractor_updates=DISTRACTOR_UPDATES,
             num_instances=args.instances,
             experiment_tag=EXPERIMENT_TAG,
-            base_seed=BASE_SEED + index * 1000,
+            condition_id=condition_id,
             num_containers=NUM_CONTAINERS,
             condition_label=condition_label,
         )

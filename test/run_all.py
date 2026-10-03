@@ -15,6 +15,7 @@ TEST_SCRIPTS = [
     "test_measured_factors.py",
     "test_analysis_and_eval.py",
     "test_eval_pipeline.py",
+    "test_scoring.py",
 ]
 
 

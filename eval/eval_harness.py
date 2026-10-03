@@ -2,12 +2,6 @@
 eval/eval_harness.py
 ====================
 Standardized Evaluation Harness for DWS-Bench.
-
-Implements §14 of the research plan:
-- Standard prompt construction (direct QA vs trajectory tracking)
-- Deterministic answer extraction and normalization
-- Metric aggregation: final accuracy, trajectory accuracy, first-error breakdown
-- Support for offline prediction evaluation and live model pipelines
 """
 
 from __future__ import annotations
@@ -19,6 +13,15 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 from analysis.failure_onset import compute_failure_onset
 from analysis.first_error import TrajectoryErrorAnalysis, analyze_first_error
+from eval.prompts import build_user_prompt
+from eval.scoring import (
+    AnswerExtraction,
+    candidate_answers,
+    extract_instance_answer,
+    extract_step_answers as _scoring_extract_step_answers,
+    normalize_text,
+    score_prediction,
+)
 
 
 # ============================================================
@@ -30,28 +33,18 @@ def format_prompt(
     question: str,
     system_prompt: Optional[str] = None,
     chain_of_thought: bool = False,
+    prompt_version: str = "v2",
 ) -> str:
     """Format an instance into a standardized evaluation prompt."""
-    prompt_parts = []
+    user_prompt = build_user_prompt(
+        context=context,
+        question=question,
+        chain_of_thought=chain_of_thought,
+        prompt_version=prompt_version,
+    )
     if system_prompt:
-        prompt_parts.append(f"Instructions: {system_prompt}\n")
-
-    prompt_parts.append(f"Narrative:\n{context}\n")
-    prompt_parts.append(f"Question:\n{question}\n")
-
-    if chain_of_thought:
-        prompt_parts.append(
-            "Solve the problem by updating the world state step by step.\n\n"
-            "Step 1: <container>\n"
-            "Step 2: <container>\n"
-            "Step 3: <container>\n\n"
-            "Final Answer: <answer>\n"
-            "Stop immediately after Final Answer."
-        )
-    else:
-        prompt_parts.append("Final Answer: <answer>\nStop immediately after Final Answer.")
-
-    return "\n".join(prompt_parts)
+        return f"Instructions: {system_prompt}\n\n{user_prompt}"
+    return user_prompt
 
 
 # ============================================================
@@ -62,61 +55,34 @@ def extract_answer(
     raw_response: str,
     candidate_containers: Optional[Sequence[str]] = None,
 ) -> str:
-    """
-    Extract and normalize the final predicted answer from a raw model output.
-    """
-    cleaned = raw_response.strip().lower()
-
-    # Only the explicit final-answer marker is authoritative. Text elsewhere
-    # in a long generation must never receive credit.
-    final_match = re.search(r"final\s+answer\s*:\s*(.+?)(?:\n|$)", cleaned, re.IGNORECASE)
-    if not final_match:
-        return ""
-    final_segment = final_match.group(1).strip()
-
-    # Boolean check (e.g. redo-validity)
-    if final_segment == "true":
-        return "True"
-    if final_segment == "false":
-        return "False"
-
-    # Match candidate container names if provided
-    if candidate_containers:
-        for container in sorted(candidate_containers, key=len, reverse=True):
-            if container.lower() in final_segment:
-                return container
-
-    return re.sub(r"[^\w\s-]", "", final_segment).strip()
+    """Deprecated: Thin wrapper around eval.scoring for backward compatibility."""
+    cands = list(candidate_containers) if candidate_containers else []
+    ans_match = re.search(r"(?:final\s+)?answer\s*:\s*(.+?)(?:\n|$)", raw_response, re.IGNORECASE)
+    if not cands and ans_match:
+        seg = ans_match.group(1).strip().lower()
+        if seg in {"true", "false"}:
+            cands = ["True", "False"]
+    extraction = extract_instance_answer(raw_response, candidates=cands)
+    if extraction.answer and (extraction.has_final_answer or ans_match):
+        return extraction.answer
+    return ""
 
 
 def normalize_answer(value: Any) -> str:
     """Normalize harmless formatting differences for final-answer comparison."""
-    return re.sub(r"\s+", " ", str(value).strip().lower()).strip(" .,!?:;\"'")
+    return normalize_text(value)
 
 
 def extract_step_answers(
     raw_response: str,
     candidate_answers: Sequence[str],
-) -> List[str]:
-    """Extract explicit ``Step N: answer`` values from a model response."""
-    answers: List[str] = []
-    candidates = sorted(
-        (str(answer) for answer in candidate_answers if answer),
-        key=len,
-        reverse=True,
-    )
-    step_pattern = re.compile(
-        r"(?:^|\n)\s*(?:step\s*)?(\d+)\s*[:.)-]\s*(.*)",
-        re.IGNORECASE,
-    )
-    for match in step_pattern.finditer(raw_response):
-        text = match.group(2).strip()
-        answer = next(
-            (candidate for candidate in candidates if candidate.lower() in text.lower()),
-            extract_answer(text, candidate_containers=candidates),
-        )
-        answers.append(answer)
-    return answers
+) -> List[Optional[str]]:
+    """
+    Extract step-wise container predictions from model responses.
+
+    Gold step 1 is the initial Put location (state after op 0).
+    """
+    return _scoring_extract_step_answers(raw_response, candidate_answers)
 
 
 # ============================================================
@@ -170,21 +136,11 @@ def evaluate_predictions(
 
     for inst in instances:
         iid = inst["instance_id"]
-        gold_answer = str(inst.get("gold_answer", "")).strip().lower()
-
         pred_info = pred_map.get(iid, {})
-        raw_pred = str(pred_info.get("pred_answer", "")).strip()
+        raw_pred = str(pred_info.get("pred_answer") or pred_info.get("raw_prediction") or "").strip()
 
-        # Extract answer against known container names if available
-        containers = list(inst.get("final_state", {}).get("containers", []))
-        if inst.get("gold_answer"):
-            containers.append(str(inst["gold_answer"]))
-        extracted_pred = extract_answer(raw_pred, candidate_containers=containers).lower()
-
-        is_correct = (
-            normalize_answer(extracted_pred) == normalize_answer(gold_answer)
-            or normalize_answer(raw_pred) == normalize_answer(gold_answer)
-        )
+        scored = score_prediction(pred_info, inst, dataset_context=instances)
+        is_correct = scored["strict_correct"]
 
         # Trajectory error analysis if step-wise predictions are present
         gold_traj = inst.get("step_wise_gold")

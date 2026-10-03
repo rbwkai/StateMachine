@@ -47,7 +47,6 @@ DISTRACTOR_UPDATES = 0        # D=0 — no interference
 NUM_CONTAINERS   = 3
 INSTANCES_PER_CONDITION = 50
 EXPERIMENT_TAG   = "rq1_depth"
-BASE_SEED        = 1000       # Distinct from other experiments
 
 T_LEVELS = [2, 4, 6, 8, 12, 16]
 
@@ -131,6 +130,7 @@ def main():
     t0 = time.perf_counter()
 
     for T in T_LEVELS:
+        condition_id = f"T{T}"
         condition_label = (
             f"basic_chain E={ENTITY_COUNT} T={T} D={DISTRACTOR_UPDATES}"
         )
@@ -142,7 +142,7 @@ def main():
             distractor_updates=DISTRACTOR_UPDATES,
             num_instances=args.instances,
             experiment_tag=EXPERIMENT_TAG,
-            base_seed=BASE_SEED + T * 1000,
+            condition_id=condition_id,
             num_containers=NUM_CONTAINERS,
             condition_label=condition_label,
         )

@@ -270,6 +270,12 @@ def _redo(
     return _apply(state, history, ops, Redo())
 
 
+OBJECT_TYPES: List[str] = [
+    "key", "apple", "phone", "map", "coin", "book", "pen",
+    "card", "ring", "token", "gem", "watch", "letter",
+]
+
+
 # ============================================================
 # Basic chain
 # ============================================================
@@ -321,8 +327,10 @@ def build_basic_chain(
     ops: List[Operation] = []
 
     target = spec.target_obj or "o0"
-
     container_list = sorted(containers)
+
+    target_type = rng.choice(OBJECT_TYPES)
+    start_container = rng.choice(container_list)
 
     # --------------------------------------------------------
     # Setup
@@ -333,17 +341,17 @@ def build_basic_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        start_container,
     )
 
     # --------------------------------------------------------
     # Target updates
     # --------------------------------------------------------
 
-    current = container_list[0]
+    current = start_container
 
-    for i in range(spec.target_updates):
+    for _ in range(spec.target_updates):
 
         candidates = [
             c
@@ -351,9 +359,7 @@ def build_basic_chain(
             if c != current
         ]
 
-        destination = candidates[
-            i % len(candidates)
-        ]
+        destination = rng.choice(candidates)
 
         state = _move(
             state,
@@ -439,34 +445,30 @@ def build_interleaved_chain(
     ops: List[Operation] = []
 
     container_list = sorted(containers)
+    target = spec.target_obj or "o0"
+
+    types_pool = rng.sample(
+        OBJECT_TYPES, k=min(len(OBJECT_TYPES), spec.entity_count)
+    )
+    target_type = types_pool[0]
+    target_start = rng.choice(container_list)
 
     # --------------------------------------------------------
     # Target
     # --------------------------------------------------------
-
-    target = spec.target_obj or "o0"
 
     state = _put(
         state,
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        target_start,
     )
 
     # --------------------------------------------------------
     # Distractors
     # --------------------------------------------------------
-
-    distractor_types = [
-        "apple",
-        "phone",
-        "map",
-        "coin",
-        "book",
-        "pen",
-    ]
 
     distractor_ids: List[str] = []
 
@@ -474,13 +476,8 @@ def build_interleaved_chain(
 
         obj_id = f"o{i + 1}"
 
-        obj_type = distractor_types[
-            i % len(distractor_types)
-        ]
-
-        container = container_list[
-            (i + 1) % len(container_list)
-        ]
+        obj_type = types_pool[(i + 1) % len(types_pool)]
+        container = rng.choice(container_list)
 
         state = _put(
             state,
@@ -497,7 +494,7 @@ def build_interleaved_chain(
     # Controlled interleaving
     # --------------------------------------------------------
 
-    target_current = container_list[0]
+    target_current = target_start
 
     target_done = 0
     distractor_done = 0
@@ -516,9 +513,7 @@ def build_interleaved_chain(
                 if c != target_current
             ]
 
-            destination = candidates[
-                target_done % len(candidates)
-            ]
+            destination = rng.choice(candidates)
 
             state = _move(
                 state,
@@ -534,10 +529,7 @@ def build_interleaved_chain(
         # Distractor operation.
         if distractor_done < spec.distractor_updates:
 
-            distractor_id = distractor_ids[
-                distractor_done
-                % len(distractor_ids)
-            ]
+            distractor_id = rng.choice(distractor_ids)
 
             current = state.location[
                 distractor_id
@@ -549,10 +541,7 @@ def build_interleaved_chain(
                 if c != current
             ]
 
-            destination = candidates[
-                distractor_done
-                % len(candidates)
-            ]
+            destination = rng.choice(candidates)
 
             state = _move(
                 state,
@@ -617,8 +606,11 @@ def build_revision(
     ops: List[Operation] = []
 
     target = spec.target_obj or "o0"
-
     container_list = sorted(containers)
+
+    perm = rng.sample(container_list, len(container_list))
+    start_container = perm[0]
+    target_type = rng.choice(OBJECT_TYPES)
 
     # --------------------------------------------------------
     # Setup
@@ -629,24 +621,24 @@ def build_revision(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        start_container,
     )
 
     # --------------------------------------------------------
-    # Explicit revision pattern
+    # Explicit revision pattern over permuted containers
     # --------------------------------------------------------
 
     revision_pattern = [
-        container_list[1],
-        container_list[2 % len(container_list)],
-        container_list[1],
-        container_list[0],
-        container_list[2 % len(container_list)],
-        container_list[0],
+        perm[1],
+        perm[2 % len(perm)],
+        perm[1],
+        perm[0],
+        perm[2 % len(perm)],
+        perm[0],
     ]
 
-    current = container_list[0]
+    current = start_container
 
     for i in range(spec.target_updates):
 
@@ -663,9 +655,7 @@ def build_revision(
                 if c != current
             ]
 
-            destination = candidates[
-                i % len(candidates)
-            ]
+            destination = rng.choice(candidates)
 
         state = _move(
             state,
@@ -687,7 +677,6 @@ def build_revision(
     )
 
 
-
 # ============================================================
 # split_chain
 # ============================================================
@@ -699,42 +688,6 @@ def build_split_chain(
     """
     Construct a trajectory that introduces identity multiplication
     via a Split operation.
-
-    Structure::
-
-        Setup:
-            Put target -> c0
-
-        Pre-split:
-            Move target -> c1        (establishes independent identity)
-
-        Split:
-            Split target -> child    (child appears at c1 alongside target)
-
-        Post-split (target_updates - 2 remaining target moves):
-            Move target -> c2
-            Move target -> c0
-            ...
-
-        Distractor moves (distractor_updates child moves):
-            Move child -> c2
-            Move child -> c1
-            ...
-
-    target_obj
-        The original entity (before the split).  After the split
-        both target and child are trackable, but queries probe
-        the original.
-
-    Distinct failure mode
-        The model merges child back into target (reports target's
-        location for child or vice versa), or loses track of one
-        of the two post-split entities entirely.
-
-    Constraints
-        entity_count = 2 (target + child)
-        target_updates >= 2 (at least pre-split move + post-split move)
-        structural_ops must contain "split"
     """
 
     if spec.entity_count != 2:
@@ -761,6 +714,9 @@ def build_split_chain(
     target = spec.target_obj or "o0"
     child = "o1"
 
+    start_c = rng.choice(container_list)
+    target_type = rng.choice(OBJECT_TYPES)
+
     # --------------------------------------------------------
     # Setup
     # --------------------------------------------------------
@@ -770,8 +726,8 @@ def build_split_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        start_c,
     )
 
     # --------------------------------------------------------
@@ -779,9 +735,9 @@ def build_split_chain(
     # --------------------------------------------------------
 
     pre_split_candidates = [
-        c for c in container_list if c != container_list[0]
+        c for c in container_list if c != start_c
     ]
-    pre_split_dst = pre_split_candidates[0]
+    pre_split_dst = rng.choice(pre_split_candidates)
 
     state = _move(
         state,
@@ -796,7 +752,6 @@ def build_split_chain(
 
     # --------------------------------------------------------
     # Split: child spawns at the same container as target
-    # The Split operation counts as 1 target update on target.
     # --------------------------------------------------------
 
     state = _split(
@@ -820,9 +775,7 @@ def build_split_chain(
             c for c in container_list if c != target_current
         ]
 
-        dst = candidates[
-            target_updates_done % len(candidates)
-        ]
+        dst = rng.choice(candidates)
 
         state = _move(
             state,
@@ -839,13 +792,13 @@ def build_split_chain(
     # Distractor: move child
     # --------------------------------------------------------
 
-    for i in range(spec.distractor_updates):
+    for _ in range(spec.distractor_updates):
 
         candidates = [
             c for c in container_list if c != child_current
         ]
 
-        dst = candidates[i % len(candidates)]
+        dst = rng.choice(candidates)
 
         state = _move(
             state,
@@ -878,41 +831,6 @@ def build_merge_chain(
     """
     Construct a trajectory that introduces identity consolidation
     via a container-level Merge operation.
-
-    The Merge op moves all objects from a source container into a
-    destination container.  Objects continue to exist; only their
-    location changes.
-
-    Structure::
-
-        Setup:
-            Put target -> c0
-            Put companion -> c1
-
-        Pre-merge moves (optional, controlled by target_updates):
-            Move target -> c0
-            Move companion -> c0   (bring companion into same container)
-
-        Merge:
-            Merge c0 -> c2         (target and companion both relocate)
-
-        Post-merge moves:
-            Move target -> c3
-            ...
-
-    target_obj
-        The primary entity whose location is queried.
-
-    Distinct failure mode
-        Over-persistence: the model reports target at c0 (its
-        pre-merge container) instead of c2 (the merge destination),
-        because it failed to apply the container-level relocation.
-
-    Constraints
-        entity_count >= 2 (target + at least one companion to merge with)
-        target_updates >= 2 (at least one move to set up the merge src +
-                             the merge op itself counts as one target update)
-        structural_ops must contain "merge"
     """
 
     if spec.entity_count < 2:
@@ -937,9 +855,10 @@ def build_merge_chain(
 
     target = spec.target_obj or "o0"
 
-    distractor_types = [
-        "apple", "phone", "map", "coin", "book", "pen",
-    ]
+    types_pool = rng.sample(
+        OBJECT_TYPES, k=min(len(OBJECT_TYPES), spec.entity_count)
+    )
+    start_c = rng.choice(container_list)
 
     # --------------------------------------------------------
     # Setup: place target and companions in initial container
@@ -950,15 +869,15 @@ def build_merge_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        types_pool[0],
+        start_c,
     )
 
     companion_ids: List[str] = []
 
     for i in range(spec.entity_count - 1):
         companion_id = f"o{i + 1}"
-        obj_type = distractor_types[i % len(distractor_types)]
+        obj_type = types_pool[(i + 1) % len(types_pool)]
 
         state = _put(
             state,
@@ -966,23 +885,19 @@ def build_merge_chain(
             ops,
             companion_id,
             obj_type,
-            container_list[0],
+            start_c,
         )
 
         companion_ids.append(companion_id)
 
-    target_current = container_list[0]
+    target_current = start_c
 
     # --------------------------------------------------------
-    # Merge: relocate everything from target_current to c1
-    # This causally moves target (and all companions) to merge_dst,
-    # counting as exactly 1 target update.
+    # Merge: relocate everything from target_current to merge_dst
     # --------------------------------------------------------
 
-    merge_dst = container_list[
-        (container_list.index(target_current) + 1)
-        % len(container_list)
-    ]
+    merge_candidates = [c for c in container_list if c != target_current]
+    merge_dst = rng.choice(merge_candidates)
 
     state = _merge(
         state,
@@ -1005,9 +920,7 @@ def build_merge_chain(
             c for c in container_list if c != target_current
         ]
 
-        dst = candidates[
-            target_updates_done % len(candidates)
-        ]
+        dst = rng.choice(candidates)
 
         state = _move(
             state,
@@ -1021,14 +934,12 @@ def build_merge_chain(
         target_updates_done += 1
 
     # --------------------------------------------------------
-    # Distractor: move companions (strictly distractor_updates)
+    # Distractor: move companions
     # --------------------------------------------------------
 
-    for i in range(spec.distractor_updates):
+    for _ in range(spec.distractor_updates):
 
-        companion_id = companion_ids[
-            i % len(companion_ids)
-        ]
+        companion_id = rng.choice(companion_ids)
 
         current = state.location[companion_id]
 
@@ -1036,7 +947,7 @@ def build_merge_chain(
             c for c in container_list if c != current
         ]
 
-        dst = candidates[i % len(candidates)]
+        dst = rng.choice(candidates)
 
         state = _move(
             state,
@@ -1067,33 +978,6 @@ def build_swap_chain(
     """
     Construct a trajectory that introduces simultaneous bilateral
     updates via Swap operations.
-
-    Structure::
-
-        Setup:
-            Put target -> c0
-            Put other   -> c1
-
-        Swap c0 <-> c1              (target now at c1, other at c0)
-
-        Move target -> c2           (target moves independently)
-
-        Swap c0 <-> c2              (target now at c0, other at c2)
-        ...
-
-    target_obj
-        The entity initially at c0.
-
-    Distinct failure mode
-        The no-temp-variable bug: the model applies the swap
-        as two sequential moves, placing both entities in the
-        same container (whichever was written second).
-
-    Constraints
-        entity_count >= 2 (need two entities to observe a swap)
-        num_containers >= 2 (need two containers to swap)
-        target_updates >= 1 (at least one swap counts as a target update)
-        structural_ops must contain "swap"
     """
 
     if spec.entity_count < 2:
@@ -1122,12 +1006,16 @@ def build_swap_chain(
     target = spec.target_obj or "o0"
     other = "o1"
 
-    distractor_types = [
-        "apple", "phone", "map", "coin", "book", "pen",
-    ]
+    perm = rng.sample(container_list, len(container_list))
+    target_start = perm[0]
+    other_start = perm[1 % len(perm)]
+
+    types_pool = rng.sample(
+        OBJECT_TYPES, k=min(len(OBJECT_TYPES), spec.entity_count)
+    )
 
     # --------------------------------------------------------
-    # Setup: target at c0, other at c1
+    # Setup: target at target_start, other at other_start
     # --------------------------------------------------------
 
     state = _put(
@@ -1135,8 +1023,8 @@ def build_swap_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        types_pool[0],
+        target_start,
     )
 
     state = _put(
@@ -1144,27 +1032,27 @@ def build_swap_chain(
         history,
         ops,
         other,
-        distractor_types[0],
-        container_list[1],
+        types_pool[1 % len(types_pool)],
+        other_start,
     )
 
-    # Extra companions if entity_count > 2
     companion_ids = [other]
 
     for i in range(2, spec.entity_count):
         companion_id = f"o{i}"
+        c = rng.choice(container_list)
         state = _put(
             state,
             history,
             ops,
             companion_id,
-            distractor_types[i % len(distractor_types)],
-            container_list[i % len(container_list)],
+            types_pool[i % len(types_pool)],
+            c,
         )
         companion_ids.append(companion_id)
 
-    target_current = container_list[0]
-    other_current = container_list[1]
+    target_current = target_start
+    other_current = other_start
 
     updates_done = 0
 
@@ -1174,7 +1062,6 @@ def build_swap_chain(
 
     while updates_done < spec.target_updates:
 
-        # Swap target's container with other's container.
         state = _swap(
             state,
             history,
@@ -1183,7 +1070,6 @@ def build_swap_chain(
             other_current,
         )
 
-        # After swap: target is now where other was.
         target_current, other_current = (
             other_current,
             target_current,
@@ -1194,7 +1080,6 @@ def build_swap_chain(
         if updates_done >= spec.target_updates:
             break
 
-        # Move target to a third container (if available).
         candidates = [
             c
             for c in container_list
@@ -1202,9 +1087,7 @@ def build_swap_chain(
         ]
 
         if candidates:
-            dst = candidates[
-                updates_done % len(candidates)
-            ]
+            dst = rng.choice(candidates)
 
             state = _move(
                 state,
@@ -1221,11 +1104,9 @@ def build_swap_chain(
     # Distractor: move companions
     # --------------------------------------------------------
 
-    for i in range(spec.distractor_updates):
+    for _ in range(spec.distractor_updates):
 
-        companion_id = companion_ids[
-            i % len(companion_ids)
-        ]
+        companion_id = rng.choice(companion_ids)
 
         current = state.location[companion_id]
 
@@ -1233,7 +1114,7 @@ def build_swap_chain(
             c for c in container_list if c != current
         ]
 
-        dst = candidates[i % len(candidates)]
+        dst = rng.choice(candidates)
 
         state = _move(
             state,
@@ -1264,32 +1145,6 @@ def build_undo_chain(
     """
     Construct a trajectory that tests rollback / contradiction
     handling via Undo operations.
-
-    target_updates counts ALL non-Put ops that affect the target's
-    effective state trajectory: moves AND undos.
-
-    Structure (target_updates=4 example)::
-
-        Setup:
-            Put target -> c0
-
-        Move target -> c1            (+1)
-        Undo                         (+1, target back at c0)
-        Move target -> c2            (+1)
-        Move target -> c3            (+1)
-
-    target_obj
-        The single tracked entity.
-
-    Distinct failure mode
-        The model treats the undone action as if it happened:
-        it reports c1 (the undone destination) instead of c0
-        (the correctly rolled-back location).
-
-    Constraints
-        entity_count = 1
-        target_updates >= 2 (at least one move + one undo)
-        structural_ops must contain "undo"
     """
 
     if spec.entity_count != 1:
@@ -1312,6 +1167,8 @@ def build_undo_chain(
     container_list = sorted(containers)
 
     target = spec.target_obj or "o0"
+    target_start = rng.choice(container_list)
+    target_type = rng.choice(OBJECT_TYPES)
 
     # --------------------------------------------------------
     # Setup
@@ -1322,61 +1179,40 @@ def build_undo_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        target_start,
     )
 
-    target_current = container_list[0]
+    target_current = target_start
     updates_done = 0
 
-    # --------------------------------------------------------
-    # Pattern: Move, Undo, Move, Move, ...
-    #
-    # One Undo is placed after the first Move to create the
-    # contradiction.  Subsequent ops are plain Moves.
-    # --------------------------------------------------------
-
-    # Step 1: move to c1 (will be undone)
+    # Step 1: move to dst (will be undone)
     candidates = [c for c in container_list if c != target_current]
-    dst = candidates[0]
+    dst = rng.choice(candidates)
 
     state = _move(state, history, ops, target, dst)
-    pre_undo_current = target_current   # where target will return to
+    pre_undo_current = target_current
     updates_done += 1
 
-    if updates_done >= spec.target_updates:
-        # Degenerate edge case: only 1 update requested; skip undo.
-        # (Validator will catch target_updates < 2 before we get here.)
-        return ConstructedTrajectory(
-            ops=ops,
-            containers=containers,
-            final_state=state,
-            history=history,
-            target_obj=target,
-            spec=spec,
-        )
-
-    # Step 2: Undo (target rolls back to pre_undo_current)
-    state = _undo(state, history, ops)
-    target_current = pre_undo_current
-    updates_done += 1
+    if updates_done < spec.target_updates:
+        # Step 2: Undo
+        state = _undo(state, history, ops)
+        target_current = pre_undo_current
+        updates_done += 1
 
     # Steps 3+: plain moves
-    move_idx = 0
-
     while updates_done < spec.target_updates:
 
         candidates = [
             c for c in container_list if c != target_current
         ]
 
-        dst = candidates[move_idx % len(candidates)]
+        dst = rng.choice(candidates)
 
         state = _move(state, history, ops, target, dst)
 
         target_current = dst
         updates_done += 1
-        move_idx += 1
 
     return ConstructedTrajectory(
         ops=ops,
@@ -1398,36 +1234,7 @@ def build_undo_redo_chain(
 ) -> ConstructedTrajectory:
     """
     Construct a trajectory that tests 3-way edit-history
-    awareness: never-happened / happened-then-undone /
-    happened-undone-then-redone.
-
-    target_updates counts ALL non-Put ops that affect the target's
-    effective state trajectory: moves, undos, AND redos.
-
-    Structure (target_updates=5 example)::
-
-        Setup:
-            Put target -> c0
-
-        Move target -> c1            (+1)   happened
-        Undo                         (+1)   undone (target at c0)
-        Redo                         (+1)   redone (target at c1)
-        Move target -> c2            (+1)   normal move
-        Move target -> c3            (+1)   normal move
-
-    target_obj
-        The single tracked entity.
-
-    Distinct failure mode
-        Conflating "undone" (target at c0) with "redone" (target
-        at c1): the model reports the correct final location but
-        cannot correctly answer step-wise queries about the
-        undo/redo cycle.
-
-    Constraints
-        entity_count = 1
-        target_updates >= 3 (move + undo + redo minimum)
-        structural_ops must contain "undo" and "redo"
+    awareness via Undo/Redo.
     """
 
     if spec.entity_count != 1:
@@ -1450,6 +1257,8 @@ def build_undo_redo_chain(
     container_list = sorted(containers)
 
     target = spec.target_obj or "o0"
+    target_start = rng.choice(container_list)
+    target_type = rng.choice(OBJECT_TYPES)
 
     # --------------------------------------------------------
     # Setup
@@ -1460,27 +1269,23 @@ def build_undo_redo_chain(
         history,
         ops,
         target,
-        "key",
-        container_list[0],
+        target_type,
+        target_start,
     )
 
-    target_current = container_list[0]
+    target_current = target_start
     updates_done = 0
-
-    # --------------------------------------------------------
-    # Core undo/redo cycle: Move -> Undo -> Redo
-    # --------------------------------------------------------
 
     # Step 1: Move to c1
     candidates = [c for c in container_list if c != target_current]
-    c1 = candidates[0]
+    c1 = rng.choice(candidates)
 
     state = _move(state, history, ops, target, c1)
     updates_done += 1
 
-    # Step 2: Undo (target back at c0)
+    # Step 2: Undo (target back at target_start)
     state = _undo(state, history, ops)
-    target_current = container_list[0]
+    target_current = target_start
     updates_done += 1
 
     # Step 3: Redo (target back at c1)
@@ -1489,21 +1294,18 @@ def build_undo_redo_chain(
     updates_done += 1
 
     # Steps 4+: plain moves
-    move_idx = 0
-
     while updates_done < spec.target_updates:
 
         candidates = [
             c for c in container_list if c != target_current
         ]
 
-        dst = candidates[move_idx % len(candidates)]
+        dst = rng.choice(candidates)
 
         state = _move(state, history, ops, target, dst)
 
         target_current = dst
         updates_done += 1
-        move_idx += 1
 
     return ConstructedTrajectory(
         ops=ops,

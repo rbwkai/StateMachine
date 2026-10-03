@@ -62,7 +62,6 @@ PILOT_FAMILIES: List[Tuple] = [
 
 INSTANCES_PER_FAMILY = 50
 EXPERIMENT_TAG       = "rq5_pilot"
-BASE_SEED            = 5000
 
 
 # ============================================================
@@ -174,7 +173,7 @@ def main():
             distractor_updates=D,
             num_instances=args.instances,
             experiment_tag=EXPERIMENT_TAG,
-            base_seed=BASE_SEED + i * 200,
+            condition_id=family,
             num_containers=num_containers,
             condition_label=f"{family} E={E} T={T} D={D}",
         )

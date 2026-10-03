@@ -11,6 +11,7 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from eval.models import ModelConfig
+from eval.prompts import build_user_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,15 @@ class InferenceEngine:
         context: str,
         question: str,
         chain_of_thought: bool = False,
+        prompt_version: str = "v2",
     ) -> str:
         """Format input narrative and question into model prompt."""
-        if chain_of_thought:
-            return f"Narrative:\n{context}\n\nQuestion:\n{question}\n\nLet's trace step by step:\nAnswer:"
-        return f"Narrative:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+        return build_user_prompt(
+            context=context,
+            question=question,
+            chain_of_thought=chain_of_thought,
+            prompt_version=prompt_version,
+        )
 
     def generate_batch(
         self,
@@ -79,7 +84,7 @@ class MockInferenceEngine(InferenceEngine):
                 text = str(p)
 
             if "Where is" in text or "where is" in text:
-                responses.append("Final Answer: the green box")
+                responses.append("Step 1: the green box\nFinal Answer: the green box")
             elif "True or False" in text or "true or false" in text:
                 responses.append("Final Answer: True")
             else:
@@ -117,6 +122,7 @@ class HuggingFaceEngine(InferenceEngine):
         self.config = model_config
         self.device_str = device
         self.precision = precision
+        self.max_prompt_length = 0
 
         logger.info(f"Loading tokenizer for {model_config.hf_model_id}...")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -188,8 +194,6 @@ class HuggingFaceEngine(InferenceEngine):
         if generation_config is None:
             return
 
-        # Some Hub configs retain temperature/top-p/top-k even when do_sample is
-        # false. Recent Transformers versions warn about those unused fields.
         if not self.config.do_sample:
             for field in ("temperature", "top_p", "top_k"):
                 if hasattr(generation_config, field):
@@ -200,18 +204,16 @@ class HuggingFaceEngine(InferenceEngine):
         context: str,
         question: str,
         chain_of_thought: bool = False,
+        prompt_version: str = "v2",
     ) -> str:
         """Apply model-specific chat template if available, else standard text."""
         system_content = self.config.system_prompt or "You are a precise state reasoning assistant."
-        user_content = f"Narrative:\n{context}\n\nQuestion:\n{question}"
-        if chain_of_thought:
-            user_content += (
-                "\n\nSolve the problem by updating the world state step by step.\n\n"
-                "Step 1: <container>\nStep 2: <container>\nStep 3: <container>\n\n"
-                "Final Answer: <answer>\nStop immediately after Final Answer."
-            )
-        else:
-            user_content += "\n\nFinal Answer: <answer>\nStop immediately after Final Answer."
+        user_content = build_user_prompt(
+            context=context,
+            question=question,
+            chain_of_thought=chain_of_thought,
+            prompt_version=prompt_version,
+        )
 
         messages = [
             {"role": "system", "content": system_content},
@@ -229,7 +231,7 @@ class HuggingFaceEngine(InferenceEngine):
             except Exception as e:
                 logger.debug(f"Chat template application failed ({e}), falling back to direct prompt.")
 
-        return f"Instructions: {system_content}\n\n{user_content}\n\nAnswer:"
+        return f"Instructions: {system_content}\n\n{user_content}"
 
     def generate_batch(
         self,
@@ -258,8 +260,27 @@ class HuggingFaceEngine(InferenceEngine):
             text_prompts,
             return_tensors="pt",
             padding=True,
-            truncation=True,
+            truncation=False,
         )
+
+        batch_max_prompt_len = inputs["input_ids"].shape[1]
+        max_model_len = getattr(self.tokenizer, "model_max_length", None)
+        if max_model_len is not None and isinstance(max_model_len, int) and max_model_len < 1e9:
+            if batch_max_prompt_len > max_model_len:
+                raise ValueError(
+                    f"Prompt length {batch_max_prompt_len} exceeds tokenizer model_max_length {max_model_len}."
+                )
+
+        if batch_max_prompt_len > self.max_prompt_length:
+            self.max_prompt_length = batch_max_prompt_len
+            logger.info(f"Max prompt token length per run so far: {self.max_prompt_length}")
+
+        # Assert decoded prompt ends with generation prompt / instruction tail
+        for i, text_p in enumerate(text_prompts):
+            decoded_p = self.tokenizer.decode(inputs["input_ids"][i], skip_special_tokens=True)
+            assert ("Final Answer" in decoded_p or "Final Answer" in text_p or "Stop immediately" in decoded_p), (
+                "Decoded prompt does not end with generation prompt instruction tail."
+            )
 
         input_device = next(self.model.parameters()).device
         input_ids = inputs["input_ids"].to(input_device)

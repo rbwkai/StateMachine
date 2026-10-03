@@ -4,13 +4,13 @@ generate_all.py
 Master script to generate the complete DWS-Bench benchmark dataset suite:
     - RQ1: Temporal Depth Sweep (300 instances)
     - RQ2: Revision Complexity Sweep (200 instances)
-        - RQ3: Distractor / Interference Sweep (200 instances)
+    - RQ3: Distractor / Interference Sweep (200 instances)
     - RQ4: Entity Load Sweep (200 instances)
     - RQ5: Structural Operation Pilot (250 instances)
-        - Full Aggregated Benchmark: data/full_benchmark.jsonl (1,150 instances)
+    - Full Aggregated Benchmark: data/full_benchmark.jsonl (1,150 instances)
 
 Usage:
-  python3 generate_all.py             # Generate all datasets and build full_benchmark.jsonl
+  python3 generate_all.py --write     # Generate all datasets, verify invariants, and write files
   python3 generate_all.py --dry-run   # Run reachability probes across all experiments
 """
 
@@ -21,8 +21,9 @@ import json
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
@@ -47,6 +48,48 @@ def run_dry_runs() -> bool:
             all_ok = False
             print(f"[FAIL] {name} probe failed!")
     return all_ok
+
+
+def verify_dataset_invariants(records: List[Dict[str, Any]]) -> bool:
+    print("\n" + "=" * 75)
+    print("POST-GENERATION DATASET INVARIANT VERIFICATION")
+    print("=" * 75)
+
+    all_seeds = [r["seed"] for r in records]
+    unique_seeds = set(all_seeds)
+    if len(unique_seeds) != len(all_seeds):
+        duplicates = [s for s, count in Counter(all_seeds).items() if count > 1]
+        print(
+            f"[FAIL] Duplicate seeds found! {len(all_seeds) - len(unique_seeds)} duplicates. "
+            f"Examples: {duplicates[:5]}"
+        )
+        return False
+    print(f"  [✓] All {len(all_seeds)} seeds are unique across the combined file.")
+
+    # Group records by condition: (experiment, condition_id)
+    condition_hashes: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for r in records:
+        exp = r.get("experiment", "")
+        cond_id = r.get("condition_id", str(r.get("requested_factors")))
+        condition_hashes[(exp, cond_id)].append(r.get("trace_hash", ""))
+
+    all_conds_ok = True
+    print("\n  Per-condition distinct trace_hash check (required >= 80%):")
+    for (exp, cond_id), hashes in sorted(condition_hashes.items()):
+        n = len(hashes)
+        distinct_count = len(set(hashes))
+        ratio = distinct_count / n if n > 0 else 0
+        status = "✓" if ratio >= 0.8 else "FAIL"
+        print(f"    [{status}] {exp:25s} / {cond_id:15s}: {distinct_count:3d}/{n:3d} distinct traces ({ratio:6.1%})")
+        if ratio < 0.8:
+            all_conds_ok = False
+
+    if not all_conds_ok:
+        print("\n[FAIL] One or more conditions fell below 80% distinct trace_hash threshold!")
+        return False
+
+    print("\n  [✓] All conditions passed distinct trace_hash check (>= 80%).")
+    return True
 
 
 def generate_all(instances_scale: float = 1.0) -> None:
@@ -84,6 +127,11 @@ def generate_all(instances_scale: float = 1.0) -> None:
                 if line:
                     combined_records.append(json.loads(line))
 
+    # Post-generation invariant check
+    if not verify_dataset_invariants(combined_records):
+        print("\n[ERROR] Post-generation dataset verification failed! Not saving full_benchmark.jsonl.")
+        sys.exit(1)
+
     with open(full_benchmark_path, "w", encoding="utf-8") as fp:
         for rec in combined_records:
             fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -117,14 +165,19 @@ def generate_all(instances_scale: float = 1.0) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Generate complete DWS-Bench benchmark dataset suite.")
     parser.add_argument("--dry-run", action="store_true", help="Run reachability probes only")
+    parser.add_argument("--write", action="store_true", help="Write generated dataset files to data/")
     args = parser.parse_args()
 
     if args.dry_run:
         ok = run_dry_runs()
         sys.exit(0 if ok else 1)
-    else:
+    elif args.write:
         generate_all()
+    else:
+        print("Please specify --write to generate and write dataset files to data/, or --dry-run for reachability probes.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+

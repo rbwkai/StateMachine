@@ -125,14 +125,72 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 f"Target {traj.target_obj} not in final state object types"
             )
 
-            # INVARIANT 7: Determinism check (rebuilding with same seed yields exact match)
-            traj_rebuilt = build_trajectory(random.Random(seed), spec)
-            assert traj_rebuilt.ops == traj.ops, "Determinism failed on ops"
-            assert traj_rebuilt.final_state.location == traj.final_state.location, "Determinism failed on location"
+            # INVARIANT 7: Determinism & Diversity
+            # 7a. Same seed -> same record
+            seed_test = int(hashlib.sha1(f"test|{family}|{seed}".encode("utf-8")).hexdigest()[:8], 16)
+            rec1 = generate_instance(
+                seed=seed_test,
+                instance_id="test1",
+                family=family,
+                entity_count=entity_count,
+                target_updates=target_updates,
+                distractor_updates=distractor_updates,
+                num_containers=3,
+                experiment_tag="test_exp",
+                condition_id=f"cond_{family}",
+            )
+            rec2 = generate_instance(
+                seed=seed_test,
+                instance_id="test2",
+                family=family,
+                entity_count=entity_count,
+                target_updates=target_updates,
+                distractor_updates=distractor_updates,
+                num_containers=3,
+                experiment_tag="test_exp",
+                condition_id=f"cond_{family}",
+            )
+            assert rec1 is not None and rec2 is not None, "generate_instance returned None"
+            assert rec1["canonical_trace"] == rec2["canonical_trace"], "Same seed -> canonical_trace mismatch"
+            assert rec1["context"] == rec2["context"], "Same seed -> context mismatch"
+            assert rec1["gold_answer"] == rec2["gold_answer"], "Same seed -> gold_answer mismatch"
+            assert rec1["trace_hash"] == rec2["trace_hash"], "Same seed -> trace_hash mismatch"
 
             total_tested += 1
 
-        print(f"  [PASS] {seeds_per_family} seeds tested across parameter sweeps. All invariants hold.")
+        # 7b. Different seeds in same condition -> mostly different traces; measured factors constant
+        records_diff = []
+        for i in range(20):
+            s = int(hashlib.sha1(f"diversity|{family}|{i}".encode("utf-8")).hexdigest()[:8], 16)
+            r = generate_instance(
+                seed=s,
+                instance_id=f"div_{i}",
+                family=family,
+                entity_count=entity_count,
+                target_updates=target_updates,
+                distractor_updates=distractor_updates,
+                num_containers=3,
+                experiment_tag="diversity_test",
+                condition_id=f"cond_{family}",
+            )
+            if r is not None:
+                records_diff.append(r)
+
+        assert len(records_diff) >= 16, f"Failed to generate sufficient diversity records for {family}"
+        distinct_hashes = len(set(r["trace_hash"] for r in records_diff))
+        assert distinct_hashes >= 0.8 * len(records_diff), (
+            f"Different seeds in same condition did not yield mostly different traces for {family}: "
+            f"{distinct_hashes}/{len(records_diff)} distinct"
+        )
+
+        # Measured factors constant
+        for r in records_diff:
+            mf = r["measured_factors"]
+            assert mf["E_actual"] == entity_count, f"Measured E mismatch in {family}"
+            assert mf["T_actual"] == target_updates, f"Measured T mismatch in {family}"
+            assert mf["D_actual"] == distractor_updates, f"Measured D mismatch in {family}"
+
+        print(f"  [PASS] {seeds_per_family} seeds tested across parameter sweeps. All invariants hold (determinism, trace diversity >= 80%, constant measured factors).")
 
     print("\n" + "=" * 76)
     print(f"ALL INVARIANTS VERIFIED SUCCESSFULLY ({total_tested} total trajectory instances).")

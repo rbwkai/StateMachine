@@ -49,7 +49,6 @@ TARGET_UPDATES  = 8     # T fixed across all conditions
 NUM_CONTAINERS  = 4     # More containers for higher D levels
 INSTANCES_PER_CONDITION = 50
 EXPERIMENT_TAG  = "rq3_distractor"
-BASE_SEED       = 3000
 
 # D=0 already exists in RQ1 — only generate D>0 by default.
 D_LEVELS_DEFAULT = [4, 8, 16]
@@ -119,6 +118,7 @@ def main():
     t0 = time.perf_counter()
 
     for D in D_LEVELS:
+        condition_id = f"D{D}"
         condition_label = (
             f"interleaved_chain E={ENTITY_COUNT} T={TARGET_UPDATES} D={D}"
         )
@@ -130,7 +130,7 @@ def main():
             distractor_updates=D,
             num_instances=args.instances,
             experiment_tag=EXPERIMENT_TAG,
-            base_seed=BASE_SEED + D * 100,
+            condition_id=condition_id,
             num_containers=NUM_CONTAINERS,
             condition_label=condition_label,
         )
@@ -145,7 +145,7 @@ def main():
         distractor_updates=4,
         num_instances=args.instances,
         experiment_tag="rq3_narrative_distractor",
-        base_seed=BASE_SEED + 4000,
+        condition_id="D4_N4",
         num_containers=NUM_CONTAINERS,
         condition_label=(
             f"{FAMILY} E={ENTITY_COUNT} T={TARGET_UPDATES} D=4 N=4"

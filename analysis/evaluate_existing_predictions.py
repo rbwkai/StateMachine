@@ -15,7 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from eval.evaluator_v2 import extract_instance_answer, normalize_text
+from eval.scoring import (
+    candidate_answers,
+    extract_instance_answer,
+    normalize_text,
+    score_prediction,
+)
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -38,48 +43,6 @@ def infer_condition(prediction_path: Path) -> Dict[str, Any]:
         "max_new_tokens": int(match.group("tokens")),
         "condition": condition,
     }
-
-
-def candidate_answers(instance: Dict[str, Any]) -> List[str]:
-    values = list(instance.get("step_wise_gold_answers", []))
-    values.append(instance.get("gold_answer", ""))
-    unique: Dict[str, str] = {}
-    for value in values:
-        normalized = normalize_text(value)
-        if normalized:
-            unique[normalized] = str(value)
-    return list(unique.values())
-
-
-def score_prediction(
-    prediction: Dict[str, Any],
-    instance: Dict[str, Any],
-    chain_of_thought: bool,
-) -> Dict[str, Any]:
-    extraction = extract_instance_answer(
-        prediction.get("raw_prediction", ""),
-        candidate_answers(instance),
-        chain_of_thought=chain_of_thought,
-    )
-    gold = normalize_text(instance.get("gold_answer", ""))
-    semantic_correct = normalize_text(extraction.answer) == gold
-    strict_correct = semantic_correct and extraction.protocol_compliant
-    result = dict(prediction)
-    result.update({
-        "model": prediction.get("model") or instance.get("model"),
-        "semantic_correct": semantic_correct,
-        "strict_correct": strict_correct,
-        "protocol_compliant": extraction.protocol_compliant,
-        "answer_extracted": extraction.answer,
-        "extraction_method": extraction.method,
-        "has_final_answer": extraction.has_final_answer,
-        "gold_answer": instance.get("gold_answer", ""),
-        "family": instance.get("family", prediction.get("family", "")),
-        "depth": instance.get("measured_factors", {}).get(
-            "T_actual", instance.get("requested_factors", {}).get("T")
-        ),
-    })
-    return result
 
 
 def aggregate(rows: Iterable[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
@@ -108,10 +71,30 @@ def aggregate(rows: Iterable[Dict[str, Any]], keys: List[str]) -> List[Dict[str,
     return output
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+def make_corrected_condition_summary(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    buckets: Dict[tuple, List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = (row.get("model"), row.get("cot"), row.get("max_new_tokens"))
+        buckets.setdefault(key, []).append(row)
+    output = []
+    for (model, cot, max_new_tokens), bucket in sorted(buckets.items(), key=lambda item: (str(item[0][0]), bool(item[0][1]), int(item[0][2] or 0))):
+        step_accs = [row["step_accuracy"] for row in bucket if row.get("step_accuracy") is not None]
+        output.append({
+            "model": model,
+            "cot": cot,
+            "max_new_tokens": max_new_tokens,
+            "accuracy": mean(bool(row["semantic_correct"]) for row in bucket),
+            "stepwise_accuracy": mean(step_accs) if step_accs else None,
+            "instances": len(bucket),
+            "runtime_minutes": None,
+        })
+    return output
+
+
+def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: Iterable[str] | None = None) -> None:
     if not rows:
         return
-    fields = sorted({key for row in rows for key in row})
+    fields = list(fieldnames) if fieldnames is not None else sorted({key for row in rows for key in row})
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -126,6 +109,7 @@ def main() -> None:
     args = parser.parse_args()
 
     instances = load_instances(args.dataset)
+    dataset_list = list(instances.values())
     prediction_files = sorted(args.predictions_root.glob("**/*_predictions.jsonl"))
     if not prediction_files:
         raise FileNotFoundError("No saved prediction JSONL files found.")
@@ -135,7 +119,7 @@ def main() -> None:
         condition = infer_condition(prediction_path)
         for prediction in load_jsonl(prediction_path):
             instance = instances[prediction["instance_id"]]
-            row = score_prediction(prediction, instance, condition["cot"])
+            row = score_prediction(prediction, instance, condition["cot"], dataset_context=dataset_list)
             row.update(condition)
             all_rows.append(row)
 
@@ -144,6 +128,14 @@ def main() -> None:
     write_csv(args.output_dir / "evaluator_v2_summary.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "condition"]))
     write_csv(args.output_dir / "evaluator_v2_family.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "family"]))
     write_csv(args.output_dir / "evaluator_v2_depth.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "depth"]))
+
+    corrected_summary = make_corrected_condition_summary(all_rows)
+    write_csv(
+        args.output_dir / "corrected_condition_summary.csv",
+        corrected_summary,
+        fieldnames=["model", "cot", "max_new_tokens", "accuracy", "stepwise_accuracy", "instances", "runtime_minutes"],
+    )
+
     print(f"Scored {len(all_rows)} predictions across {len(prediction_files)} conditions.")
     print(f"Saved Evaluator v2 outputs to {args.output_dir}")
 
