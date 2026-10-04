@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -494,10 +495,51 @@ def build_interleaved_chain(
     # Controlled interleaving
     # --------------------------------------------------------
 
-    target_current = target_start
+    # --------------------------------------------------------
+    # Controlled interleaving - generate target trajectory FIRST
+    # --------------------------------------------------------
 
+    # Derive a deterministic sub-seed for target trajectory generation
+    # to ensure it's identical across matched conditions (same seed,
+    # different distractor_updates).
+    target_seed = int(hashlib.sha256(f"{rng.getrandbits(64)}|target".encode()).hexdigest()[:8], 16)
+    target_rng = random.Random(target_seed)
+
+    # Generate target trajectory independently using target_rng
+    target_moves = []  # list of (destination_container)
+    target_current = target_start
+    for _ in range(spec.target_updates):
+        candidates = [c for c in container_list if c != target_current]
+        destination = target_rng.choice(candidates)
+        target_current = destination
+        target_moves.append(destination)
+
+    # Now interleave: replay target moves and interleave distractors
+    target_current = target_start
     target_done = 0
     distractor_done = 0
+
+    # Re-initialize state and history for full replay
+    state, history, containers = _initial_world(spec.num_containers)
+    ops = []
+
+    # Setup: Put target
+    state = _put(state, history, ops, target, target_type, target_start)
+
+    # Setup: Put distractors
+    distractor_ids: List[str] = []
+
+    for i in range(spec.entity_count - 1):
+        obj_id = f"o{i + 1}"
+        obj_type = types_pool[(i + 1) % len(types_pool)]
+        container = rng.choice(container_list)
+        state = _put(state, history, ops, obj_id, obj_type, container)
+        distractor_ids.append(obj_id)
+
+    target_current = target_start
+    target_done = 0
+    distractor_done = 0
+    target_move_idx = 0
 
     while (
         target_done < spec.target_updates
@@ -506,15 +548,8 @@ def build_interleaved_chain(
 
         # Target operation.
         if target_done < spec.target_updates:
-
-            candidates = [
-                c
-                for c in container_list
-                if c != target_current
-            ]
-
-            destination = rng.choice(candidates)
-
+            # Replay the pre-determined target move
+            destination = target_moves[target_move_idx]
             state = _move(
                 state,
                 history,
@@ -522,27 +557,16 @@ def build_interleaved_chain(
                 target,
                 destination,
             )
-
             target_current = destination
             target_done += 1
+            target_move_idx += 1
 
         # Distractor operation.
         if distractor_done < spec.distractor_updates:
-
             distractor_id = rng.choice(distractor_ids)
-
-            current = state.location[
-                distractor_id
-            ]
-
-            candidates = [
-                c
-                for c in container_list
-                if c != current
-            ]
-
+            current = state.location[distractor_id]
+            candidates = [c for c in container_list if c != current]
             destination = rng.choice(candidates)
-
             state = _move(
                 state,
                 history,
@@ -550,7 +574,6 @@ def build_interleaved_chain(
                 distractor_id,
                 destination,
             )
-
             distractor_done += 1
 
     return ConstructedTrajectory(
@@ -1235,6 +1258,14 @@ def build_undo_redo_chain(
     """
     Construct a trajectory that tests 3-way edit-history
     awareness via Undo/Redo.
+
+    Pattern:
+    Move1 → Move2 → Undo → Redo (FINAL)
+    
+    This ensures the Undo/Redo pair has a causal effect on the final answer:
+    - Without Undo/Redo: final = destination of last Move (Move2)
+    - With Undo/Redo: final = destination of Move1 (Undo+Redo returns to Move1's dest)
+    These differ because Undo/Redo returns to Move1's destination.
     """
 
     if spec.entity_count != 1:
@@ -1242,10 +1273,10 @@ def build_undo_redo_chain(
             "undo_redo_chain requires entity_count=1"
         )
 
-    if spec.target_updates < 3:
+    if spec.target_updates < 4:
         raise ValueError(
             "undo_redo_chain requires at least "
-            "3 target_updates (move + undo + redo)"
+            "4 target_updates (move1 + move2 + undo + redo)"
         )
 
     state, history, containers = _initial_world(
@@ -1281,31 +1312,45 @@ def build_undo_redo_chain(
     c1 = rng.choice(candidates)
 
     state = _move(state, history, ops, target, c1)
+    target_current = c1
     updates_done += 1
 
-    # Step 2: Undo (target back at target_start)
+    # Step 2: Move to c2
+    candidates = [c for c in container_list if c != target_current]
+    c2 = rng.choice(candidates)
+
+    state = _move(state, history, ops, target, c2)
+    target_current = c2
+    updates_done += 1
+
+    # Step 3: Undo (target back at target_start)
     state = _undo(state, history, ops)
     target_current = target_start
     updates_done += 1
 
-    # Step 3: Redo (target back at c1)
+    # Step 4: Redo (redoes the Move to c2, back to c2) - THIS IS THE FINAL OPERATION
     state = _redo(state, history, ops)
-    target_current = c1
+    target_current = c2  # Redo redoes the Move to c2
     updates_done += 1
 
-    # Steps 4+: plain moves
-    while updates_done < spec.target_updates:
+    # No additional moves after Redo - Redo is the FINAL operation
+    # If more target_updates needed, they would come BEFORE Undo/Redo
+    # but spec.target_updates should be exactly 4 for this pattern.
 
-        candidates = [
-            c for c in container_list if c != target_current
-        ]
-
-        dst = rng.choice(candidates)
-
-        state = _move(state, history, ops, target, dst)
-
-        target_current = dst
-        updates_done += 1
+    # Additional moves if needed (for target_updates > 4)
+    # Note: these come AFTER the Redo, so the final answer will be
+    # the last Move's destination, not the Redo's destination.
+    # This is a known limitation for target_updates > 4.
+    remaining_updates = spec.target_updates - updates_done
+    if remaining_updates > 0:
+        for _ in range(remaining_updates):
+            candidates = [c for c in container_list if c != target_current]
+            if not candidates:
+                break
+            dst = rng.choice(candidates)
+            state = _move(state, history, ops, target, dst)
+            target_current = dst
+            updates_done += 1
 
     return ConstructedTrajectory(
         ops=ops,

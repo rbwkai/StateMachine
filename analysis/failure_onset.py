@@ -58,15 +58,23 @@ def compute_failure_onset(
     tau: float = 0.70,
 ) -> Optional[Union[int, float]]:
     """
-    Compute failure onset L_f = min { x : A(x) < tau }.
+    Compute failure onset L_f = min { x : A(x) < tau and stays below tau }.
+    
     Assumes x_values and accuracies are sorted in increasing order of difficulty x.
+    Uses a "sustained failure" criterion: the first x where accuracy drops below tau
+    and does not recover above tau for the remaining x values.
     """
     if len(x_values) != len(accuracies):
         raise ValueError("x_values and accuracies must have identical length")
 
-    for x, acc in zip(x_values, accuracies):
+    for i, (x, acc) in enumerate(zip(x_values, accuracies)):
         if acc < tau:
-            return x
+            # Check if accuracy recovers above tau after this point
+            recovers = any(a >= tau for a in accuracies[i+1:])
+            if not recovers:
+                return x
+            # If it recovers, continue searching for a sustained failure
+    
     return None
 
 
@@ -97,6 +105,9 @@ def fit_linear(
     r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
     k = 2  # number of parameters (a, b)
     aic = n * math.log(max(ss_res / n, 1e-12)) + 2 * k
+    # Use AICc (corrected AIC) for small sample sizes
+    if n > k + 1:
+        aic += 2 * k * (k + 1) / (n - k - 1)
 
     return CurveFitResult("linear", {"a": a, "b": b}, r_squared, aic, preds)
 
@@ -117,7 +128,8 @@ def fit_exponential(
     best_preds = y_values
 
     # Grid search for robust initialization
-    for c_val in [0.0, 0.1, 0.2, 0.25]:
+    # Include true chance floor (1/3 ≈ 0.33) for 3-choice tasks
+    for c_val in [0.0, 0.1, 0.2, 0.25, 1.0/3.0]:
         for b_val in [0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0]:
             # a = (y - c) / exp(-b * x)
             exp_terms = [math.exp(-b_val * x) for x in x_values]
@@ -137,6 +149,9 @@ def fit_exponential(
     r_squared = 1.0 - (best_res / ss_tot) if ss_tot > 0 else 1.0
     k = 3  # parameters (a, b, c)
     aic = n * math.log(max(best_res / n, 1e-12)) + 2 * k
+    # Use AICc (corrected AIC) for small sample sizes
+    if n > k + 1:
+        aic += 2 * k * (k + 1) / (n - k - 1)
 
     return CurveFitResult("exponential", best_params, r_squared, aic, best_preds)
 
@@ -163,7 +178,7 @@ def fit_sigmoid(
     for x_0 in x0_candidates:
         for b_val in [0.2, 0.5, 1.0, 2.0]:
             for a_val in [1.0, 0.95]:
-                for c_val in [0.0, 0.1, 0.2]:
+                for c_val in [0.0, 0.1, 0.2, 1.0/3.0]:
                     preds = []
                     for x in x_values:
                         exponent = max(min(b_val * (x - x_0), 50.0), -50.0)
@@ -180,6 +195,9 @@ def fit_sigmoid(
     r_squared = 1.0 - (best_res / ss_tot) if ss_tot > 0 else 1.0
     k = 4  # parameters (a, c, b, x_0)
     aic = n * math.log(max(best_res / n, 1e-12)) + 2 * k
+    # Use AICc (corrected AIC) for small sample sizes
+    if n > k + 1:
+        aic += 2 * k * (k + 1) / (n - k - 1)
 
     return CurveFitResult("sigmoid", best_params, r_squared, aic, best_preds)
 

@@ -57,13 +57,19 @@ def analyze_first_error(
 ) -> TrajectoryErrorAnalysis:
     """
     Classify the trajectory error between gold step-wise states and model predictions.
+    
+    Note: gold_states[0] is the initial state (after first Put), while model's Step 1
+    corresponds to the first Move. We align by skipping gold_states[0] for comparison.
     """
-    if len(gold_states) != len(pred_states):
+    # Align: gold_states[0] is initial state (after Put), pred_states[0] is model's Step 1 (first move)
+    # So we compare pred_states[i] with gold_states[i+1]
+    if len(gold_states) != len(pred_states) + 1:
         raise ValueError(
-            f"Trajectory length mismatch: gold={len(gold_states)}, pred={len(pred_states)}"
+            f"Trajectory length mismatch: gold={len(gold_states)}, pred={len(pred_states)}. "
+            "Expected gold = pred + 1 (gold includes initial state)"
         )
-
-    n = len(gold_states)
+    
+    n = len(pred_states)
     if n == 0:
         return TrajectoryErrorAnalysis(
             error_type=ErrorType.NO_ERROR,
@@ -74,10 +80,11 @@ def analyze_first_error(
             pred_final=None,
             final_is_correct=True,
         )
-
-    step_errors = [i for i in range(n) if gold_states[i] != pred_states[i]]
+    
+    # Compare pred_states[i] with gold_states[i+1]
+    step_errors = [i for i in range(n) if gold_states[i + 1] != pred_states[i]]
     final_is_correct = (gold_states[-1] == pred_states[-1])
-
+    
     if not step_errors:
         return TrajectoryErrorAnalysis(
             error_type=ErrorType.NO_ERROR,
@@ -88,17 +95,17 @@ def analyze_first_error(
             pred_final=pred_states[-1],
             final_is_correct=True,
         )
-
-    t = step_errors[0]
-
+    
+    t = step_errors[0]  # 0-indexed in pred_states
+    
     # Check for final-only error: only the final step is wrong
     if t == n - 1 and len(step_errors) == 1:
         error_type = ErrorType.FINAL_ONLY_ERROR
-
+    
     # Check for cancellation error: intermediate error occurred, but final answer is correct
     elif final_is_correct:
         error_type = ErrorType.CANCELLATION_ERROR
-
+    
     else:
         # Final answer is wrong.
         # Check if model recovered at any point after step t
@@ -107,12 +114,12 @@ def analyze_first_error(
             error_type = ErrorType.LOCAL_ERROR
         else:
             error_type = ErrorType.PROPAGATING_ERROR
-
+    
     return TrajectoryErrorAnalysis(
         error_type=error_type,
-        first_error_step=t,
+        first_error_step=t + 1,  # 1-indexed for human-readable step number
         total_steps=n,
-        step_errors=step_errors,
+        step_errors=[e + 1 for e in step_errors],  # 1-indexed
         gold_final=gold_states[-1],
         pred_final=pred_states[-1],
         final_is_correct=final_is_correct,

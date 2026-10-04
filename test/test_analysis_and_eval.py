@@ -89,37 +89,37 @@ print("=" * 70)
 print("3. FIRST-ERROR CLASSIFICATION")
 print("=" * 70)
 
-# NO_ERROR
-gold = ["c0", "c1", "c2", "c0"]
-pred_perfect = ["c0", "c1", "c2", "c0"]
+# NO_ERROR (gold has initial state + 3 moves, pred has 3 moves)
+gold = ["c0", "c1", "c2", "c0"]  # initial + 3 moves
+pred_perfect = ["c1", "c2", "c0"]  # 3 moves (no initial)
 res_perfect = analyze_first_error(gold, pred_perfect)
 assert res_perfect.error_type == ErrorType.NO_ERROR
 assert res_perfect.first_error_step is None
 assert res_perfect.final_is_correct is True
 
 # PROPAGATING_ERROR: error at step 1 and all subsequent are wrong
-pred_prop = ["c0", "c2", "c3", "c1"]
+pred_prop = ["c2", "c3", "c3"]  # step 0: c2 vs c1 (error), step 1: c3 vs c2 (error), step 2: c3 vs c0 (error)
 res_prop = analyze_first_error(gold, pred_prop)
 assert res_prop.error_type == ErrorType.PROPAGATING_ERROR
 assert res_prop.first_error_step == 1
 assert res_prop.final_is_correct is False
 
 # LOCAL_ERROR: error at step 1, recovers at step 2, but final is wrong
-pred_local = ["c0", "c2", "c2", "c3"]
+pred_local = ["c3", "c2", "c3"]  # step 0 error (c3 vs c1), step 1 recovers (c2 vs c2), step 2 wrong (c3 vs c0)
 res_local = analyze_first_error(gold, pred_local)
 assert res_local.error_type == ErrorType.LOCAL_ERROR
 assert res_local.first_error_step == 1
 assert res_local.final_is_correct is False
 
-# CANCELLATION_ERROR: error at step 1 and 2, but final matches
-pred_cancel = ["c0", "c2", "c3", "c0"]
+# CANCELLATION_ERROR: error at step 1, step 2 correct but final matches
+pred_cancel = ["c3", "c3", "c0"]  # step 0 error (c3 vs c1), step 1 error (c3 vs c2), step 2 recovers (c0 vs c0)
 res_cancel = analyze_first_error(gold, pred_cancel)
 assert res_cancel.error_type == ErrorType.CANCELLATION_ERROR
 assert res_cancel.final_is_correct is True
 assert res_cancel.first_error_step == 1
 
 # FINAL_ONLY_ERROR: intermediate correct, final wrong
-pred_final_only = ["c0", "c1", "c2", "c3"]
+pred_final_only = ["c1", "c2", "c3"]  # step 0 OK, step 1 OK, step 2 error (c3 vs c0)
 res_final_only = analyze_first_error(gold, pred_final_only)
 assert res_final_only.error_type == ErrorType.FINAL_ONLY_ERROR
 assert res_final_only.first_error_step == 3
@@ -158,7 +158,7 @@ mock_instances = [
         "family": "basic_chain",
         "requested_factors": {"T": 4, "D": 0},
         "gold_answer": "wooden shelf",
-        "step_wise_gold": ["c0", "c1", "c2", "c0"],
+        "step_wise_gold": ["c0", "c1", "c2", "c0", "c0"],  # initial + 4 moves
         "final_state": {"containers": ["wooden shelf", "glass crate"]},
     },
     {
@@ -166,7 +166,7 @@ mock_instances = [
         "family": "basic_chain",
         "requested_factors": {"T": 4, "D": 0},
         "gold_answer": "glass crate",
-        "step_wise_gold": ["c0", "c1"],
+        "step_wise_gold": ["c0", "c1", "c1"],  # initial + 2 moves
         "final_state": {"containers": ["wooden shelf", "glass crate"]},
     },
 ]
@@ -175,12 +175,12 @@ mock_predictions = [
     {
         "instance_id": "inst_001",
         "pred_answer": "Final Answer: wooden shelf",
-        "pred_trajectory": ["c0", "c1", "c2", "c0"],
+        "pred_trajectory": ["c0", "c1", "c2", "c0"],  # 4 moves (no initial)
     },
     {
         "instance_id": "inst_002",
         "pred_answer": "Final Answer: wooden shelf",  # wrong
-        "pred_trajectory": ["c0", "c0"],  # propagating error
+        "pred_trajectory": ["c0", "c0"],  # 2 moves
     },
 ]
 

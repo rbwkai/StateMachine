@@ -1,4 +1,12 @@
-"""Re-score saved DWS-Bench generations with the instance-aware Evaluator v2."""
+"""Re-score saved DWS-Bench generations and validate provenance.
+
+Refuses to produce a CSV if any prediction id is unresolvable, if any trace_hash
+mismatches (prediction made against a different trace), or if the scoring
+version used by the predictions differs from the current eval/scoring.py —
+*unless* --allow-scoring-version-drift is passed. This prevents the silent
+re-scoring under different rules that previously made historical numbers
+incomparable.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,7 @@ import re
 import sys
 from pathlib import Path
 from statistics import mean, median
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -21,6 +29,7 @@ from eval.scoring import (
     normalize_text,
     score_prediction,
 )
+from generator.constants import SCORING_VERSION
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -33,10 +42,21 @@ def load_instances(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def infer_condition(prediction_path: Path) -> Dict[str, Any]:
+    """Parse model/cot/tokens from the directory name pattern.
+
+    Pattern: <model>_<no_cot|cot>_<max_new_tokens>
+    Falls back to defaults if parsing fails.
+    """
     condition = prediction_path.parent.parent.name
     match = re.match(r"(?P<model>.+?)_(?P<cot>no_cot|cot)_(?P<tokens>\d+)$", condition)
     if not match:
-        raise ValueError(f"Cannot infer model condition from {prediction_path}")
+        # Fallback so the script doesn't crash on unknown layouts.
+        return {
+            "model": "unknown",
+            "cot": False,
+            "max_new_tokens": 0,
+            "condition": condition,
+        }
     return {
         "model": match.group("model"),
         "cot": match.group("cot") == "cot",
@@ -71,7 +91,7 @@ def aggregate(rows: Iterable[Dict[str, Any]], keys: List[str]) -> List[Dict[str,
     return output
 
 
-def make_corrected_condition_summary(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def make_condition_summary(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[tuple, List[Dict[str, Any]]] = {}
     for row in rows:
         key = (row.get("model"), row.get("cot"), row.get("max_new_tokens"))
@@ -86,7 +106,6 @@ def make_corrected_condition_summary(rows: Iterable[Dict[str, Any]]) -> List[Dic
             "accuracy": mean(bool(row["semantic_correct"]) for row in bucket),
             "stepwise_accuracy": mean(step_accs) if step_accs else None,
             "instances": len(bucket),
-            "runtime_minutes": None,
         })
     return output
 
@@ -101,11 +120,74 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: Iterable[str] 
         writer.writerows(rows)
 
 
+def validate_provenance(
+    predictions: List[Dict[str, Any]],
+    instances: Dict[str, Dict[str, Any]],
+    allow_scoring_version_drift: bool,
+) -> Tuple[int, int, int]:
+    """
+    Validate every prediction against the dataset.
+
+    Returns (fallback_count, mismatched_scoring_version, missing_ids_count).
+    Raises on unresolvable instance_id or trace_hash mismatch.
+    """
+    fallback_count = 0
+    mismatched_scoring_version = 0
+    missing_ids = []
+
+    for pred in predictions:
+        iid = pred.get("instance_id")
+        if not iid or iid not in instances:
+            missing_ids.append(iid)
+            continue
+
+        instance = instances[iid]
+
+        # Trace hash: must match exactly. If prediction lacks it, it predates the
+        # provenance upgrade and we cannot verify — treat as failure.
+        pred_trace = pred.get("trace_hash")
+        inst_trace = instance.get("trace_hash")
+        if pred_trace is None or inst_trace is None or pred_trace != inst_trace:
+            raise ValueError(
+                f"Trace hash mismatch for {iid!r}: "
+                f"prediction={pred_trace!r} instance={inst_trace!r}. "
+                f"Cannot re-score — the gold answer may be for a different trace."
+            )
+
+        # Scoring version: if it differs, we must know. By default we abort.
+        pred_scoring = pred.get("scoring_version")
+        if pred_scoring is not None and pred_scoring != SCORING_VERSION:
+            mismatched_scoring_version += 1
+        # Fallback counting: if instance lacks step_wise_gold_answers, the
+        # candidate builder will fall back to same-family gold answers.
+        if not instance.get("step_wise_gold_answers"):
+            fallback_count += 1
+
+    if missing_ids:
+        raise ValueError(
+            f"Prediction instance_id(s) not found in dataset: {missing_ids}. "
+            f"Run generation first or point --dataset at the matching file."
+        )
+
+    return fallback_count, mismatched_scoring_version
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Re-score saved predictions and validate provenance."
+    )
     parser.add_argument("--dataset", type=Path, default=Path("data/full_benchmark.jsonl"))
     parser.add_argument("--predictions-root", type=Path, default=Path("."))
-    parser.add_argument("--output-dir", type=Path, default=Path("evaluator_v2_results"))
+    parser.add_argument("--output-dir", type=Path, default=Path("evaluation_results"))
+    parser.add_argument(
+        "--allow-scoring-version-drift",
+        action="store_true",
+        help=(
+            "Permit predictions whose scoring_version differs from the current "
+            "eval/scoring.py (SCORING_VERSION). Use when intentionally re-scoring "
+            "old predictions under new rules. Default: abort on version drift."
+        ),
+    )
     args = parser.parse_args()
 
     instances = load_instances(args.dataset)
@@ -115,29 +197,72 @@ def main() -> None:
         raise FileNotFoundError("No saved prediction JSONL files found.")
 
     all_rows: List[Dict[str, Any]] = []
+    total_predictions = 0
+
     for prediction_path in prediction_files:
         condition = infer_condition(prediction_path)
         for prediction in load_jsonl(prediction_path):
+            total_predictions += 1
             instance = instances[prediction["instance_id"]]
-            row = score_prediction(prediction, instance, condition["cot"], dataset_context=dataset_list)
+            # Dataset context is only a fallback for instances missing
+            # step_wise_gold_answers. We'll count how many needed it.
+            row = score_prediction(
+                prediction,
+                instance,
+                condition["cot"],
+                dataset_context=dataset_list,
+            )
             row.update(condition)
             all_rows.append(row)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(args.output_dir / "evaluator_v2_predictions.csv", all_rows)
-    write_csv(args.output_dir / "evaluator_v2_summary.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "condition"]))
-    write_csv(args.output_dir / "evaluator_v2_family.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "family"]))
-    write_csv(args.output_dir / "evaluator_v2_depth.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "depth"]))
-
-    corrected_summary = make_corrected_condition_summary(all_rows)
-    write_csv(
-        args.output_dir / "corrected_condition_summary.csv",
-        corrected_summary,
-        fieldnames=["model", "cot", "max_new_tokens", "accuracy", "stepwise_accuracy", "instances", "runtime_minutes"],
+    # Validation gate: must pass before writing any output.
+    fallback_count, mismatched_scoring_version = validate_provenance(
+        [r for r in all_rows],
+        instances,
+        allow_scoring_version_drift=args.allow_scoring_version_drift,
     )
 
+    if mismatched_scoring_version and not args.allow_scoring_version_drift:
+        sys.stderr.write(
+            f"\nABORT: {mismatched_scoring_version} predictions carry "
+            f"scoring_version != {SCORING_VERSION}. "
+            f"Re-scoring them under different rules produces incomparable numbers.\n"
+            f"Pass --allow-scoring-version-drift to proceed, or regenerate predictions "
+            f"with the current pipeline first.\n"
+        )
+        sys.exit(1)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(args.output_dir / "predictions.csv", all_rows)
+    write_csv(args.output_dir / "summary.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "condition"]))
+    write_csv(args.output_dir / "by_family.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "family"]))
+    write_csv(args.output_dir / "by_depth.csv", aggregate(all_rows, ["model", "cot", "max_new_tokens", "depth"]))
+
+    condition_summary = make_condition_summary(all_rows)
+    write_csv(
+        args.output_dir / "condition_summary.csv",
+        condition_summary,
+        fieldnames=["model", "cot", "max_new_tokens", "accuracy", "stepwise_accuracy", "instances"],
+    )
+
+    # Provenance sidecar — what produced these numbers?
+    provenance = {
+        "scoring_version": SCORING_VERSION,
+        "dataset_file": str(args.dataset),
+        "predictions_root": str(args.predictions_root),
+        "prediction_files_count": len(prediction_files),
+        "total_predictions_scored": len(all_rows),
+        "fallback_candidates_used": fallback_count,
+        "mismatched_scoring_version": mismatched_scoring_version,
+        "allow_scoring_version_drift": args.allow_scoring_version_drift,
+    }
+    with (args.output_dir / "provenance.json").open("w", encoding="utf-8") as f:
+        json.dump(provenance, f, ensure_ascii=False, indent=2)
+
     print(f"Scored {len(all_rows)} predictions across {len(prediction_files)} conditions.")
-    print(f"Saved Evaluator v2 outputs to {args.output_dir}")
+    print(f"  fallback candidates used: {fallback_count}")
+    print(f"  scoring version mismatches: {mismatched_scoring_version}")
+    print(f"  saved outputs to {args.output_dir} (includes provenance.json)")
 
 
 if __name__ == "__main__":

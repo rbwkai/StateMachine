@@ -173,9 +173,12 @@ class Condition:
     S : Total Symbolic Operations (S = Initial Placements + U)
         The total count of discrete operations applied to the symbolic simulator.
 
-    L : Rendered Token Length
-        Token count of the rendered linguistic narrative (constrained to L < 600
-        in the benchmark design). Distinct from sentence count and symbolic step count S.
+    L : Rendered Narrative Length
+        Word count of the rendered linguistic narrative, capped at
+        L <= L_MAX_WORDS (generator.constants) and enforced by
+        generator.metadata.verify_length. Words, not tokens (SPEC §2
+        RESOLVED-1); a tokenizer-measured length is an evaluation-side
+        diagnostic. Distinct from sentence count and symbolic step count S.
     """
 
     family: str
@@ -194,11 +197,6 @@ class Condition:
             raise ValueError("E must be >= 1")
         if self.D < 0:
             raise ValueError("D must be >= 0")
-        if self.D >= self.T:
-            raise ValueError(
-                "D must be < T "
-                "(at least one target update required)"
-            )
 
     @property
     def capability_group(self) -> CapabilityGroup:
@@ -231,3 +229,54 @@ STRUCTURAL_FAMILIES: frozenset[str] = frozenset({
     "undo_chain",
     "undo_redo_chain",
 })
+
+
+# ============================================================
+# NOTE: REMOVE operation
+# ============================================================
+#
+# The symbolic simulator (world/operations.py) and sampler (generator/sampler.py)
+# both support the REMOVE operation. However, the currently released trajectory
+# families do not include REMOVE.
+#
+# REASON FOR EXCLUSION (methodological constraint, not theoretical):
+#   The current generator validation pipeline was designed around operations that
+#   preserve enough entity structure for the target-state/query construction.
+#   REMOVE introduces unique challenges that require additional design work:
+#     1. Target entity removal: final query becomes "entity no longer exists"
+#     2. Later operations referring to removed entities must be rejected
+#     3. REMOVE as target-relevant T (yes: location changes to None)
+#     4. Distractor REMOVE must not affect target answer
+#     4. Renderer must unambiguously represent disappearance
+#     5. Structural causality/deletion test must apply to REMOVE
+#
+# SCIENTIFIC MOTIVATION FOR INCLUSION:
+#   REMOVE represents a fundamentally different mutation type (entity deletion/
+#   disappearance) that would complete the operation taxonomy for RQ1:
+#     - State relocation: MOVE
+#     - Revision: UNDO/REDO
+#     - Identity reassignment: SWAP
+#     - Deletion: REMOVE
+#     - Structural composition: SPLIT/MERGE
+#
+# FUTURE WORK:
+#   If REMOVE can be generated with the same validity/solubility guarantees as
+#   other operations before the next release, it should be added as a new family
+#   (e.g., "remove_chain" or integrated into existing families) and the paper
+#   should note its exclusion as a methodological constraint rather than a
+#   theoretical decision.
+#
+# ============================================================
+
+
+# ============================================================
+# Required structural ops per family (single source)
+# ============================================================
+
+REQUIRED_STRUCTURAL_OPS: dict = {
+    "split_chain": frozenset({"split"}),
+    "merge_chain": frozenset({"merge"}),
+    "swap_chain": frozenset({"swap"}),
+    "undo_chain": frozenset({"undo"}),
+    "undo_redo_chain": frozenset({"undo", "redo"}),
+}

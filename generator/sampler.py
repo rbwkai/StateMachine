@@ -166,14 +166,15 @@ def sample_sequence(
     # produce an all-Swap/Undo sequence on a world that never has any
     # object in it, which leaves every possible query with nothing to ask
     # about.
-    if Put in operations_enabled and update_count >= 1:
+    if Put in operations_enabled:
         first_put = _construct_put(rng, state, objects_created)
         state = apply_op(first_put, state, history)
         ops_applied.append(first_put)
         objects_created += 1
 
-    budget = update_count * max_attempts_factor
-    while len(ops_applied) < update_count and budget > 0:
+    budget = max(1, update_count) * max_attempts_factor
+    non_put_updates = 0
+    while non_put_updates < update_count and budget > 0:
         budget -= 1
         op = _propose_operation(
             rng, state, history, objects_created, entity_count, operations_enabled
@@ -187,11 +188,13 @@ def sample_sequence(
         ops_applied.append(op)
         if isinstance(op, (Put, Split)):
             objects_created += 1
+        if not isinstance(op, Put):
+            non_put_updates += 1
 
-    if len(ops_applied) < update_count:
+    if non_put_updates < update_count:
         raise GenerationError(
             f"could not reach U={update_count} within budget "
-            f"(reached {len(ops_applied)}; try more containers or a higher entity_count)"
+            f"(reached {non_put_updates}; try more containers or a higher entity_count)"
         )
 
     return ops_applied, state, history, containers

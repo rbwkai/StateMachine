@@ -226,7 +226,9 @@ split = build_trajectory(
 
 print_trajectory(split)
 
-assert split.target_obj == "o0"
+# The queried target of split_chain is the child spawned by the Split (D-004),
+# not the split source.
+assert split.target_obj == "o1"
 assert len(split.final_state.location) == 2
 assert "o0" in split.final_state.location
 assert "o1" in split.final_state.location

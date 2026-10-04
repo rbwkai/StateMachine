@@ -7,7 +7,6 @@ Standardized Evaluation Harness for DWS-Bench.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -17,8 +16,9 @@ from eval.prompts import build_user_prompt
 from eval.scoring import (
     AnswerExtraction,
     candidate_answers,
+    extract_answer,
     extract_instance_answer,
-    extract_step_answers as _scoring_extract_step_answers,
+    extract_step_answers,
     normalize_text,
     score_prediction,
 )
@@ -51,21 +51,11 @@ def format_prompt(
 # Answer Extraction
 # ============================================================
 
-def extract_answer(
-    raw_response: str,
-    candidate_containers: Optional[Sequence[str]] = None,
-) -> str:
-    """Deprecated: Thin wrapper around eval.scoring for backward compatibility."""
-    cands = list(candidate_containers) if candidate_containers else []
-    ans_match = re.search(r"(?:final\s+)?answer\s*:\s*(.+?)(?:\n|$)", raw_response, re.IGNORECASE)
-    if not cands and ans_match:
-        seg = ans_match.group(1).strip().lower()
-        if seg in {"true", "false"}:
-            cands = ["True", "False"]
-    extraction = extract_instance_answer(raw_response, candidates=cands)
-    if extraction.answer and (extraction.has_final_answer or ans_match):
-        return extraction.answer
-    return ""
+# ============================================================
+# Extraction lives in eval/scoring.py (AGENTS.md §5). Re-exported here
+# because harness callers import both from this module; there is no second
+# extraction implementation.
+# ============================================================
 
 
 def normalize_answer(value: Any) -> str:
@@ -73,16 +63,8 @@ def normalize_answer(value: Any) -> str:
     return normalize_text(value)
 
 
-def extract_step_answers(
-    raw_response: str,
-    candidate_answers: Sequence[str],
-) -> List[Optional[str]]:
-    """
-    Extract step-wise container predictions from model responses.
-
-    Gold step 1 is the initial Put location (state after op 0).
-    """
-    return _scoring_extract_step_answers(raw_response, candidate_answers)
+# AGENTS.md §5: eval/scoring.py owns extraction. Re-exported here so harness
+# callers keep one import site; there is no second extraction implementation.
 
 
 # ============================================================
@@ -102,6 +84,12 @@ class InstanceEvalResult:
     gold_trajectory: Optional[List[Any]] = None
     pred_trajectory: Optional[List[Any]] = None
     error_analysis: Optional[Dict[str, Any]] = None
+    
+    # Extraction diagnostics (E2: separate extraction vs reasoning failure)
+    has_final_answer: bool = False
+    extraction_method: str = ""
+    protocol_compliant: bool = False
+    semantic_correct: bool = False
 
 
 @dataclass
@@ -111,6 +99,11 @@ class ConditionEvalSummary:
     correct_instances: int
     accuracy: float
     error_type_counts: Dict[str, int]
+    
+    # Extraction diagnostics (E2)
+    format_compliance_rate: float = 0.0
+    extraction_rate: float = 0.0
+    semantic_accuracy: float = 0.0
 
 
 # ============================================================
@@ -120,6 +113,7 @@ class ConditionEvalSummary:
 def evaluate_predictions(
     instances: List[Dict[str, Any]],
     predictions: List[Dict[str, Any]],
+    chain_of_thought: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluate a set of predictions against gold instances.
@@ -129,7 +123,19 @@ def evaluate_predictions(
       - "pred_answer": model's predicted final answer
       - "pred_trajectory" (optional): step-by-step state predictions
     """
+    prediction_ids = [p["instance_id"] for p in predictions]
+    duplicate_ids = sorted({
+        instance_id
+        for instance_id in prediction_ids
+        if prediction_ids.count(instance_id) > 1
+    })
+    if duplicate_ids:
+        raise ValueError(
+            "duplicate prediction instance_id values: "
+            + ", ".join(duplicate_ids)
+        )
     pred_map = {p["instance_id"]: p for p in predictions}
+    missing_ids = [inst["instance_id"] for inst in instances if inst["instance_id"] not in pred_map]
 
     results: List[InstanceEvalResult] = []
     condition_buckets: Dict[str, List[InstanceEvalResult]] = {}
@@ -139,7 +145,12 @@ def evaluate_predictions(
         pred_info = pred_map.get(iid, {})
         raw_pred = str(pred_info.get("pred_answer") or pred_info.get("raw_prediction") or "").strip()
 
-        scored = score_prediction(pred_info, inst, dataset_context=instances)
+        scored = score_prediction(
+            pred_info,
+            inst,
+            chain_of_thought=chain_of_thought,
+            dataset_context=instances,
+        )
         is_correct = scored["strict_correct"]
 
         # Trajectory error analysis if step-wise predictions are present
@@ -163,6 +174,11 @@ def evaluate_predictions(
             gold_trajectory=gold_traj,
             pred_trajectory=pred_traj,
             error_analysis=error_analysis_dict,
+            # Extraction diagnostics (E2)
+            has_final_answer=scored.get("has_final_answer", False),
+            extraction_method=scored.get("extraction_method", ""),
+            protocol_compliant=scored.get("protocol_compliant", False),
+            semantic_correct=scored.get("semantic_correct", False),
         )
         results.append(res)
 
@@ -178,6 +194,15 @@ def evaluate_predictions(
         correct = sum(1 for r in bucket if r.is_correct)
         acc = correct / total if total > 0 else 0.0
 
+        # Extraction diagnostics (E2)
+        format_compliant = sum(1 for r in bucket if r.has_final_answer)
+        extracted = sum(1 for r in bucket if r.extraction_method != "none")
+        semantic_correct = sum(1 for r in bucket if r.semantic_correct)
+        
+        format_compliance_rate = format_compliant / total if total > 0 else 0.0
+        extraction_rate = extracted / total if total > 0 else 0.0
+        semantic_accuracy = semantic_correct / total if total > 0 else 0.0
+
         error_counts: Dict[str, int] = {}
         for r in bucket:
             if r.error_analysis:
@@ -190,16 +215,35 @@ def evaluate_predictions(
             correct_instances=correct,
             accuracy=acc,
             error_type_counts=error_counts,
+            format_compliance_rate=format_compliance_rate,
+            extraction_rate=extraction_rate,
+            semantic_accuracy=semantic_accuracy,
         )
 
     overall_total = len(results)
     overall_correct = sum(1 for r in results if r.is_correct)
     overall_acc = overall_correct / overall_total if overall_total > 0 else 0.0
 
+    # Overall extraction diagnostics
+    overall_format_compliant = sum(1 for r in results if r.has_final_answer)
+    overall_extracted = sum(1 for r in results if r.extraction_method != "none")
+    overall_semantic_correct = sum(1 for r in results if r.semantic_correct)
+    
+    overall_format_compliance = overall_format_compliant / overall_total if overall_total > 0 else 0.0
+    overall_extraction_rate = overall_extracted / overall_total if overall_total > 0 else 0.0
+    overall_semantic_acc = overall_semantic_correct / overall_total if overall_total > 0 else 0.0
+
     return {
         "overall_total": overall_total,
         "overall_correct": overall_correct,
         "overall_accuracy": overall_acc,
+        # Overall extraction diagnostics (E2)
+        "overall_format_compliance_rate": overall_format_compliance,
+        "overall_extraction_rate": overall_extraction_rate,
+        "overall_semantic_accuracy": overall_semantic_acc,
+        "prediction_count": len(predictions),
+        "missing_predictions": len(missing_ids),
+        "missing_prediction_ids": missing_ids,
         "condition_summaries": {k: vars(v) for k, v in summaries.items()},
         "instance_results": [vars(r) for r in results],
     }

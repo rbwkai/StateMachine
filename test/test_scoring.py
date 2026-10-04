@@ -37,24 +37,24 @@ def test_gold_large_basket_extracted() -> None:
     assert res.protocol_compliant is True
 
 
-def test_placeholder_followed_by_final_answer() -> None:
+def test_first_final_answer_is_the_contract() -> None:
     res = extract_instance_answer(
         "Final Answer: <answer>\nFinal Answer: the red crate",
         CANDIDATES,
         gold_answer="the red crate",
     )
-    assert res.answer == "the red crate"
+    assert res.answer == ""
     assert res.method == "final_answer"
-    assert res.semantic_correct is True
+    assert res.semantic_correct is False
 
 
-def test_two_final_answer_lines_last_wins() -> None:
+def test_first_final_answer_wins() -> None:
     res = extract_instance_answer(
         "Final Answer: the green box\nFinal Answer: the red crate",
         CANDIDATES,
         gold_answer="the red crate",
     )
-    assert res.answer == "the red crate"
+    assert res.answer == "the green box"
 
 
 def test_ambiguous_final_answer_no_credit() -> None:
@@ -100,6 +100,64 @@ def test_step_answers_parsing() -> None:
     assert parsed == ["the green box", None, "the large basket"]
 
 
+# ---- instance-aware extraction (was test/test_evaluator_v2.py, D-015) ----
+
+PROBE_CANDIDATES = ["the blue shelf", "the large basket", "the old box"]
+
+
+def test_marker_free_answer_is_semantically_extractable_but_not_protocol_compliant() -> None:
+    result = extract_instance_answer(
+        "The key is now on the blue shelf.", PROBE_CANDIDATES, chain_of_thought=False
+    )
+    assert result.answer == "the blue shelf"
+    assert result.method == "answer_sentence"
+    assert not result.has_final_answer
+    assert not result.protocol_compliant
+
+
+def test_final_answer_marker_is_strictly_compliant() -> None:
+    result = extract_instance_answer(
+        "Final Answer: the large basket", PROBE_CANDIDATES, chain_of_thought=False
+    )
+    assert result.answer == "the large basket"
+    assert result.method == "final_answer"
+    assert result.has_final_answer
+    assert result.protocol_compliant
+
+
+def test_articleless_answer_matches_article_prefixed_candidate() -> None:
+    result = extract_instance_answer(
+        "Step 1: large basket\nFinal Answer: large basket",
+        PROBE_CANDIDATES,
+        chain_of_thought=True,
+    )
+    assert result.answer == "the large basket"
+    assert result.method == "final_answer"
+    assert result.protocol_compliant
+
+
+def test_ambiguous_candidate_mentions_are_invalid() -> None:
+    result = extract_instance_answer(
+        "The key moved from the old box to the blue shelf.",
+        PROBE_CANDIDATES,
+        chain_of_thought=False,
+    )
+    assert result.answer == ""
+    assert result.method == "none"
+
+
+def test_cot_requires_step_and_final_answer() -> None:
+    without_step = extract_instance_answer(
+        "Final Answer: the blue shelf", PROBE_CANDIDATES, chain_of_thought=True
+    )
+    with_step = extract_instance_answer(
+        "Step 1: the large basket\nFinal Answer: the blue shelf",
+        PROBE_CANDIDATES,
+        chain_of_thought=True,
+    )
+    assert not without_step.protocol_compliant
+    assert with_step.protocol_compliant
+
 def main() -> None:
     print("=" * 70)
     print("RUNNING TEST_SCORING.PY")
@@ -108,11 +166,13 @@ def main() -> None:
     test_gold_large_basket_extracted()
     print("1. Gold 'the large basket': 'Final Answer: Large basket' -> PASS")
 
-    test_placeholder_followed_by_final_answer()
+    # D-003: the scorer takes the FIRST 'Final Answer:' marker, so a leading
+    # placeholder is the answer under test and the later real answer is ignored.
+    test_first_final_answer_is_the_contract()
     print("2. 'Final Answer: <answer>\\nFinal Answer: the red crate' -> PASS")
 
-    test_two_final_answer_lines_last_wins()
-    print("3. Two Final Answer lines -> last wins -> PASS")
+    test_first_final_answer_wins()
+    print("3. Two Final Answer lines -> first wins -> PASS")
 
     test_ambiguous_final_answer_no_credit()
     print("4. 'Final Answer: the green box or the large basket' -> '' -> PASS")
@@ -125,6 +185,21 @@ def main() -> None:
 
     test_step_answers_parsing()
     print("7. 'Step 1: Green box' parsed, '2. foo' ignored -> PASS")
+
+    test_marker_free_answer_is_semantically_extractable_but_not_protocol_compliant()
+    print("8. marker-free answer: extractable but not protocol compliant -> PASS")
+
+    test_final_answer_marker_is_strictly_compliant()
+    print("9. 'Final Answer:' marker is protocol compliant -> PASS")
+
+    test_articleless_answer_matches_article_prefixed_candidate()
+    print("10. articleless answer matches article-prefixed candidate -> PASS")
+
+    test_ambiguous_candidate_mentions_are_invalid()
+    print("11. ambiguous candidate mentions score no credit -> PASS")
+
+    test_cot_requires_step_and_final_answer()
+    print("12. CoT compliance needs both Step and Final Answer -> PASS")
 
     print("=" * 70)
     print("ALL SCORING TESTS PASSED")

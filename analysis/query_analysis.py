@@ -23,6 +23,7 @@ class QueryAnalysis:
     dependency_depth: int
     last_relevant_step: Optional[int]
     revision_count: int
+    v_actual: int  # V_actual from measured factors (revisits + history reversals)
     undo_count: int
     redo_count: int
     interleaving_score: float
@@ -43,14 +44,16 @@ def _operation_touches_query(op: Operation, query) -> bool:
             return op.obj_id == oid
         if isinstance(op, Split):
             return op.source_obj_id == oid or op.new_obj_id == oid
+        if isinstance(op, (Swap, Merge, Undo, Redo)):
+            return True
         return False
 
     container = query.container
     obj_type = query.obj_type
-    if isinstance(op, (Move, Put)):
-        return op.container == container or (
-            isinstance(op, Move) and op.dst == container
-        )
+    if isinstance(op, Put):
+        return op.container == container
+    if isinstance(op, Move):
+        return op.dst == container
     if isinstance(op, Remove):
         return True
     if isinstance(op, (Swap,)):
@@ -142,6 +145,7 @@ def analyze_trajectory(
         dependency_depth=(max(cf_sensitive) + 1 if cf_sensitive else 0),
         last_relevant_step=(max(relevant_steps) if relevant_steps else None),
         revision_count=revisions,
+        v_actual=revisions,  # Note: this matches the revision_count definition; for V_actual from metadata, use MeasuredFactors.V_actual
         undo_count=undo_count,
         redo_count=redo_count,
         interleaving_score=_interleaving_score(ops, query),
@@ -179,7 +183,7 @@ class QuerySpec:
             return False
         if analysis.interleaving_score < self.min_interleaving:
             return False
-        if self.require_revision and analysis.revision_count < 1:
+        if self.require_revision and analysis.v_actual < 1:
             return False
         if analysis.undo_count < self.min_undo:
             return False

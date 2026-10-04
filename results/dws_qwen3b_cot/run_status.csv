@@ -1,4 +1,0 @@
-condition,return_code,minutes
-qwen2.5-3b_cot_128,0,72.3
-qwen2.5-3b_cot_256,0,73.59
-qwen2.5-3b_cot_512,0,74.92

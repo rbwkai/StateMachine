@@ -6,7 +6,7 @@ from world import (
     Merge, Move, Operation, Put, Redo, Remove, Split, Swap, Undo,
     WorldState, replay_trace,
 )
-from .names import NameRegistry
+from .names import NameRegistry, pluralize_object
 
 
 def _indefinite_article(word: str) -> str:
@@ -32,9 +32,12 @@ def render_move(
     op: Move,
     before: WorldState,
     names: NameRegistry,
+    include_source: bool = True,
 ) -> str:
-    src = before.location[op.obj_id]
     phrase = names.obj(op.obj_id, before)
+    if not include_source:
+        return f"{phrase.capitalize()} was moved to {names.container(op.dst)}."
+    src = before.location[op.obj_id]
 
     return (
         f"{phrase.capitalize()} was moved from "
@@ -124,6 +127,7 @@ def render_narrative(
     ops: Sequence[Operation],
     containers,
     names: NameRegistry,
+    include_move_sources: bool = False,
 ) -> Tuple[List[str], WorldState]:
     """Render the canonical operation trace.
 
@@ -133,10 +137,19 @@ def render_narrative(
     """
     trace, final_state, _ = replay_trace(ops, containers)
 
-    sentences = [
-        RENDER_DISPATCH[type(op)](op, before, names)
-        for op, before, _after in trace
-    ]
+    sentences = []
+    for op, before, _after in trace:
+        if isinstance(op, Move):
+            sentences.append(
+                render_move(
+                    op,
+                    before,
+                    names,
+                    include_source=include_move_sources,
+                )
+            )
+        else:
+            sentences.append(RENDER_DISPATCH[type(op)](op, before, names))
 
     return sentences, final_state
 
@@ -145,23 +158,13 @@ def render_narrative(
 # Question rendering
 # ---------------------------------------------------------------------------
 
-def question_location(
-    obj_id: str,
-    state: WorldState,
-    names: NameRegistry,
-) -> str:
-    """Generate a location question for an object."""
+def question_location(obj_id: str, state: WorldState, names: NameRegistry) -> str:
     return f"Where is {names.obj(obj_id, state)} now?"
 
 
-def question_count(
-    container_id: str,
-    obj_type: str,
-    names: NameRegistry,
-) -> str:
-    """Generate a count question for a container/type pair."""
+def question_count(container_id: str, obj_type: str, names: NameRegistry) -> str:
     return (
-        f"How many {obj_type}s are in "
+        f"How many {pluralize_object(obj_type)} are in "
         f"{names.container(container_id)} now?"
     )
 
@@ -179,9 +182,7 @@ def question_counterfactual(
     obj_id: str,
     state: WorldState,
 ) -> str:
-    """Generate a counterfactual location question."""
     obj_type = state.object_type[obj_id]
-
     return (
         f'Suppose this had not happened: "{removed_sentence}" '
         f"Where would the {obj_type} be now?"

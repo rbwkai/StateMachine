@@ -1,6 +1,15 @@
 """
+generate.py
+===========
 Generation CLI / Script for DWS-Bench Trajectories.
-Generates full benchmark records for all trajectory families.
+
+Every record this CLI emits comes from ``generator.instance`` — the same
+request -> validated-record path ``experiments/_common.py`` uses, including the
+structural, factor and length gate (SPEC §3, requirements.md §7). The CLI adds
+no fields of its own: ``build_validated_instance`` owns the record schema, so
+``generate.py`` output and the experiment sweeps are interchangeable and
+``eval/eval_harness.py`` / ``run_eval.py`` read the same ``instance_id`` key from
+both.
 """
 
 from __future__ import annotations
@@ -10,25 +19,22 @@ import json
 import random
 from typing import Any, Dict, List
 
-from generator.dataset_spec import (
-    CapabilityGroup,
-    Condition,
-    Experiment,
-    GenerationStatus,
-    family_capability_group,
-)
-from generator.trajectories import available_families, build_trajectory
+from generator.dataset_spec import family_capability_group
+from generator.instance import generate_instance_with_retry
+from generator.trajectories import available_families
 from generator.trajectory_specs import TrajectorySpec
-from generator.trajectory_validation import validate_trajectory
-from render.names import NameRegistry
-from render.narrative import question_location, render_narrative
-from world.operations import Move, Put
+
+
+# Records are not part of an RQ sweep, but the unified schema carries an
+# `experiment` / `condition_id` pair, so a CLI run is labelled rather than left
+# empty and becomes aggregatable with the sweep data by generate_all.py.
+CLI_EXPERIMENT_TAG = "generate_cli"
 
 
 def generate_family_example(
     family: str,
     rng: random.Random,
-    example_id: str,
+    instance_id: str,
     entity_count: int = 2,
     total_updates: int = 4,
     target_updates: int = 4,
@@ -61,65 +67,48 @@ def generate_family_example(
         distractor_updates=distractor_updates,
     )
 
-    # 1. Build symbolic trajectory
-    trajectory = build_trajectory(rng, spec)
+    # One draw from the caller's stream becomes this instance's seed, so
+    # successive CLI instances differ while a given --seed still reproduces the
+    # same records. Trajectory construction, rendering, measurement and the gate
+    # all happen inside the shared path; nothing is re-derived here.
+    instance_seed = rng.getrandbits(32)
 
-    # 2. Structural validation
-    validate_trajectory(trajectory.ops, trajectory.target_obj, trajectory.spec)
-
-    # 3. Render natural language narrative
-    names = NameRegistry(containers=trajectory.containers, rng=rng)
-    sentences, final_state = render_narrative(
-        trajectory.ops, trajectory.containers, names
+    return generate_instance_with_retry(
+        seed=instance_seed,
+        spec=spec,
+        instance_id=instance_id,
+        experiment=CLI_EXPERIMENT_TAG,
+        condition_id=(
+            f"{family}_T{target_updates}_D{distractor_updates}_E{entity_count}"
+        ),
     )
 
-    # 4. Target question and answer
-    question = question_location(trajectory.target_obj, final_state, names)
-    target_container = final_state.location.get(trajectory.target_obj)
-    target_name = names.container(target_container) if target_container else None
 
-    # 5. Build step-by-step trace
-    step_trace: List[Dict[str, Any]] = []
-    for step_idx, (op, sentence) in enumerate(zip(trajectory.ops, sentences)):
-        step_trace.append({
-            "step": step_idx,
-            "op": op.__class__.__name__.upper(),
-            "sentence": sentence,
-            "details": str(op),
-        })
-
-    initial_placements = len([op for op in trajectory.ops if isinstance(op, Put)])
-    post_init_updates = len([op for op in trajectory.ops if not isinstance(op, Put)])
-    total_transitions = len(trajectory.ops)
-
-    record = {
-        "example_id": example_id,
-        "family": family,
-        "capability_group": family_capability_group(family).name,
-        "spec": {
-            "entity_count": spec.entity_count,
-            "total_updates": spec.total_updates,
-            "target_updates": spec.target_updates,
-            "distractor_updates": spec.distractor_updates,
-            "num_containers": spec.num_containers,
-            "initial_placements": initial_placements,
-            "post_init_updates": post_init_updates,
-            "total_transitions": total_transitions,
-        },
-        "context": " ".join(sentences),
-        "sentences": sentences,
-        "question": question,
-        "gold_answer": target_name,
-        "gold_container": target_container,
-        "target_obj": trajectory.target_obj,
-        "step_trace": step_trace,
-        "final_state": {
-            "location": final_state.location,
-            "containers": sorted(final_state.containers),
-        },
-    }
-
-    return record
+def _print_record(record: Dict[str, Any]) -> None:
+    print(f"[{record['instance_id']}]")
+    print("Story:")
+    for sentence in record["sentences"]:
+        print(f"  - {sentence}")
+    print(f"Question:    {record['question']}")
+    print(
+        f"Gold Answer: {record['gold_answer']} "
+        f"({record['gold_container']})"
+    )
+    print(f"Final State: {record['final_state']['location']}")
+    print(f"Requested:  {json.dumps(record['requested_factors'])}")
+    print(f"Measured:   {json.dumps(record['measured_factors'])}")
+    print(f"trace_hash: {record['trace_hash']}")
+    print(
+        "canonical_trace: "
+        f"{len(record['canonical_trace'])} ops, "
+        f"step_wise_gold: {json.dumps(record['step_wise_gold'])}"
+    )
+    print(
+        "versions: "
+        f"generator={record['generator_version']} "
+        f"renderer={record['renderer_version']} "
+        f"scoring={record['scoring_version']}"
+    )
 
 
 def main():
@@ -144,29 +133,31 @@ def main():
             raise ValueError(f"Unknown family: {args.family}. Available: {available_families()}")
         families = [args.family]
 
-    generated_records = []
+    generated_records: List[Dict[str, Any]] = []
 
     for fam in families:
         print(f"\n{'='*70}\nFAMILY: {fam}\n{'='*70}")
         for i in range(args.count):
-            ex_id = f"{fam}_{args.seed}_{i}"
-            rec = generate_family_example(family=fam, rng=rng, example_id=ex_id)
+            instance_id = f"{fam}_{args.seed}_{i}"
+            rec = generate_family_example(
+                family=fam,
+                rng=rng,
+                instance_id=instance_id,
+            )
             generated_records.append(rec)
 
-            print(f"[{ex_id}]")
-            print(f"Story:")
-            for s in rec["sentences"]:
-                print(f"  - {s}")
-            print(f"Question:    {rec['question']}")
-            print(f"Gold Answer: {rec['gold_answer']} ({rec['gold_container']})")
-            print(f"Final State: {rec['final_state']['location']}")
+            _print_record(rec)
             print()
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             for rec in generated_records:
-                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"\nWrote {len(generated_records)} records to {args.output}")
+
+    print("\nFamilies covered: " + ", ".join(
+        f"{fam} ({family_capability_group(fam).name})" for fam in families
+    ))
 
 
 if __name__ == "__main__":

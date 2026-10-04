@@ -48,10 +48,9 @@ class InferenceEngine:
     def generate_batch(
         self,
         prompts: Sequence[Union[str, List[Dict[str, str]]]],
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-        do_sample: bool = False,
+        max_new_tokens: Optional[int] = None,
+        *,
+        enforce_greedy: bool = True,
     ) -> List[str]:
         """Generate responses for a batch of prompts."""
         raise NotImplementedError
@@ -71,31 +70,53 @@ class MockInferenceEngine(InferenceEngine):
     def generate_batch(
         self,
         prompts: Sequence[Union[str, List[Dict[str, str]]]],
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-        do_sample: bool = False,
+        max_new_tokens: Optional[int] = None,
+        *,
+        enforce_greedy: bool = True,
     ) -> List[str]:
         responses: List[str] = []
+        prompt_tokens_list = []
         for p in prompts:
             if isinstance(p, list):
                 text = " ".join([m.get("content", "") for m in p])
             else:
                 text = str(p)
 
+            # Extract system prompt if embedded in the prompt
+            system_prompt = "default"
+            if "[SYSTEM_PROMPT:" in text:
+                import re
+                match = re.search(r"\[SYSTEM_PROMPT: ([^\]]+)\]", text)
+                if match:
+                    system_prompt = match.group(1)
+
             if "Where is" in text or "where is" in text:
-                responses.append("Step 1: the green box\nFinal Answer: the green box")
+                # Vary response based on system prompt for testing
+                if "expert dynamic state reasoning" in system_prompt.lower():
+                    responses.append("Step 1: the green box\nFinal Answer: the green box")
+                elif "helpful assistant" in system_prompt.lower():
+                    responses.append("Step 1: the green box\nFinal Answer: the green box")
+                elif "answer the question" in system_prompt.lower():
+                    responses.append("Final Answer: the green box")
+                else:
+                    responses.append("Step 1: the green box\nFinal Answer: the green box")
             elif "True or False" in text or "true or false" in text:
                 responses.append("Final Answer: True")
             else:
                 responses.append("Final Answer: container")
+            # Mock prompt token count (rough approximation: 1 token per 4 chars)
+            prompt_tokens_list.append(max(1, len(text) // 4))
+        
         self.last_generation_metadata = [
             {
                 "generated_tokens": 0,
                 "finish_reason": "eos_token",
                 "has_final_answer": "final answer:" in response.lower(),
+                "enforce_greedy": enforce_greedy,
+                "prompt_tokens": prompt_tokens_list[i],
+                "system_prompt": system_prompt,
             }
-            for response in responses
+            for i, response in enumerate(responses)
         ]
         return responses
 
@@ -124,11 +145,12 @@ class HuggingFaceEngine(InferenceEngine):
         self.precision = precision
         self.max_prompt_length = 0
 
-        logger.info(f"Loading tokenizer for {model_config.hf_model_id}...")
+        logger.info(f"Loading tokenizer for {model_config.hf_model_id} (rev={model_config.revision[:8]})...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_config.hf_model_id,
+            revision=model_config.revision,
             token=hf_token,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         # Set pad token if not present
@@ -145,8 +167,9 @@ class HuggingFaceEngine(InferenceEngine):
         )
 
         model_kwargs: Dict[str, Any] = {
-            "trust_remote_code": True,
+            "trust_remote_code": False,
             "token": hf_token,
+            "revision": model_config.revision,
         }
 
         if precision == "4bit":
@@ -236,11 +259,17 @@ class HuggingFaceEngine(InferenceEngine):
     def generate_batch(
         self,
         prompts: Sequence[Union[str, List[Dict[str, str]]]],
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-        top_p: float = 1.0,
-        do_sample: bool = False,
+        max_new_tokens: Optional[int] = None,
+        *,
+        enforce_greedy: bool = True,
     ) -> List[str]:
+        """
+        Generate responses for a batch of prompts.
+
+        By default, enforces greedy decoding (temperature=0, do_sample=False) per
+        the model's ModelConfig. Pass enforce_greedy=False only for explicit
+        ablations or debugging.
+        """
         if torch is None:
             raise RuntimeError("PyTorch is not available.")
 
@@ -286,18 +315,25 @@ class HuggingFaceEngine(InferenceEngine):
         input_ids = inputs["input_ids"].to(input_device)
         attention_mask = inputs["attention_mask"].to(input_device)
 
+        # Use ModelConfig decoding params; enforce greedy by default
         gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": max_new_tokens,
+            "max_new_tokens": max_new_tokens or self.config.max_new_tokens,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
 
-        if do_sample and temperature > 0.0:
-            gen_kwargs["do_sample"] = True
-            gen_kwargs["temperature"] = temperature
-            gen_kwargs["top_p"] = top_p
-        else:
+        if enforce_greedy:
             gen_kwargs["do_sample"] = False
+            gen_kwargs["temperature"] = None
+            gen_kwargs["top_p"] = None
+        else:
+            # Allow overrides only when explicitly opted out
+            gen_kwargs["do_sample"] = self.config.do_sample
+            if self.config.do_sample:
+                gen_kwargs["temperature"] = self.config.temperature
+                gen_kwargs["top_p"] = self.config.top_p
+            else:
+                gen_kwargs["do_sample"] = False
 
         with torch.no_grad():
             output_ids = self.model.generate(
@@ -321,6 +357,61 @@ class HuggingFaceEngine(InferenceEngine):
                 "generated_tokens": token_count,
                 "finish_reason": "eos_token" if reached_eos else "length",
                 "has_final_answer": "final answer:" in text.lower(),
+                "prompt_tokens": input_len,  # L_tok for this prompt
             })
         self.last_generation_metadata = metadata
         return [d.strip() for d in decoded]
+
+def create_engine(
+    model_key: str,
+    device: str = "auto",
+    precision: str = "bfloat16",
+    max_new_tokens: int = 256,
+    mock: bool = False,
+    hf_token: Optional[str] = None,
+) -> InferenceEngine:
+    """
+    Factory function to create an inference engine.
+    
+    Args:
+        model_key: Key from CORE_MODELS or OPTIONAL_MODELS
+        device: Device to run on ("auto", "cuda", "cpu")
+        precision: Precision mode ("bfloat16", "float16", "4bit", "8bit")
+        max_new_tokens: Maximum tokens to generate
+        mock: If True, return a MockInferenceEngine for dry runs
+        hf_token: HuggingFace token for private models
+    
+    Returns:
+        An InferenceEngine instance (HuggingFaceEngine or MockInferenceEngine)
+    """
+    from eval.models import CORE_MODELS, OPTIONAL_MODELS, ModelConfig
+    
+    all_models = {**CORE_MODELS, **OPTIONAL_MODELS}
+    if model_key not in all_models:
+        raise ValueError(f"Unknown model: {model_key}. Available: {list(all_models.keys())}")
+    
+    model_config = all_models[model_key]
+    
+    # Create a copy with updated max_new_tokens
+    config = ModelConfig(
+        name=model_config.name,
+        hf_model_id=model_config.hf_model_id,
+        family=model_config.family,
+        parameter_count_b=model_config.parameter_count_b,
+        revision=model_config.revision,
+        temperature=model_config.temperature,
+        top_p=model_config.top_p,
+        max_new_tokens=max_new_tokens,
+        do_sample=model_config.do_sample,
+        system_prompt=model_config.system_prompt,
+    )
+    
+    if mock:
+        return MockInferenceEngine(model_name=model_key)
+    
+    return HuggingFaceEngine(
+        model_config=config,
+        device=device,
+        precision=precision,
+        hf_token=hf_token,
+    )

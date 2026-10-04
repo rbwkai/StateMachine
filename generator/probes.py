@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import collections.abc
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from world import (
     GenerationError,
@@ -19,6 +20,7 @@ from world import (
     Undo,
     WorldState,
     apply_op,
+    can_redo,
     gold_count,
     gold_location,
     replay_trace,
@@ -225,22 +227,42 @@ def step_wise_gold(
 # Counterfactual evaluation
 # ============================================================
 
-def counterfactual_gold(
+# Every candidate removal lands in exactly one of these classes. The first
+# three are also written into each probe's ``probe_class`` field, so a stored
+# probe never leaves its causal class implicit (SPEC §4).
+PROBE_VALID_ANSWER_CHANGING = "valid_answer_changing"
+PROBE_VALID_ANSWER_PRESERVING = "valid_answer_preserving"
+PROBE_INVALID_REPLAY = "invalid_replay"
+PROBE_EXCLUDED_SETUP = "excluded_setup"
+
+
+def _is_setup_op(op: Operation) -> bool:
+    """
+    True for a setup placement, i.e. one of the trajectory's initial
+    conditions.
+
+    SPEC §2 separates $P$ (initial placements) from $U = T + D$, which
+    excludes Put. Deleting a Put therefore changes what the world started
+    with, not what subsequently happened to it, so it is a different
+    intervention and is excluded from probe selection unless asked for.
+    """
+
+    return isinstance(op, Put)
+
+
+def _counterfactual_state(
     ops_applied: Sequence[Operation],
     containers: Set[str],
     remove_index: int,
-    query: Query,
-) -> Optional[Any]:
+) -> Optional[WorldState]:
     """
-    Remove exactly one operation and replay the resulting
-    trajectory.
+    Final state of the trajectory with exactly one operation removed.
 
-    Returns:
-        The counterfactual final query answer.
+    Returns None only when the remaining sequence cannot be replayed.
 
-    Returns None:
-        If removing the operation causes a later operation
-        to become invalid.
+    The sentinel is deliberately *not* an answer value: SPEC §4 gives a
+    removed object the gold answer None, so "replay became invalid" and
+    "the answer is None" must never share a representation.
     """
 
     if not 0 <= remove_index < len(
@@ -270,9 +292,384 @@ def counterfactual_gold(
     except InvalidOperation:
         return None
 
+    return final_state
+
+
+def counterfactual_gold(
+    ops_applied: Sequence[Operation],
+    containers: Set[str],
+    remove_index: int,
+    query: Query,
+) -> Optional[Any]:
+    """
+    Remove exactly one operation and replay the resulting
+    trajectory.
+
+    Returns:
+        The counterfactual final query answer.
+
+    Returns None:
+        If removing the operation causes a later operation
+        to become invalid, or if the answer is itself None.
+
+    Callers that need to tell those two cases apart must use
+    classify_counterfactual_removals() instead of testing the
+    return value for None.
+    """
+
+    final_state = _counterfactual_state(
+        ops_applied,
+        containers,
+        remove_index,
+    )
+
+    if final_state is None:
+        return None
+
     return query.read(
         final_state
     )
+
+
+# ============================================================
+# Counterfactual removal classification
+# ============================================================
+
+@dataclass(frozen=True)
+class RemovalClassification:
+    """
+    Every candidate removal, split into the three causal classes of
+    SPEC §4 plus the excluded-setup bucket.
+
+    ``answer_changing`` and ``answer_preserving`` hold *all* classified
+    candidates in ascending ``remove_step`` order, not the selected subset.
+    """
+
+    original_answer: Any
+    answer_changing: Tuple[Dict[str, Any], ...]
+    answer_preserving: Tuple[Dict[str, Any], ...]
+    invalid_indices: Tuple[int, ...]
+    excluded_setup_indices: Tuple[int, ...]
+    candidates: int
+
+    @property
+    def classified(self) -> int:
+        return (
+            len(self.answer_changing)
+            + len(self.answer_preserving)
+            + len(self.invalid_indices)
+            + len(self.excluded_setup_indices)
+        )
+
+
+def classify_counterfactual_removals(
+    ops_applied: Sequence[Operation],
+    containers: Set[str],
+    query: Query,
+    include_setup: bool = False,
+) -> RemovalClassification:
+    """
+    Classify EVERY possible single-operation removal of
+    ``ops_applied``.
+
+    Every index of ``ops_applied`` lands in exactly one bucket:
+
+        valid_answer_changing
+            Replay stays valid and the final answer differs.
+
+        valid_answer_preserving
+            Replay stays valid and the final answer is unchanged.
+
+        invalid_replay
+            Some later operation becomes invalid once the
+            removed operation is gone.
+
+        excluded_setup
+            A setup Put, skipped before evaluation because
+            include_setup is False.
+
+    ``invalid_replay`` and ``excluded_setup`` are counted rather than
+    silently discarded, so a dataset audit can see how much of the causal
+    surface was untestable.
+
+    Deterministic: no randomness is consumed here, so the classification is
+    a pure function of (ops_applied, containers, query, include_setup).
+    """
+
+    if not ops_applied:
+
+        return RemovalClassification(
+            original_answer=None,
+            answer_changing=(),
+            answer_preserving=(),
+            invalid_indices=(),
+            excluded_setup_indices=(),
+            candidates=0,
+        )
+
+    # --------------------------------------------------------
+    # Original final answer, from the one canonical replay.
+    # --------------------------------------------------------
+
+    _, original_state, _ = replay_trace(
+        ops_applied,
+        containers,
+    )
+
+    original_answer = query.read(
+        original_state
+    )
+
+    answer_changing: List[Dict[str, Any]] = []
+    answer_preserving: List[Dict[str, Any]] = []
+    invalid_indices: List[int] = []
+    excluded_setup_indices: List[int] = []
+
+    for idx, op in enumerate(ops_applied):
+
+        # --------------------------------------------------------
+        # Removing a setup Put is a different intervention from
+        # removing an update (SPEC §2). Counted, never dropped
+        # without a record.
+        # --------------------------------------------------------
+
+        if _is_setup_op(op) and not include_setup:
+
+            excluded_setup_indices.append(idx)
+            continue
+
+        final_state = _counterfactual_state(
+            ops_applied,
+            containers,
+            idx,
+        )
+
+        if final_state is None:
+
+            invalid_indices.append(idx)
+            continue
+
+        counterfactual_answer = query.read(
+            final_state
+        )
+
+        probe = {
+            "remove_step": idx,
+
+            "removed_operation": {
+                "type": type(op).__name__.upper(),
+            },
+
+            "original_answer": original_answer,
+
+            "counterfactual_answer": counterfactual_answer,
+
+            "answer_changed": (
+                counterfactual_answer != original_answer
+            ),
+        }
+
+        if probe["answer_changed"]:
+
+            probe["probe_class"] = (
+                PROBE_VALID_ANSWER_CHANGING
+            )
+            answer_changing.append(probe)
+
+        else:
+
+            probe["probe_class"] = (
+                PROBE_VALID_ANSWER_PRESERVING
+            )
+            answer_preserving.append(probe)
+
+    return RemovalClassification(
+        original_answer=original_answer,
+        answer_changing=tuple(answer_changing),
+        answer_preserving=tuple(answer_preserving),
+        invalid_indices=tuple(invalid_indices),
+        excluded_setup_indices=tuple(excluded_setup_indices),
+        candidates=len(ops_applied),
+    )
+
+
+# ============================================================
+# Counterfactual probe accounting and result
+# ============================================================
+
+@dataclass(frozen=True)
+class ProbeAccounting:
+    """
+    Full accounting for one build_counterfactual_probes() call.
+
+    Every removal is accounted for, so
+    ``excluded_setup + invalid_replay + valid_answer_changing +
+    valid_answer_preserving == candidates`` holds by construction and is
+    asserted below.
+    """
+
+    candidates: int
+    excluded_setup: int
+    invalid_replay: int
+    valid_answer_changing: int
+    valid_answer_preserving: int
+    selected_answer_changing: int
+    selected_answer_preserving: int
+    requested_changing_fraction: float
+    invalid_indices: Tuple[int, ...]
+    excluded_setup_indices: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+
+        classified = (
+            self.excluded_setup
+            + self.invalid_replay
+            + self.valid_answer_changing
+            + self.valid_answer_preserving
+        )
+
+        if classified != self.candidates:
+            raise AssertionError(
+                "counterfactual accounting lost removals: "
+                f"{classified} classified != "
+                f"{self.candidates} candidates"
+            )
+
+        if (
+            self.selected_answer_changing
+            > self.valid_answer_changing
+        ):
+            raise AssertionError(
+                "selected more answer-changing probes than exist"
+            )
+
+        if (
+            self.selected_answer_preserving
+            > self.valid_answer_preserving
+        ):
+            raise AssertionError(
+                "selected more answer-preserving probes than exist"
+            )
+
+    @property
+    def selected(self) -> int:
+        return (
+            self.selected_answer_changing
+            + self.selected_answer_preserving
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        """
+        JSON-safe view, for manifests and dataset audits.
+        """
+
+        return {
+            "candidates": self.candidates,
+            "excluded_setup": self.excluded_setup,
+            "invalid_replay": self.invalid_replay,
+            "valid_answer_changing": self.valid_answer_changing,
+            "valid_answer_preserving": self.valid_answer_preserving,
+            "selected": self.selected,
+            "selected_answer_changing": self.selected_answer_changing,
+            "selected_answer_preserving": self.selected_answer_preserving,
+            "requested_changing_fraction": self.requested_changing_fraction,
+            "invalid_indices": list(self.invalid_indices),
+            "excluded_setup_indices": list(self.excluded_setup_indices),
+        }
+
+
+class CounterfactualProbeSet(
+    collections.abc.Sequence
+):
+    """
+    The selected probes plus the accounting for the removals that were not
+    selected.
+
+    Implements the Sequence protocol, so existing callers keep working
+    unchanged: ``len(result)``, ``for probe in result`` and
+    ``result[i]`` all behave exactly as they did when this function
+    returned a bare list. Use ``.probes`` / ``.as_list()`` for the payload
+    and ``.accounting`` for the counts.
+    """
+
+    __slots__ = (
+        "_probes",
+        "accounting",
+        "original_answer",
+    )
+
+    def __init__(
+        self,
+        probes: Sequence[Dict[str, Any]],
+        accounting: ProbeAccounting,
+        original_answer: Any,
+    ) -> None:
+
+        self._probes: Tuple[Dict[str, Any], ...] = tuple(
+            probes
+        )
+        self.accounting = accounting
+        self.original_answer = original_answer
+
+    def __len__(self) -> int:
+        return len(self._probes)
+
+    def __getitem__(
+        self,
+        index: Union[int, slice],
+    ) -> Union[
+        Dict[str, Any],
+        List[Dict[str, Any]],
+    ]:
+        """
+        Sequence protocol. A slice yields a plain list so a caller that only
+        wanted the payload never has to unwrap the result.
+        """
+
+        if isinstance(index, slice):
+            return list(self._probes[index])
+
+        return self._probes[index]
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        return iter(self._probes)
+
+    @property
+    def probes(self) -> Tuple[Dict[str, Any], ...]:
+        return self._probes
+
+    def as_list(self) -> List[Dict[str, Any]]:
+        return list(self._probes)
+
+    def realised_balance(self) -> Dict[str, Any]:
+        """
+        Requested vs realised split of the returned probes.
+
+        A degenerate requested split (one causal class empty) is reported
+        as a realised fraction of None rather than silently rounded.
+        """
+
+        total = len(self._probes)
+
+        return {
+            "selected": total,
+            "answer_changing": self.accounting.selected_answer_changing,
+            "answer_preserving": self.accounting.selected_answer_preserving,
+            "requested_changing_fraction": self.accounting.requested_changing_fraction,
+            "realised_changing_fraction": (
+                self.accounting.selected_answer_changing / total
+                if total
+                else None
+            ),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"CounterfactualProbeSet("
+            f"probes={len(self._probes)}, "
+            f"invalid_replay={self.accounting.invalid_replay}, "
+            f"excluded_setup={self.accounting.excluded_setup})"
+        )
 
 
 # ============================================================
@@ -285,7 +682,9 @@ def build_counterfactual_probes(
     containers: Set[str],
     query: Query,
     max_probes: int = 2,
-) -> List[Dict[str, Any]]:
+    balance: float = 0.5,
+    include_setup: bool = False,
+) -> CounterfactualProbeSet:
     """
     Construct causally labelled counterfactual probes.
 
@@ -307,159 +706,77 @@ def build_counterfactual_probes(
 
     Selection policy:
 
-        1. Prefer one sensitive probe.
-        2. Prefer one insensitive probe.
-        3. Fill remaining slots from either category.
+        ``balance`` is the requested fraction of the returned probes that
+        must be answer-changing. It is honoured exactly when both causal
+        classes have enough candidates; the shortfall from the exhausted
+        class is filled from the other, so the realised split is reported
+        by ``result.realised_balance()`` instead of being implied.
 
-    This produces a much more useful causal-sensitivity
-    signal than randomly selecting arbitrary removals.
+    ``include_setup`` excludes setup Put removals by default (SPEC §2 keeps
+    initial placements out of $U$). Those removals are counted as
+    ``excluded_setup`` in the accounting, and so are removals that make the
+    replay invalid, so no candidate is ever dropped without a record.
+
+    Determinism: every draw goes through ``rng``; each candidate pool is
+    shuffled once and then drawn from the END of the shuffled list, which is
+    the draw order the previous implementation used, so a given seed keeps
+    reproducing the same probes.
     """
 
-    if max_probes <= 0:
-        return []
+    if not 0.0 <= balance <= 1.0:
+        raise ValueError(
+            f"balance={balance} outside [0.0, 1.0]"
+        )
 
-    if not ops_applied:
-        return []
-
-    # --------------------------------------------------------
-    # Original final answer
-    # --------------------------------------------------------
-
-    _, original_state, _ = replay_trace(
+    classification = classify_counterfactual_removals(
         ops_applied,
         containers,
+        query,
+        include_setup=include_setup,
     )
 
-    original_answer = query.read(
-        original_state
-    )
-
     # --------------------------------------------------------
-    # Evaluate every possible removal.
+    # Selection pool, ordered so that the fill phase has a
+    # deterministic starting order.
     # --------------------------------------------------------
 
-    candidates: List[
-        Dict[str, Any]
-    ] = []
+    changing = list(classification.answer_changing)
+    preserving = list(classification.answer_preserving)
 
-    for idx in range(
-        len(ops_applied)
-    ):
+    selected: List[Dict[str, Any]] = []
 
-        counterfactual_answer = (
-            counterfactual_gold(
-                ops_applied,
-                containers,
-                idx,
-                query,
-            )
+    # --------------------------------------------------------
+    # 1. Balanced take: shuffle each class once, then draw from
+    #    the END of the shuffled list.
+    # --------------------------------------------------------
+
+    if max_probes > 0:
+
+        rng.shuffle(changing)
+        rng.shuffle(preserving)
+
+        target_changing = min(
+            max_probes,
+            max(0, int(max_probes * balance + 0.5)),
         )
+        target_preserving = max_probes - target_changing
 
-        # The intervention produced an invalid trajectory.
-        if counterfactual_answer is None:
-            continue
+        for _ in range(min(target_changing, len(changing))):
+            selected.append(changing.pop())
 
-        answer_changed = (
-            counterfactual_answer
-            != original_answer
-        )
+        for _ in range(min(target_preserving, len(preserving))):
+            selected.append(preserving.pop())
 
-        candidates.append(
-            {
-                "remove_step": idx,
+        # --------------------------------------------------------
+        # 2. Fill from whichever class still has candidates.
+        # --------------------------------------------------------
 
-                "removed_operation": {
-                    "type": type(
-                        ops_applied[idx]
-                    ).__name__.upper(),
-                },
+        remaining = changing + preserving
 
-                "original_answer": (
-                    original_answer
-                ),
+        rng.shuffle(remaining)
 
-                "counterfactual_answer": (
-                    counterfactual_answer
-                ),
-
-                "answer_changed": (
-                    answer_changed
-                ),
-            }
-        )
-
-    # --------------------------------------------------------
-    # Separate causal categories.
-    # --------------------------------------------------------
-
-    sensitive = [
-        probe
-        for probe in candidates
-        if probe["answer_changed"]
-    ]
-
-    insensitive = [
-        probe
-        for probe in candidates
-        if not probe["answer_changed"]
-    ]
-
-    rng.shuffle(
-        sensitive
-    )
-
-    rng.shuffle(
-        insensitive
-    )
-
-    selected: List[
-        Dict[str, Any]
-    ] = []
-
-    # --------------------------------------------------------
-    # 1. Prefer causally sensitive probe.
-    # --------------------------------------------------------
-
-    if sensitive:
-
-        selected.append(
-            sensitive.pop()
-        )
-
-    # --------------------------------------------------------
-    # 2. Prefer causally insensitive probe.
-    # --------------------------------------------------------
-
-    if (
-        insensitive
-        and len(selected) < max_probes
-    ):
-
-        selected.append(
-            insensitive.pop()
-        )
-
-    # --------------------------------------------------------
-    # 3. Fill remaining slots.
-    # --------------------------------------------------------
-
-    remaining = (
-        sensitive
-        + insensitive
-    )
-
-    rng.shuffle(
-        remaining
-    )
-
-    for probe in remaining:
-
-        if len(selected) >= max_probes:
-            break
-
-        selected.append(
-            probe
-        )
+        while remaining and len(selected) < max_probes:
+            selected.append(remaining.pop())
 
     # --------------------------------------------------------
     # Sort by trajectory position for reproducible,
@@ -467,41 +784,125 @@ def build_counterfactual_probes(
     # --------------------------------------------------------
 
     selected.sort(
-        key=lambda probe:
-            probe["remove_step"]
+        key=lambda probe: probe["remove_step"]
     )
 
-    return selected
+    selected_changing = sum(
+        probe["answer_changed"]
+        for probe in selected
+    )
+
+    accounting = ProbeAccounting(
+        candidates=classification.candidates,
+        excluded_setup=len(
+            classification.excluded_setup_indices
+        ),
+        invalid_replay=len(classification.invalid_indices),
+        valid_answer_changing=len(classification.answer_changing),
+        valid_answer_preserving=len(classification.answer_preserving),
+        selected_answer_changing=selected_changing,
+        selected_answer_preserving=len(selected) - selected_changing,
+        requested_changing_fraction=balance,
+        invalid_indices=classification.invalid_indices,
+        excluded_setup_indices=(
+            classification.excluded_setup_indices
+        ),
+    )
+
+    return CounterfactualProbeSet(
+        selected,
+        accounting,
+        classification.original_answer,
+    )
 
 
 # ============================================================
 # Redo-validity probe
 # ============================================================
 
-def build_redo_validity_example(
+REDO_CLASS_VALID = "valid"
+REDO_CLASS_INVALID = "invalid"
+REDO_CLASSES: Tuple[str, ...] = (
+    REDO_CLASS_VALID,
+    REDO_CLASS_INVALID,
+)
+
+
+@dataclass(frozen=True)
+class RedoValidityExample:
+    """
+    One redo-validity condition plus its ground-truth label.
+
+    ``would_be_valid`` is read from ``world.can_redo(history)`` after the
+    trajectory is built, never assumed from the requested class.
+    """
+
+    ops: Tuple[Operation, ...]
+    state: WorldState
+    history: History
+    containers: Set[str]
+    meta: Dict[str, Any]
+
+    @property
+    def would_be_valid(self) -> bool:
+        return bool(
+            self.meta["would_be_valid"]
+        )
+
+    @property
+    def redo_class(self) -> str:
+        return str(
+            self.meta["redo_class"]
+        )
+
+    def as_tuple(
+        self,
+    ) -> Tuple[
+        List[Operation],
+        WorldState,
+        History,
+        Set[str],
+        Dict[str, Any],
+    ]:
+        """
+        The legacy 5-tuple shape consumed by pipeline.py and analysis/audits/04.
+        """
+
+        return (
+            list(self.ops),
+            self.state,
+            self.history,
+            self.containers,
+            dict(self.meta),
+        )
+
+
+def _build_redo_validity_example(
     rng: random.Random,
     entity_count: int,
     update_count: int,
     operations_enabled: Sequence[type],
-    num_containers: Optional[int] = None,
-) -> Tuple[
-    List[Operation],
-    WorldState,
-    History,
-    Set[str],
-    Dict[str, Any],
-]:
+    num_containers: Optional[int],
+    redo_class: str,
+) -> RedoValidityExample:
     """
-    Construct a trajectory ending in:
+    Shared builder for both redo-validity classes.
 
-        ... -> operation -> Undo -> new operation
+    Both classes share the identical prefix -- base sequence, one setup
+    operation, then Undo -- and differ only in what happens after the Undo:
 
-    The new operation invalidates the redo history.
+        redo_class == "valid"
+            Stop. ``world.can_redo`` is True because the Undo pushed onto
+            the redo stack and nothing has cleared it.
 
-    The Redo itself is NOT applied.
+        redo_class == "invalid"
+            Apply one further operation, which clears the redo stack
+            (world.operations.apply_op), so ``world.can_redo`` is False.
 
-    The benchmark instead asks whether the undone operation
-    could be redone at the current point in history.
+    Sharing the prefix keeps the two classes comparable: the only difference
+    between a valid and an invalid example is the presence of the clearing
+    operation, and the base length ``update_count - 3`` is therefore the
+    same for both so the RNG stream stays aligned.
     """
 
     base_update_count = max(
@@ -570,56 +971,224 @@ def build_redo_validity_example(
     )
 
     # --------------------------------------------------------
-    # Apply a new operation.
-    #
-    # This invalidates the redo stack.
+    # "valid" stops here: the redo stack is still populated, so
+    # this path never needs a second constructed operation and
+    # therefore cannot hit the clearing-operation failure.
     # --------------------------------------------------------
 
-    new_action = (
-        _construct_move(
-            rng,
+    if redo_class == REDO_CLASS_INVALID:
+
+        # --------------------------------------------------------
+        # Apply a new operation.
+        #
+        # This invalidates the redo stack.
+        # --------------------------------------------------------
+
+        new_action = (
+            _construct_move(
+                rng,
+                state,
+            )
+            or _construct_swap(
+                rng,
+                state,
+            )
+        )
+
+        if new_action is None:
+            raise RuntimeError(
+                "could not construct an invalidating operation "
+                "for redo-validity probe"
+            )
+
+        state = apply_op(
+            new_action,
             state,
-        )
-        or _construct_swap(
-            rng,
-            state,
-        )
-    )
-
-    if new_action is None:
-        raise RuntimeError(
-            "could not construct an invalidating operation "
-            "for redo-validity probe"
+            history,
         )
 
-    state = apply_op(
-        new_action,
-        state,
-        history,
-    )
-
-    ops.append(
-        new_action
-    )
+        ops.append(
+            new_action
+        )
 
     # --------------------------------------------------------
-    # Evaluate redo validity.
+    # Ground-truth label from History, not from the request.
     # --------------------------------------------------------
-
-    from world import can_redo
 
     would_be_valid = can_redo(
         history
     )
 
-    return (
-        ops,
-        state,
-        history,
-        containers,
-        {
-            "would_be_valid": (
-                would_be_valid
-            ),
+    requested = redo_class == REDO_CLASS_VALID
+
+    if would_be_valid != requested:
+        raise AssertionError(
+            f"redo-validity probe built with redo_class="
+            f"{redo_class!r} but world.can_redo(history)="
+            f"{would_be_valid}; the two classes are not "
+            "distinguishable in this trajectory"
+        )
+
+    return RedoValidityExample(
+        ops=tuple(ops),
+        state=state,
+        history=history,
+        containers=containers,
+        meta={
+            "would_be_valid": would_be_valid,
+            "redo_class": redo_class,
         },
     )
+
+
+def build_redo_validity_example(
+    rng: random.Random,
+    entity_count: int,
+    update_count: int,
+    operations_enabled: Sequence[type],
+    num_containers: Optional[int] = None,
+    redo_class: str = REDO_CLASS_INVALID,
+) -> Tuple[
+    List[Operation],
+    WorldState,
+    History,
+    Set[str],
+    Dict[str, Any],
+]:
+    """
+    Construct a trajectory whose final operation decides redo
+    availability.
+
+    ``redo_class`` selects the class explicitly and is never inferred
+    from the RNG:
+
+        "valid"
+            ... -> operation -> Undo
+            The redo stack still holds the undone state, so
+            ``meta["would_be_valid"]`` is True.
+
+        "invalid" (default)
+            ... -> operation -> Undo -> new operation
+            The new operation clears the redo stack, so
+            ``meta["would_be_valid"]`` is False.
+
+    The default keeps the historical behaviour of this function, which only
+    ever produced the invalid class.
+
+    The Redo itself is NOT applied in either class. The benchmark instead
+    asks whether the undone operation could be redone at the current point
+    in history.
+
+    Returns the legacy 5-tuple; use build_redo_validity_examples() for the
+    typed RedoValidityExample plus a balanced label split.
+    """
+
+    if redo_class not in REDO_CLASSES:
+        raise ValueError(
+            f"redo_class={redo_class!r} not in {REDO_CLASSES!r}"
+        )
+
+    return _build_redo_validity_example(
+        rng,
+        entity_count,
+        update_count,
+        operations_enabled,
+        num_containers,
+        redo_class,
+    ).as_tuple()
+
+
+def build_redo_validity_examples(
+    rng: random.Random,
+    entity_count: int,
+    update_count: int,
+    operations_enabled: Sequence[type],
+    num_containers: Optional[int] = None,
+    n_per_class: int = 1,
+    tolerance: float = 0.0,
+) -> Tuple[
+    List[RedoValidityExample],
+    Dict[str, Any],
+]:
+    """
+    Build a label-balanced batch of redo-validity conditions.
+
+    Produces ``n_per_class`` valid and ``n_per_class`` invalid examples, in
+    that fixed class order, so the batch is balanced by construction rather
+    than by rejection sampling.
+
+    ``tolerance`` is the largest realised deviation from a 50/50 label split
+    that the returned batch is allowed to have; exceeding it raises rather
+    than shipping an unbalanced condition. Because the class order and the
+    per-class count are fixed, the realised deviation of a successfully
+    built batch is 0 and this is a consistency gate rather than a knob.
+
+    Returns (examples, balance) where balance is JSON-safe:
+    {"n_valid", "n_invalid", "n_total", "requested_valid_fraction",
+    "realised_valid_fraction", "max_tolerance"}.
+
+    Determinism: all randomness flows through ``rng``.
+    """
+
+    if n_per_class < 1:
+        raise ValueError(
+            f"n_per_class={n_per_class} must be >= 1"
+        )
+
+    if not 0.0 <= tolerance <= 0.5:
+        raise ValueError(
+            f"tolerance={tolerance} outside [0.0, 0.5]"
+        )
+
+    examples: List[RedoValidityExample] = []
+
+    for redo_class in REDO_CLASSES:
+
+        for _ in range(n_per_class):
+
+            examples.append(
+                _build_redo_validity_example(
+                    rng,
+                    entity_count,
+                    update_count,
+                    operations_enabled,
+                    num_containers,
+                    redo_class,
+                )
+            )
+
+    n_valid = sum(
+        example.would_be_valid
+        for example in examples
+    )
+    n_invalid = len(examples) - n_valid
+    n_total = len(examples)
+
+    realised_valid_fraction = (
+        n_valid / n_total if n_total else 0.0
+    )
+    requested_valid_fraction = 0.5
+
+    deviation = abs(
+        realised_valid_fraction - requested_valid_fraction
+    )
+
+    if deviation > tolerance:
+        raise AssertionError(
+            "redo-validity batch is not label-balanced: "
+            f"realised={realised_valid_fraction:.3f} "
+            f"requested={requested_valid_fraction:.3f} "
+            f"deviation={deviation:.3f} > "
+            f"tolerance={tolerance:.3f}"
+        )
+
+    balance = {
+        "n_valid": n_valid,
+        "n_invalid": n_invalid,
+        "n_total": n_total,
+        "requested_valid_fraction": requested_valid_fraction,
+        "realised_valid_fraction": realised_valid_fraction,
+        "max_tolerance": tolerance,
+    }
+
+    return examples, balance

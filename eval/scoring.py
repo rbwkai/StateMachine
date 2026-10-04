@@ -36,9 +36,17 @@ def _is_placeholder(segment: str) -> bool:
     cleaned = segment.strip()
     if not cleaned:
         return True
+    # Match placeholder patterns like <answer>, <container>, < answer >, etc.
     if re.fullmatch(r"<\s*(?:answer|container)\s*>", cleaned, re.IGNORECASE):
         return True
+    # Match bare placeholder words
     if cleaned.lower() in {"<answer>", "<container>", "answer", "container"}:
+        return True
+    # Match "Answer:" or "Container:" prefix (with or without colon)
+    if re.match(r"^(?:answer|container):?$", cleaned, re.IGNORECASE):
+        return True
+    # Match markdown bold placeholders
+    if re.fullmatch(r"\*\*(?:answer|container)\*\*", cleaned, re.IGNORECASE):
         return True
     return False
 
@@ -125,6 +133,7 @@ def extract_instance_answer(
     gold_answer: Optional[str] = None,
     instance: Optional[Dict[str, Any]] = None,
     object_types: Optional[Sequence[str]] = None,
+    first_final_answer: bool = True,
 ) -> AnswerExtraction:
     """
     Extract one unique candidate from final answer line or fallback segments.
@@ -140,8 +149,10 @@ def extract_instance_answer(
     has_step = bool(re.search(r"(?:^|\n)\s*step\s*\d+\s*[:.)-]", raw_response, re.IGNORECASE))
 
     if has_final_answer:
-        last_match = final_matches[-1]
-        final_segment = last_match.group(1).strip()
+        # The single scoring contract uses the first marker. Later markers may
+        # be echoed or generated continuation text.
+        final_match = final_matches[0]
+        final_segment = final_match.group(1).strip()
         protocol_compliant = not chain_of_thought or has_step
 
         if _is_placeholder(final_segment):
@@ -209,42 +220,20 @@ def candidate_answers(
     candidate_answers(instance) = unique normalized(
         step_wise_gold_answers ∪ gold_answer ∪ final_state container display names if present
     )
+    
+    NOTE: Does NOT fall back to other instances' gold answers to avoid leakage.
     """
-    global _WARNED_RQ2_CANDIDATES
-
     raw_candidates: List[str] = []
 
     step_wise = instance.get("step_wise_gold_answers")
     if step_wise:
         raw_candidates.extend(str(s) for s in step_wise if s)
-    else:
-        if not _WARNED_RQ2_CANDIDATES:
-            logger.warning(
-                "Instance missing step_wise_gold_answers; building candidates from "
-                "gold_answers sharing the same family+T."
-            )
-            _WARNED_RQ2_CANDIDATES = True
-
-        fam = instance.get("family")
-        factors = instance.get("requested_factors", {})
-        t_val = factors.get("T")
-        if t_val is None:
-            t_val = instance.get("measured_factors", {}).get("T_actual")
-
-        if dataset_context and fam is not None and t_val is not None:
-            for rec in dataset_context:
-                rec_fam = rec.get("family")
-                rec_req = rec.get("requested_factors", {})
-                rec_t = rec_req.get("T")
-                if rec_t is None:
-                    rec_t = rec.get("measured_factors", {}).get("T_actual")
-                if rec_fam == fam and rec_t == t_val:
-                    ga = rec.get("gold_answer")
-                    if ga:
-                        raw_candidates.append(str(ga))
+    # NOTE: We do NOT fall back to other instances' gold answers to avoid cross-instance leakage.
+    # If step_wise_gold_answers is missing, we only use the instance's own gold_answer
+    # and final_state container names.
 
     ga = instance.get("gold_answer")
-    if ga:
+    if ga is not None:
         raw_candidates.append(str(ga))
 
     final_state = instance.get("final_state", {})
@@ -252,8 +241,6 @@ def candidate_answers(
         container_names = final_state.get("container_names") or final_state.get("container_display_names")
         if container_names:
             if isinstance(container_names, dict):
-                raw_candidates.extend(str(v) for v in container_names.values() if v)
-            elif isinstance(container_names, (list, tuple)):
                 raw_candidates.extend(str(v) for v in container_names if v)
 
     unique: Dict[str, str] = {}
@@ -320,6 +307,7 @@ def score_prediction(
         chain_of_thought=chain_of_thought,
         gold_answer=gold_answer,
         instance=instance,
+        first_final_answer=True,
     )
 
     result = dict(prediction)
@@ -341,3 +329,30 @@ def score_prediction(
         ),
     })
     return result
+
+
+def extract_answer(
+    raw_response: str,
+    candidate_containers: Optional[Sequence[str]] = None,
+) -> str:
+    """Lenient final-answer extraction for boolean and legacy analysis paths.
+
+    Lives here, not in ``eval/eval_harness.py``, because AGENTS.md §5 makes this
+    module the single owner of scoring and extraction. It differs from
+    :func:`extract_instance_answer` in contract, not by accident: it accepts a
+    bare ``Answer:`` prefix and coerces boolean answers to the candidate set
+    ``{"True", "False"}``. Protocol-strict extraction stays in
+    :func:`extract_instance_answer`.
+    """
+    cands = list(candidate_containers) if candidate_containers else []
+    ans_match = re.search(
+        r"(?:final\s+)?answer\s*:\s*(.+?)(?:\n|$)", raw_response, re.IGNORECASE
+    )
+    if not cands and ans_match:
+        seg = ans_match.group(1).strip().lower()
+        if seg in {"true", "false"}:
+            cands = ["True", "False"]
+    extraction = extract_instance_answer(raw_response, candidates=cands)
+    if extraction.answer and (extraction.has_final_answer or ans_match):
+        return extraction.answer
+    return ""

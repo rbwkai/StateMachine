@@ -143,13 +143,17 @@ print("revision (T∈{4,6,8,12} × 5 seeds, V≥1): PASS")
 # ============================================================
 # 5. split_chain — E=2 (target + child)
 # ============================================================
+# Note: split_chain requires T>=3 for causal validity (1 pre-split Move,
+# 1 Split, at least 1 post-split Move). T=2 is invalid as it allows
+# no post-split Move, making the Split causally vacuous.
+# See generator/trajectory_validation.py:442
 
 print()
 print("=" * 70)
 print("5. split_chain measured factors")
 print("=" * 70)
 
-for T in [2, 4, 6, 8]:
+for T in [3, 4, 6, 8]:
     for seed in range(5):
         t, m = build_and_measure("split_chain", 2, T, 0, seed=seed)
         assert m.E_actual == 2, f"split T={T} s={seed}: E_actual={m.E_actual}"
@@ -159,7 +163,7 @@ for T in [2, 4, 6, 8]:
         assert m.T_actual + m.D_actual == T, \
             f"split T={T} s={seed}: T_actual+D_actual={m.T_actual+m.D_actual} != {T}"
 
-print("split_chain (T∈{2,4,6,8} × 5 seeds): PASS")
+print("split_chain (T∈{3,4,6,8} × 5 seeds): PASS")
 
 
 # ============================================================
@@ -230,7 +234,8 @@ print("=" * 70)
 print("9. undo_redo_chain measured factors")
 print("=" * 70)
 
-for T in [3, 5, 8]:
+# undo_redo_chain requires exactly 4 target_updates (move1 + move2 + undo + redo)
+for T in [4]:
     for seed in range(5):
         t, m = build_and_measure("undo_redo_chain", 1, T, 0, seed=seed)
         assert m.E_actual == 1, f"undo_redo T={T} s={seed}: E_actual={m.E_actual}"
@@ -238,16 +243,16 @@ for T in [3, 5, 8]:
         assert m.T_actual == T, \
             f"undo_redo T={T} s={seed}: T_actual={m.T_actual} != {T}"
 
-print("undo_redo_chain (T∈{3,5,8} × 5 seeds): PASS")
+print("undo_redo_chain (T=4 × 5 seeds): PASS")
 
 
 # ============================================================
-# 10. measure_factors with L_actual
+# 10. measure_factors with L_word
 # ============================================================
 
 print()
 print("=" * 70)
-print("10. L_actual word-count computation")
+print("10. L_word word-count computation")
 print("=" * 70)
 
 sentences = [
@@ -266,10 +271,10 @@ state = _move(state, history, ops, "o0", "c0")
 
 m = mf_fn(ops, containers, "o0", sentences=sentences)
 expected_words = sum(len(s.split()) for s in sentences)
-assert m.L_actual == expected_words, \
-    f"L_actual={m.L_actual} != {expected_words}"
+assert m.L_word == expected_words, \
+    f"L_word={m.L_word} != {expected_words}"
 
-print(f"L_actual word count (expected {expected_words}): PASS")
+print(f"L_word word count (expected {expected_words}): PASS")
 
 
 # ============================================================
@@ -374,6 +379,6 @@ print("merge_chain E measurement .............. PASS")
 print("swap_chain T≥1 measurement ............. PASS")
 print("undo_chain T measurement ............... PASS")
 print("undo_redo_chain T measurement .......... PASS")
-print("L_actual word-count computation ........ PASS")
+print("L_word word-count computation ........ PASS")
 print("verify_factors mismatch detection ....... PASS")
 print("measured_factors in ConstructedTrajectory PASS")

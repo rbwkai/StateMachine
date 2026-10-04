@@ -53,6 +53,7 @@ from eval.scoring import (
     normalize_text,
 )
 from eval.models import CORE_MODELS, OPTIONAL_MODELS, ModelConfig
+from generator.constants import SCORING_VERSION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -214,9 +215,7 @@ def run_evaluation(
         batch_responses = engine.generate_batch(
             batch_prompts,
             max_new_tokens=effective_max_tokens,
-            temperature=model_config.temperature,
-            top_p=model_config.top_p,
-            do_sample=model_config.do_sample,
+            enforce_greedy=True,  # Always use greedy decoding for evaluation
         )
         raw_predictions.extend(batch_responses)
         generation_metadata = getattr(engine, "last_generation_metadata", [])
@@ -281,6 +280,11 @@ def run_evaluation(
             "instance_id": iid,
             "family": family,
             "experiment": exp,
+            # Provenance: without these, analysis/evaluate_existing_predictions.py
+            # cannot tell whether a saved prediction belongs to this trace or was
+            # scored by the same rules, and would silently re-score mismatched data.
+            "trace_hash": rec.get("trace_hash"),
+            "scoring_version": SCORING_VERSION,
             "requested_factors": rec.get("requested_factors", {}),
             "measured_factors": rec.get("measured_factors", {}),
             "question": rec.get("question"),
@@ -304,6 +308,7 @@ def run_evaluation(
                 sum(step_correct) / len(step_correct) if step_correct else None
             ),
             "generated_tokens": generation_info.get("generated_tokens"),
+            "prompt_tokens": generation_info.get("prompt_tokens"),
             "finish_reason": generation_info.get("finish_reason"),
             "has_final_answer": extraction.has_final_answer,
             "predicted_answer": extracted,
@@ -432,6 +437,7 @@ def write_audit_csv(rows: List[Dict[str, Any]], path: Path) -> None:
         "gold_container", "raw_prediction", "extracted_answer", "is_correct",
         "is_correct_semantic", "semantic_correct", "strict_correct",
         "extraction_method", "protocol_compliant", "prompt_version",
+        "trace_hash", "scoring_version",
         "step_accuracy", "step_first_error", "requested_factors", "measured_factors",
         "gold_step_answers", "predicted_step_answers", "step_correct", "prompt",
         "generated_tokens", "finish_reason", "has_final_answer", "predicted_answer",

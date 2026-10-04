@@ -7,20 +7,45 @@ from .dataset_spec import (
     family_capability_group,
 )
 
+from .constants import (
+    CURVE_MODELS,
+    DECODING,
+    FAILURE_THRESHOLD_TAU,
+    GENERATOR_VERSION,
+    L_MAX_WORDS,
+    NUM_CONTAINERS_DEFAULT,
+    NUM_CONTAINERS_MIN,
+    PROMPT_VERSIONS,
+    RENDERER_VERSION,
+    SCORING_VERSION,
+    SPEC_VERSION,
+)
+
 from .metadata import (
     MeasuredFactors,
+    TargetEffect,
+    classify_op,
     measure_factors,
     verify_factors,
+    verify_length,
+    get_t_d_classification_table,
+    validate_t_d_classification_complete,
 )
 
 from .probes import (
     CountQuery,
+    CounterfactualProbeSet,
     LocationQuery,
+    ProbeAccounting,
     Query,
+    RedoValidityExample,
     RedoValidityQuery,
+    RemovalClassification,
     build_counterfactual_probes,
     build_redo_validity_example,
+    build_redo_validity_examples,
     candidate_queries,
+    classify_counterfactual_removals,
     counterfactual_gold,
     select_query,
     step_wise_gold,
@@ -43,8 +68,37 @@ from .trajectories import (
     validate_trajectory,
 )
 
+from .instance import (
+    DEFAULT_MAX_ATTEMPTS,
+    INSTANCE_RECORD_KEYS,
+    InstanceGateFailure,
+    InstanceResult,
+    attempt_seed,
+    build_validated_instance,
+    generate_instance_with_retry,
+    reset_deduplication_registry,
+)
+
 
 __all__ = [
+    "CounterfactualProbeSet",
+    "ProbeAccounting",
+    "RedoValidityExample",
+    "RemovalClassification",
+    "build_redo_validity_examples",
+    "classify_counterfactual_removals",
+    # Constants (single owner of thresholds and version stamps)
+    "CURVE_MODELS",
+    "DECODING",
+    "FAILURE_THRESHOLD_TAU",
+    "GENERATOR_VERSION",
+    "L_MAX_WORDS",
+    "NUM_CONTAINERS_DEFAULT",
+    "NUM_CONTAINERS_MIN",
+    "PROMPT_VERSIONS",
+    "RENDERER_VERSION",
+    "SCORING_VERSION",
+    "SPEC_VERSION",
     # Dataset spec
     "CapabilityGroup",
     "Condition",
@@ -52,10 +106,15 @@ __all__ = [
     "GenerationStatus",
     "STRUCTURAL_FAMILIES",
     "family_capability_group",
-    # Metadata
+    # Metadata — the single factor authority
     "MeasuredFactors",
+    "TargetEffect",
+    "classify_op",
     "measure_factors",
     "verify_factors",
+    "verify_length",
+    "get_t_d_classification_table",
+    "validate_t_d_classification_complete",
     # Queries / probes
     "CountQuery",
     "LocationQuery",
@@ -82,4 +141,15 @@ __all__ = [
     "build_undo_chain",
     "build_undo_redo_chain",
     "validate_trajectory",
+    # Instance construction — the single request -> validated record path
+    "DEFAULT_MAX_ATTEMPTS",
+    "INSTANCE_RECORD_KEYS",
+    "InstanceGateFailure",
+    "InstanceResult",
+    "attempt_seed",
+    "build_validated_instance",
+    "generate_instance_with_retry",
+    "reset_deduplication_registry",
 ]
+
+from .structural import validate_structural_causality  # noqa: F401

@@ -15,6 +15,7 @@ Invariants:
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import random
 import sys
 from typing import List
@@ -24,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from experiments._common import generate_instance
+from generator import reset_deduplication_registry
 from generator.dataset_spec import CapabilityGroup, family_capability_group
 from generator.trajectories import available_families, build_trajectory
 from generator.trajectory_specs import TrajectorySpec
@@ -128,6 +131,9 @@ def verify_batch(seeds_per_family: int = 25) -> None:
             # INVARIANT 7: Determinism & Diversity
             # 7a. Same seed -> same record
             seed_test = int(hashlib.sha1(f"test|{family}|{seed}".encode("utf-8")).hexdigest()[:8], 16)
+
+            # Reset deduplication registry for determinism check
+            reset_deduplication_registry()
             rec1 = generate_instance(
                 seed=seed_test,
                 instance_id="test1",
@@ -139,6 +145,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 experiment_tag="test_exp",
                 condition_id=f"cond_{family}",
             )
+            reset_deduplication_registry()
             rec2 = generate_instance(
                 seed=seed_test,
                 instance_id="test2",

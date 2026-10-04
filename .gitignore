@@ -56,3 +56,15 @@ Thumbs.db
 
 /statemachine
 /.venv~
+
+paper
+
+# Generated datasets and run outputs. AGENTS.md 10: never commit data under
+# data/. Datasets are reproducible from generate_all.py plus a recorded seed.
+/data/
+/results/
+.opencode
+AGENTS.md
+SPEC.md
+requirements.md
+IMPLEMENTATION_PLAN.md

@@ -2,18 +2,18 @@
 generate_all.py
 ===============
 Master script to generate the complete DWS-Bench benchmark dataset suite:
-    - RQ1: Temporal Depth Sweep (300 instances)
-    - RQ2: Revision Complexity Sweep (200 instances)
-    - RQ3: Distractor / Interference Sweep (200 instances)
-    - RQ4: Entity Load Sweep (200 instances)
-    - RQ5: Structural Operation Pilot (250 instances)
-    - Full Aggregated Benchmark: data/full_benchmark.jsonl (1,150 instances)
+
+    - RQ1: Sequential Dependency & Mutation Structure (~1,500 instances)
+    - RQ2: Interference Decomposition & Supersession (~700 instances)
+    - Full Aggregated Benchmark: data/full_benchmark.jsonl
+
+RQ3 (Model Scale & Reasoning Strategy) is an evaluation-only experiment;
+it consumes RQ1/RQ2 datasets and does not generate new data.
 
 Usage:
-  python3 generate_all.py --write     # Generate all datasets, verify invariants, and write files
+  python3 generate_all.py --write     # Generate all datasets, verify invariants, write files
   python3 generate_all.py --dry-run   # Run reachability probes across all experiments
 """
-
 from __future__ import annotations
 
 import argparse
@@ -28,11 +28,8 @@ from typing import Any, Dict, List, Tuple
 _REPO_ROOT = Path(__file__).resolve().parent
 
 EXPERIMENT_SCRIPTS = [
-    ("RQ1 Temporal Depth Sweep", _REPO_ROOT / "experiments" / "rq1_depth.py", _REPO_ROOT / "data" / "rq1_depth" / "rq1_depth.jsonl", 300),
-    ("RQ2 Revision Sweep", _REPO_ROOT / "experiments" / "rq2_revision.py", _REPO_ROOT / "data" / "rq2_revision" / "rq2_revision.jsonl", 200),
-    ("RQ3 Distractor Sweep", _REPO_ROOT / "experiments" / "rq3_distractor.py", _REPO_ROOT / "data" / "rq3_distractor" / "rq3_distractor.jsonl", 200),
-    ("RQ4 Entity Load Sweep", _REPO_ROOT / "experiments" / "rq4_entity_load.py", _REPO_ROOT / "data" / "rq4_entity_load" / "rq4_entity_load.jsonl", 200),
-    ("RQ5 Structural Pilot", _REPO_ROOT / "experiments" / "rq5_pilot.py", _REPO_ROOT / "data" / "rq5_pilot" / "rq5_pilot.jsonl", 250),
+    ("RQ1 Mutation & Depth", _REPO_ROOT / "experiments" / "rq1_mutation_depth.py", _REPO_ROOT / "data" / "rq1_mutation_depth" / "rq1_mutation_depth.jsonl", 1500),
+    ("RQ2 Interference & Supersession", _REPO_ROOT / "experiments" / "rq2_interference.py", _REPO_ROOT / "data" / "rq2_interference" / "rq2_interference.jsonl", 700),
 ]
 
 
@@ -150,20 +147,22 @@ def generate_all(instances_scale: float = 1.0) -> None:
 
     print("\nDistribution by Experiment Sweep:")
     for exp, count in Counter(r["experiment"] for r in combined_records).most_common():
-        print(f"  - {exp:20s}: {count:4d} instances")
+        print(f"  - {exp:25s}: {count:4d} instances")
 
     print("\nVerification Checklist:")
-    print(f"  [✓] RQ1 Depth Sweep:       {sum(1 for r in combined_records if r['experiment'] == 'rq1_depth')} / 300")
-    print(f"  [✓] RQ2 Revision Sweep:    {sum(1 for r in combined_records if r['experiment'] == 'rq2_revision')} / 200")
-    print(f"  [✓] RQ3 Distractor Sweep:  {sum(1 for r in combined_records if r['experiment'] in {'rq3_distractor', 'rq3_narrative_distractor'})} / 200")
-    print(f"  [✓] RQ4 Entity Load Sweep:  {sum(1 for r in combined_records if r['experiment'] == 'rq4_entity_load')} / 200")
-    print(f"  [✓] RQ5 Structural Pilot:  {sum(1 for r in combined_records if r['experiment'] == 'rq5_pilot')} / 250")
-    print(f"  [✓] Total Benchmark Suite: {len(combined_records)} / 1150")
+    print(f"  [✓] RQ1 Mutation & Depth:     {sum(1 for r in combined_records if r['experiment'] == 'rq1_mutation_depth')} instances")
+    print(f"  [✓] RQ2 Interference & Supers.: {sum(1 for r in combined_records if r['experiment'] in {'rq2_interference', 'rq2_supersession'})} instances")
+    print(f"  [✓] Total Benchmark Suite:    {len(combined_records)} instances")
+    print("=" * 75)
+
+    # Note about RQ3
+    print("\nNOTE: RQ3 (Model Scale & Reasoning Strategy) is evaluation-only.")
+    print("      Run with: python3 experiments/rq3_scale_reasoning.py --all-models --all-prompts")
     print("=" * 75)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate complete DWS-Bench benchmark dataset suite.")
+    parser = argparse.ArgumentParser(description="Generate complete DWS-Bench benchmark dataset suite (RQ1-RQ2).")
     parser.add_argument("--dry-run", action="store_true", help="Run reachability probes only")
     parser.add_argument("--write", action="store_true", help="Write generated dataset files to data/")
     args = parser.parse_args()
@@ -180,4 +179,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

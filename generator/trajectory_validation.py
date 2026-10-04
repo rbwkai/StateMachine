@@ -4,16 +4,9 @@ from typing import Sequence
 
 from world import Merge, Move, Operation, Put, Redo, Split, Swap, Undo
 
+from .dataset_spec import STRUCTURAL_FAMILIES
 from .trajectory_specs import TrajectorySpec
 
-
-_STRUCTURAL_FAMILIES: frozenset = frozenset({
-    "split_chain",
-    "merge_chain",
-    "swap_chain",
-    "undo_chain",
-    "undo_redo_chain",
-})
 
 
 def validate_trajectory(
@@ -54,7 +47,7 @@ def validate_trajectory(
     # 1. SETUP / ENTITY & UPDATE VALIDATION (NON-STRUCTURAL)
     # ========================================================
 
-    if spec.family not in _STRUCTURAL_FAMILIES:
+    if spec.family not in STRUCTURAL_FAMILIES:
         put_ops = [
             op
             for op in ops
@@ -432,44 +425,26 @@ def validate_trajectory(
                 "split_chain contains no Split operations"
             )
 
-        # The source of every Split must be the target object.
-        for sop in split_ops:
-            if sop.source_obj_id != target_obj:
-                raise ValueError(
-                    "split_chain Split must originate "
-                    "from the target object; "
-                    f"got source={sop.source_obj_id!r}"
-                )
-
-        # Target must have at least one Move before and after
-        # the first Split.
+        # The spawned child must be queried through at least one post-split
+        # Move so removing Split invalidates the counterfactual replay.
         first_split_idx = next(
             i for i, op in enumerate(ops)
             if isinstance(op, Split)
         )
 
-        pre_split_target_moves = [
-            op for op in ops[:first_split_idx]
-            if isinstance(op, Move) and op.obj_id == target_obj
+        post_split_target_moves = [
+            op for op in ops[first_split_idx + 1:]
+            if isinstance(op, Move)
+            and op.obj_id == target_obj
         ]
 
-        if not pre_split_target_moves:
+        if not post_split_target_moves:
             raise ValueError(
-                "split_chain must have at least one "
-                "target Move before the Split"
+                "split_chain must have at least one post-split "
+                "target Move"
             )
 
-        if spec.target_updates > 2:
-            post_split_target_moves = [
-                op for op in ops[first_split_idx + 1:]
-                if isinstance(op, Move) and op.obj_id == target_obj
-            ]
 
-            if not post_split_target_moves:
-                raise ValueError(
-                    "split_chain must have at least one "
-                    "target Move after the Split when target_updates > 2"
-                )
 
         return
 

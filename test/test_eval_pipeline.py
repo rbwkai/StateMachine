@@ -94,7 +94,7 @@ def test_end_to_end_mock_eval_and_layout() -> None:
                 "family": "basic_chain",
                 "experiment": "rq1_depth",
                 "requested_factors": {"T": 2, "E": 1, "D": 0},
-                "measured_factors": {"T_actual": 2, "E_actual": 1, "D_actual": 0, "V_actual": 0, "L_actual": 20},
+                "measured_factors": {"T_actual": 2, "E_actual": 1, "D_actual": 0, "V_actual": 0, "L_word": 20},
                 "context": "A key was put in the green box. The key was moved to the large cabinet.",
                 "question": "Where is the key now?",
                 "gold_answer": "the large cabinet",
@@ -106,7 +106,7 @@ def test_end_to_end_mock_eval_and_layout() -> None:
                 "family": "basic_chain",
                 "experiment": "rq1_depth",
                 "requested_factors": {"T": 4, "E": 1, "D": 0},
-                "measured_factors": {"T_actual": 4, "E_actual": 1, "D_actual": 0, "V_actual": 0, "L_actual": 35},
+                "measured_factors": {"T_actual": 4, "E_actual": 1, "D_actual": 0, "V_actual": 0, "L_word": 35},
                 "context": "A ball was placed in the green box.",
                 "question": "Where is the ball now?",
                 "gold_answer": "the green box",
@@ -184,11 +184,33 @@ def test_cli_mock_run_eval() -> None:
     print("Testing CLI run_eval with --mock --limit 20...")
     temp_dir = Path(tempfile.mkdtemp(prefix="dws_cli_test_"))
     try:
+        dataset_path = temp_dir / "rq1_depth.jsonl"
+        # Build the fixture with the real generator. D-010: a test that needs a
+        # dataset must generate one, never hand-write JSON that can drift from
+        # the record schema. These 20 records come from the same validated path
+        # as the sweeps, so this test exercises the true schema end to end.
+        from experiments._common import generate_instance
+
+        with dataset_path.open("w", encoding="utf-8") as handle:
+            for index in range(20):
+                rec = generate_instance(
+                    seed=1000 + index,
+                    instance_id=f"cli_fixture_{index}",
+                    family="basic_chain",
+                    entity_count=1,
+                    target_updates=2 + (index % 4),
+                    distractor_updates=0,
+                    num_containers=4,
+                    experiment_tag="rq1_depth",
+                    condition_id=f"cli_fixture_T{2 + (index % 4)}",
+                )
+                assert rec is not None
+                handle.write(json.dumps(rec) + "\n")
         cmd = [
             sys.executable,
             "run_eval.py",
             "--model", "qwen2.5-0.5b",
-            "--dataset", "rq1",
+            "--dataset", str(dataset_path),
             "--mock",
             "--limit", "20",
             "--cot",

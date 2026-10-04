@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .constants import NUM_CONTAINERS_DEFAULT, NUM_CONTAINERS_MIN
+from .dataset_spec import FAMILY_TO_CAPABILITY_GROUP, REQUIRED_STRUCTURAL_OPS, STRUCTURAL_FAMILIES
+
 
 @dataclass(frozen=True)
 class TrajectorySpec:
@@ -37,7 +40,7 @@ class TrajectorySpec:
 
     entity_count: int
 
-    num_containers: int = 3
+    num_containers: int = NUM_CONTAINERS_DEFAULT
 
     # --------------------------------------------------------
     # Temporal complexity
@@ -85,31 +88,30 @@ class TrajectorySpec:
         # General validation
         # ====================================================
 
-        if self.family not in {
-            # Original RQ1-4 families
-            "basic_chain",
-            "interleaved_chain",
-            "revision",
-            # RQ5 structural families
-            "split_chain",
-            "merge_chain",
-            "swap_chain",
-            "undo_chain",
-            "undo_redo_chain",
-        }:
+        # The family registry belongs to generator/dataset_spec.py (AGENTS.md §5);
+        # it used to be copied here as an inline set (SPEC OPEN-6).
+        if self.family not in FAMILY_TO_CAPABILITY_GROUP:
             raise ValueError(
                 f"unknown trajectory family: "
                 f"{self.family!r}"
             )
+        # Set structural_ops from registry if not explicitly provided
+        if not self.structural_ops:
+            object.__setattr__(
+                self,
+                "structural_ops",
+                REQUIRED_STRUCTURAL_OPS.get(self.family, frozenset()),
+            )
+
 
         if self.entity_count < 1:
             raise ValueError(
                 "entity_count must be >= 1"
             )
 
-        if self.num_containers < 2:
+        if self.num_containers < NUM_CONTAINERS_MIN:
             raise ValueError(
-                "num_containers must be >= 2"
+                f"num_containers must be >= {NUM_CONTAINERS_MIN}"
             )
 
         if self.total_updates < 1:
@@ -156,15 +158,7 @@ class TrajectorySpec:
         # second-guessed at spec construction time.
         # ====================================================
 
-        _structural_families = {
-            "split_chain",
-            "merge_chain",
-            "swap_chain",
-            "undo_chain",
-            "undo_redo_chain",
-        }
-
-        if self.family not in _structural_families:
+        if self.family not in STRUCTURAL_FAMILIES:
             expected_updates = (
                 self.target_updates
                 + self.distractor_updates
