@@ -51,6 +51,26 @@ def query_type_of(instance: Dict[str, Any]) -> str:
     return "count" if str(instance.get("question", "")).startswith("How many") else "location"
 
 
+def chance_level(instance: Dict[str, Any]) -> float:
+    """1/size of the answer space this instance actually offers.
+
+    A count cell answers with one of ``0..E+splits``; every other query type
+    answers with one of the final containers. Derived per instance, never a
+    hard-coded 1/3.
+    """
+    if query_type_of(instance) == "count":
+        splits = sum(
+            1
+            for op in (instance.get("canonical_trace") or [])
+            if op.get("op_type") == "SPLIT"
+        )
+        factors = instance.get("requested_factors") or {}
+        entity_count = factors.get("E", 1) or 1
+        return 1.0 / (entity_count + splits + 1)
+    containers = (instance.get("final_state") or {}).get("containers") or []
+    return 1.0 / len(containers) if containers else 0.0
+
+
 def compute_stateless_baseline(instances: Sequence[Dict[str, Any]]) -> List[BaselineResult]:
     """
     Stateless baseline: answer based on initial state only.

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from eval.models import ModelConfig
+from eval.models import ModelConfig, validate_pinned_revision
 from eval.prompts import build_user_prompt
 
 logger = logging.getLogger(__name__)
@@ -156,10 +156,13 @@ class HuggingFaceEngine(InferenceEngine):
         self.precision = precision
         self.max_prompt_length = 0
 
-        logger.info(f"Loading tokenizer for {model_config.hf_model_id} (rev={model_config.revision[:8]})...")
+        # Refuse a floating or placeholder revision before any weight download.
+        revision = validate_pinned_revision(model_config)
+
+        logger.info(f"Loading tokenizer for {model_config.hf_model_id} (rev={revision[:8]})...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_config.hf_model_id,
-            revision=model_config.revision,
+            revision=revision,
             token=hf_token,
             trust_remote_code=False,
         )
@@ -180,7 +183,7 @@ class HuggingFaceEngine(InferenceEngine):
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": False,
             "token": hf_token,
-            "revision": model_config.revision,
+            "revision": revision,
         }
 
         if precision == "4bit":
@@ -232,6 +235,11 @@ class HuggingFaceEngine(InferenceEngine):
             for field in ("temperature", "top_p", "top_k"):
                 if hasattr(generation_config, field):
                     setattr(generation_config, field, None)
+            # The shipped Qwen2.5 generation_config carries
+            # repetition_penalty=1.1, so a "greedy" run would still be penalised.
+            # Greedy decoding is repetition_penalty == 1.0.
+            if hasattr(generation_config, "repetition_penalty"):
+                generation_config.repetition_penalty = 1.0
 
     def format_input(
         self,

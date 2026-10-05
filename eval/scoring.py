@@ -82,6 +82,55 @@ def _unique_candidate_match(text: str, candidates: Sequence[str]) -> Optional[st
     return None
 
 
+# Number words a count answer may be written with, plus the filler a model puts
+# in front of it. Bounded table, not a general parser: the input is untrusted
+# text and must never reach eval/exec (AGENTS.md §6.13).
+_COUNT_NUMBER_WORDS: Dict[str, str] = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19", "twenty": "20",
+}
+_COUNT_FILLER = re.compile(
+    r"^(?:there (?:are|is)|number of|total of|count of|about|around|roughly)\s+",
+    re.IGNORECASE,
+)
+_COUNT_UNIT = re.compile(
+    r"\s*\b(?:tokens?|items?|objects?|entities?|of them|in total)\b\.?$",
+    re.IGNORECASE,
+)
+_INTEGER = re.compile(r"\d+")
+
+
+def _numeric_answer_space(gold_answer: Optional[str]) -> bool:
+    """True when this instance is answered with a bare number (a count cell).
+
+    A location cell's gold is a container display name, so this stays false for
+    it and the numeric fallback never competes with candidate matching.
+    """
+    if gold_answer is None:
+        return False
+    return bool(_INTEGER.fullmatch(normalize_text(gold_answer)))
+
+
+def read_count_answer(segment: str) -> Optional[str]:
+    """Read a bare count answer such as ``"2"``, ``"two"`` or ``"12 tokens"``.
+
+    Returns the answer as a digit string, or ``None`` when ``segment`` is not a
+    number. Used so a wrong count is recorded as a wrong guess instead of being
+    dropped for not matching a candidate (checklist 6).
+    """
+    text = normalize_text(segment)
+    text = _COUNT_FILLER.sub("", text)
+    text = _COUNT_UNIT.sub("", text).strip()
+    if not text:
+        return None
+    if _INTEGER.fullmatch(text):
+        return text
+    return _COUNT_NUMBER_WORDS.get(text)
+
+
 def _collect_object_nouns(
     instance: Optional[Dict[str, Any]] = None,
     object_types: Optional[Sequence[str]] = None,
@@ -163,6 +212,13 @@ def extract_instance_answer(
             if cand_match is not None:
                 answer = cand_match
                 method = "final_answer"
+            elif _numeric_answer_space(gold_answer):
+                # A count cell's candidates hold only the gold value, so a
+                # non-gold number matches nothing. Record the guess instead of
+                # dropping it: "" is indistinguishable from no answer at all.
+                guess = read_count_answer(final_segment)
+                answer = guess or ""
+                method = "final_answer"
             else:
                 answer = ""
                 method = "final_answer"
@@ -186,6 +242,8 @@ def extract_instance_answer(
 
     for method, segment in _fallback_answer_segments(raw_response, instance=instance, object_types=object_types):
         cand_match = _unique_candidate_match(segment, candidates)
+        if cand_match is None and _numeric_answer_space(gold_answer):
+            cand_match = read_count_answer(segment)
         if cand_match is not None:
             gold_norm = normalize_text(gold_answer) if gold_answer is not None else ""
             ans_norm = normalize_text(cand_match)

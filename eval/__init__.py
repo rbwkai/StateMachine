@@ -9,11 +9,14 @@ from .eval_harness import (
 from .models import CORE_MODELS, OPTIONAL_MODELS, ModelConfig
 from .baselines import (
     BaselineResult,
+    chance_level,
     compute_stateless_baseline,
     compute_mfc_baseline,
+    query_type_of,
     run_all_baselines,
     summarize_baselines,
 )
+from .post_run_sanity import WEAK_BASELINE, sanity_checks, sanity_failures
 from .robustness import (
     RobustnessResult,
     build_prompt_variants,
@@ -37,10 +40,15 @@ __all__ = [
     "MockInferenceEngine",
     "create_engine",
     "BaselineResult",
+    "chance_level",
     "compute_stateless_baseline",
     "compute_mfc_baseline",
+    "query_type_of",
     "run_all_baselines",
     "summarize_baselines",
+    "WEAK_BASELINE",
+    "sanity_checks",
+    "sanity_failures",
     "RobustnessResult",
     "build_prompt_variants",
     "paraphrase_narrative",

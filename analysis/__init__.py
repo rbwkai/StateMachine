@@ -22,6 +22,14 @@ from .first_error import (
     TrajectoryErrorAnalysis,
     analyze_first_error,
 )
+from .statistics import (
+    CONFIDENCE_LEVEL,
+    MIN_SUCCESSES_FOR_REPORTING,
+    McNemarResult,
+    flag_low_success_cells,
+    mcnemar_test,
+    wilson_interval,
+)
 
 __all__ = [
     "QueryAnalysis",
@@ -38,4 +46,10 @@ __all__ = [
     "ErrorType",
     "TrajectoryErrorAnalysis",
     "analyze_first_error",
+    "CONFIDENCE_LEVEL",
+    "MIN_SUCCESSES_FOR_REPORTING",
+    "McNemarResult",
+    "wilson_interval",
+    "mcnemar_test",
+    "flag_low_success_cells",
 ]

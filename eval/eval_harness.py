@@ -63,6 +63,56 @@ def normalize_answer(value: Any) -> str:
     return normalize_text(value)
 
 
+# ============================================================
+# Condition keys and trajectory parsing
+# ============================================================
+
+def condition_key(instance: Dict[str, Any]) -> str:
+    """Bucket key for one condition: family + T + D, plus E and N when set.
+
+    RQ1 forbids pooling two cells that differ only in E or N, so the key has to
+    carry them. The minimal cell (E=1, N=0) leaves them implicit, which keeps the
+    key equal to the `condition_id` prefix `generate.py` writes
+    (`family_T{T}_D{D}_E{E}`) for default cells. The record schema puts N in
+    ``measured_factors['N_actual']`` only, so fall back to it rather than pool
+    two cells that differ in textual distractors.
+    """
+    factors = instance.get("requested_factors") or {}
+    measured = instance.get("measured_factors") or {}
+    key = f"{instance.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
+    entity_count = factors.get("E", 1) or 1
+    textual_distractors = factors.get("N", measured.get("N_actual", 0)) or 0
+    if entity_count != 1:
+        key += f"_E{entity_count}"
+    if textual_distractors:
+        key += f"_N{textual_distractors}"
+    return key
+
+
+def parse_pred_trajectory(
+    raw_prediction: str,
+    instance: Dict[str, Any],
+) -> Optional[List[Optional[str]]]:
+    """Step-wise answers parsed out of a chain-of-thought response.
+
+    ``gold_states[0]`` is the initial state, so ``step_wise_gold`` carries one
+    more entry than the number of predicted steps; the response is parsed over
+    the steps after the initial one. Returns ``None`` when the response has no
+    usable Step line, so a markerless reply contributes no trajectory data.
+    """
+    gold_states = instance.get("step_wise_gold") or []
+    if len(gold_states) < 2:
+        return None
+    parsed = extract_step_answers(
+        raw_prediction,
+        candidate_answers(instance),
+        num_steps=len(gold_states) - 1,
+    )
+    if not any(step is not None for step in parsed):
+        return None
+    return parsed
+
+
 # AGENTS.md §5: eval/scoring.py owns extraction. Re-exported here so harness
 # callers keep one import site; there is no second extraction implementation.
 
@@ -153,9 +203,13 @@ def evaluate_predictions(
         )
         is_correct = scored["strict_correct"]
 
-        # Trajectory error analysis if step-wise predictions are present
+        # Trajectory error analysis if step-wise predictions are present. A
+        # caller-supplied trajectory wins; otherwise parse one out of the
+        # response so a chain-of-thought run feeds the taxonomy.
         gold_traj = inst.get("step_wise_gold")
         pred_traj = pred_info.get("pred_trajectory")
+        if pred_traj is None:
+            pred_traj = parse_pred_trajectory(raw_pred, inst)
         error_analysis_dict = None
 
         if gold_traj and pred_traj and len(gold_traj) == len(pred_traj) + 1:
@@ -182,9 +236,9 @@ def evaluate_predictions(
         )
         results.append(res)
 
-        # Condition grouping: family + T + D
-        factors = inst.get("requested_factors", {})
-        cond_key = f"{inst.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
+        # Condition grouping: family + T + D, plus E and N when set (RQ1: no
+        # pooling of different E or N into one cell).
+        cond_key = condition_key(inst)
         condition_buckets.setdefault(cond_key, []).append(res)
 
     # Aggregate summaries

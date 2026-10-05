@@ -16,6 +16,7 @@ Implements §13 (Model Selection) and §14 (Standardized Evaluation):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -42,6 +43,53 @@ class ModelConfig:
         "Give your final answer clearly."
     )
 
+
+# ============================================================
+# Revision validation
+# ============================================================
+
+# A Hugging Face repo sha is 40 lowercase hex characters. Anything else is a
+# placeholder or a floating ref and must be rejected before a weight download
+# starts (AGENTS.md §9: no floating `main`).
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+_PLACEHOLDER_REVISIONS = {"", "main", "master", "head", "latest", "none", "null"}
+_PLACEHOLDER_WORDS = re.compile(r"todo|tbd|fixme|placeholder|x{3,}", re.IGNORECASE)
+
+
+def validate_pinned_revision(config: ModelConfig) -> str:
+    """Return the pinned commit hash of ``config``, or raise ``ValueError``.
+
+    Fails loudly on a placeholder (``main``, a TODO marker) or malformed
+    revision instead of letting ``from_pretrained`` resolve it to whatever the
+    branch points at today. Callers run this before loading weights.
+    """
+    revision = str(config.revision or "").strip()
+    if revision.lower() in _PLACEHOLDER_REVISIONS or _PLACEHOLDER_WORDS.search(revision):
+        raise ValueError(
+            f"model {config.name!r} has a placeholder revision {config.revision!r}; "
+            "pin a 40-character commit hash (AGENTS.md §9)"
+        )
+    if not _COMMIT_SHA.fullmatch(revision):
+        raise ValueError(
+            f"model {config.name!r} has an unpinned revision {config.revision!r}; "
+            "expected a 40-character lowercase commit hash (AGENTS.md §9)"
+        )
+    return revision
+
+
+def validate_registry(configs: Dict[str, ModelConfig]) -> None:
+    """Validate every registered config. Called at import so the registry itself
+    cannot carry a floating revision."""
+    for key, config in configs.items():
+        try:
+            validate_pinned_revision(config)
+        except ValueError as error:
+            raise ValueError(f"registry entry {key!r}: {error}") from error
+
+
+# ============================================================
+# Model registry
+# ============================================================
 
 # 5 Core Models (§13); revisions pinned to specific commits.
 # Hashes below are the current `sha` of each repository on the Hugging Face Hub,
@@ -102,3 +150,5 @@ OPTIONAL_MODELS: Dict[str, ModelConfig] = {
         revision="470b1fba1ae01581f270116362ee4aa1b97f4c84",
     ),
 }
+
+validate_registry({**CORE_MODELS, **OPTIONAL_MODELS})
