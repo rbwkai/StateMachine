@@ -111,7 +111,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 f"Invariant U == T + D failed: {spec.total_updates} != {spec.target_updates} + {spec.distractor_updates}"
             )
 
-            # INVARIANT 3: Initial Put operations count == E (or 1 for split_chain)
+            # INVARIANT 3: Initial Put operations count == E (or 1 for split_chain (child created later))
             expected_initial_puts = 1 if family == "split_chain" else spec.entity_count
             assert E_actual == expected_initial_puts, (
                 f"Initial Put count mismatch: expected {expected_initial_puts}, got {E_actual}"

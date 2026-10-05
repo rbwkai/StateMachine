@@ -77,6 +77,7 @@ DISTRACTOR_UPDATES = 0
 TEXTUAL_DISTRACTORS = 0
 INSTANCES_PER_CONDITION = 50
 EXPERIMENT_TAG = "rq1_mutation_depth"
+condition_id = ""
 
 # Family-specific container defaults
 FAMILY_CONTAINERS = {

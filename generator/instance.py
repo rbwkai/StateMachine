@@ -42,7 +42,14 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from world import GenerationError, Merge, Operation, Put, replay_trace
+from world import (
+    GenerationError,
+    Merge,
+    Operation,
+    Put,
+    gold_count,
+    replay_trace,
+)
 
 from render.names import (
     NameRegistry,
@@ -58,10 +65,12 @@ from .constants import (
 )
 from .metadata import (
     MeasuredFactors,
+    count_query_target,
     measure_factors,
     verify_factors,
     verify_length,
 )
+from .probes import CountQuery
 from .structural import validate_structural_causality
 from .trajectories import build_trajectory
 from .trajectory_specs import TrajectorySpec
@@ -410,13 +419,25 @@ def build_validated_instance(
         )
 
         # Compute step-wise gold for operation sentences (before splicing distractors)
+        # Read through the same probe as the final question, so a count cell's
+        # step-wise gold is a count at every step. Previously it always read the
+        # target's container, which the CoT condition could not match against a
+        # numeric gold.
         trace, _, _ = replay_trace(trajectory.ops, trajectory.containers)
-        op_step_wise_gold_answers = [
-            names.container(after.location.get(trajectory.target_obj))
-            if after.location.get(trajectory.target_obj) is not None
-            else "removed"
-            for _, _, after in trace
-        ]
+        if spec.query_type == "count":
+            probe = CountQuery(
+                *count_query_target(
+                    trajectory.ops, trajectory.final_state, trajectory.target_obj
+                )
+            )
+            op_step_wise_gold_answers = [str(probe.read(after)) for _, _, after in trace]
+        else:
+            op_step_wise_gold_answers = [
+                names.container(after.location.get(trajectory.target_obj))
+                if after.location.get(trajectory.target_obj) is not None
+                else "removed"
+                for _, _, after in trace
+            ]
 
         if textual_distractor_count:
             distractors = make_distractor_sentences(
@@ -551,25 +572,17 @@ def build_validated_instance(
     target_container = final_state.location.get(trajectory.target_obj)
     gold_answer = names.container(target_container) if target_container else None
 
-    # Handle count queries for split_chain
-    if spec.family == "split_chain" and spec.query_type == "count":
-        # For split_chain, the count query asks about the merge destination container
-        # Find the Merge operation to determine the destination container
-        merge_ops = [op for op in trajectory.ops if isinstance(op, Merge)]
-        if merge_ops:
-            merge_dst = merge_ops[0].dst_container
-            # Count objects of the target's type in the merge destination
-            target_type = final_state.object_type.get(trajectory.target_obj)
-            count = sum(
-                1 for oid, typ in final_state.object_type.items()
-                if typ == target_type and final_state.location.get(oid) == merge_dst
-            )
-            question = question_count(merge_dst, target_type, names)
-            gold_answer = str(count)
-        else:
-            # Fallback
-            target_container = final_state.location.get(trajectory.target_obj)
-            gold_answer = names.container(target_container) if target_container else None
+    # A count cell asks a counting question and answers with a number. Every
+    # count family goes through this one branch; previously it was hard-coded to
+    # split_chain, so undo_chain, swap_chain and merge_chain built with
+    # query_type="count" still rendered "Where is ...?" with a container as gold.
+    if spec.query_type == "count":
+        count_container, count_type = count_query_target(
+            trajectory.ops, final_state, trajectory.target_obj
+        )
+        question = question_count(count_container, count_type, names)
+        gold_answer = str(gold_count(final_state, count_container, count_type))
+        target_container = count_container
 
     # --------------------------------------------------------
     # 4d. Answer leakage gate: reject if gold answer appears
@@ -633,6 +646,12 @@ def build_validated_instance(
             "total_updates": spec.total_updates,
             "initial_placements": initial_placements,
             "total_transitions": len(trajectory.ops),
+            # Serialised so a dataset can be audited per query type without
+            # inferring the question from the family name: four families build
+            # with query_type="count" but the field was absent, so a downstream
+            # reader could not tell a count question from a location question
+            # (SPEC §6 rule 5, checklist 5).
+            "query_type": spec.query_type,
         },
 
         "canonical_trace": canonical_trace,

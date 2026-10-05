@@ -62,10 +62,12 @@ L_word
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Mapping, Optional, Sequence, Set
+from typing import List, Mapping, Optional, Sequence, Set, Tuple
 
 from world import (
+    GenerationError,
     History,
+    Merge,
     Operation,
     Put,
     Redo,
@@ -433,6 +435,41 @@ def _count_revisits(locations: List[str]) -> int:
             revisit_count += 1
 
     return revisit_count
+
+
+# ============================================================
+# Count-query target (SPEC §2; single source of truth)
+# ============================================================
+
+def count_query_target(
+    ops: Sequence[Operation],
+    final_state: WorldState,
+    target_obj: str,
+) -> Tuple[str, str]:
+    """Return ``(container, obj_type)`` that a count question asks about.
+
+    One rule, shared by the renderer, the step-wise gold and the structural
+    necessity check, so the question asked, the gold answered and the
+    counterfactual compared are always about the same container. Previously the
+    renderer hard-coded ``split_chain`` and structural.py carried a second copy
+    of the rule, so a ``count`` cell could be rendered as a location question.
+
+    The container is the first ``Merge`` destination when the trace contains a
+    ``Merge`` (``split_chain``, ``merge_chain``): that is where the structural
+    operation determines the population. Otherwise it is the target's own final
+    container (``swap_chain``, ``undo_chain``).
+    """
+    for op in ops:
+        if isinstance(op, Merge):
+            return op.dst_container, final_state.object_type[target_obj]
+
+    container = final_state.location.get(target_obj)
+    if container is None:
+        raise GenerationError(
+            f"count query has no container to ask about: target {target_obj!r} "
+            "has no location and the trace contains no Merge"
+        )
+    return container, final_state.object_type[target_obj]
 
 
 # ============================================================

@@ -623,6 +623,11 @@ def build_revision(
             "3 target updates"
         )
 
+    if spec.revision_count > spec.target_updates:
+        raise ValueError(
+            f"revision requires revision_count <= target_updates (revision_count={spec.revision_count} > target_updates={spec.target_updates})"
+        )
+
     if spec.distractor_updates != 0:
         raise ValueError(
             "revision does not currently support "
@@ -993,11 +998,27 @@ def build_merge_chain(
     target_current = merge_dst
     target_updates_done = 1
 
-    # --------------------------------------------------------
-    # No trailing Moves after Merge - Merge is the FINAL target-affecting operation
-    # If target_updates > 1, the extra target_updates are absorbed by the Merge
-    # since Merge moves all entities at once (counts as 1 target update).
-    # This ensures the count query depends on the Merge.
+    # Additional target moves if target_updates > 1
+    # (Merge counts as 1; subsequent moves add to reach target_updates)
+    while target_updates_done < spec.target_updates:
+        candidates = [
+            c for c in container_list if c != target_current
+        ]
+        if not candidates:
+            break
+        dst = rng.choice(candidates)
+
+        state = _move(
+            state,
+            history,
+            ops,
+            target,
+            dst,
+        )
+
+        target_current = dst
+        target_updates_done += 1
+
     # --------------------------------------------------------
 
     # --------------------------------------------------------
@@ -1149,8 +1170,21 @@ def build_swap_chain(
     # Pre-swap Moves on "other" are distractors (D), not target updates (T)
     max_pre_swap_target_moves = spec.target_updates - 1
     pre_swap_target_moves = max_pre_swap_target_moves
-    
-    for _ in range(pre_swap_target_moves):
+
+    # Interleaved `other` Moves are D operations, so they are drawn from the
+    # distractor budget rather than from a coin flip: a coin flip made D_actual a
+    # function of T, so a D=0 request produced D>0 and `verify_factors` rejected
+    # the instance (SPEC §6 rule 3). Spreading the budget over the pre-swap Moves
+    # keeps the interleaved character while holding D_actual == requested.
+    distractor_budget = spec.distractor_updates
+    distractor_stride = (
+        max(1, pre_swap_target_moves // distractor_budget)
+        if distractor_budget
+        else 0
+    )
+    distractors_done = 0
+
+    for i in range(pre_swap_target_moves):
         # Move target to a different container (always affects target = T update)
         candidates = [c for c in container_list if c != target_current]
         if not candidates:
@@ -1160,15 +1194,18 @@ def build_swap_chain(
         target_current = dst
         updates_done += 1
 
-        # Optional: Move other as distractor (D update, not counted toward T)
-        # This adds noise without consuming target update budget
-        if rng.random() < 0.5:
+        # Move "other" as a distractor once per stride, while budget remains.
+        if (
+            distractor_stride
+            and distractors_done < distractor_budget
+            and (i + 1) % distractor_stride == 0
+        ):
             candidates = [c for c in container_list if c != other_current]
             if candidates:
                 dst = rng.choice(candidates)
                 state = _move(state, history, ops, other, dst)
                 other_current = dst
-                # Note: this is a distractor update, NOT counted in updates_done
+                distractors_done += 1
 
     # --------------------------------------------------------
     # Final Swap between two randomly chosen containers (always executed, affects target = T update)
@@ -1203,7 +1240,10 @@ def build_swap_chain(
     # Distractor: move companions
     # --------------------------------------------------------
 
-    for _ in range(spec.distractor_updates):
+    # Only the unspent remainder of the distractor budget lands here; the
+    # interleaved pre-swap Moves above already consumed part of it, and charging
+    # the full budget twice made D_actual exceed the request.
+    for _ in range(distractor_budget - distractors_done):
 
         companion_id = rng.choice(companion_ids)
 

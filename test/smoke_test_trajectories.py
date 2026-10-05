@@ -217,6 +217,7 @@ split_spec = TrajectorySpec(
     total_updates=4,
     target_updates=4,
     distractor_updates=0,
+    query_type='count',
 )
 
 split = build_trajectory(
