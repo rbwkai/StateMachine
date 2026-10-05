@@ -14,6 +14,12 @@ OBJECT_TYPES: Tuple[str, ...] = (
     "card", "ring", "token", "gem", "watch", "letter",
 )
 
+# Canonical Undo sentence. Owned here (the lower render layer) because both the
+# renderer and splice_distractors() need it and `render.narrative` imports this
+# module, not the other way round. render_undo() renders this exact string, so
+# there is one definition of the sentence template (AGENTS.md §5).
+UNDO_SENTENCE = "That last action was undone."
+
 CONTAINER_ADJS = [
     "wooden", "metal", "old", "small", "large", "blue", "red",
     "dusty", "narrow", "tall", "green", "battered", "glass",
@@ -22,6 +28,17 @@ CONTAINER_NOUNS = [
     "drawer", "cabinet", "box", "shelf", "closet", "chest",
     "bin", "cupboard", "bag", "crate", "trunk", "basket",
 ]
+
+
+def ordinal(n: int) -> str:
+    """English ordinal for a positive integer: 1st, 2nd, 3rd, 11th, 21st."""
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def pluralize_object(obj_type: str) -> str:
     if obj_type.endswith(("s", "x", "z", "ch", "sh")):
         return f"{obj_type}es"
@@ -48,24 +65,29 @@ class NameRegistry:
 
     def obj(self, obj_id: str, state: WorldState) -> str:
         obj_type = state.object_type[obj_id]
-        same_type_objs = sorted(
-            [oid for oid, t in state.object_type.items() if t == obj_type]
-        )
+        # Creation order, not lexicographic id order: Put/Split insert into
+        # state.object_type in trace order, so dict order is the order the
+        # reader meets the objects. Sorting ids would name "o10" the 3rd key.
+        same_type_objs = [
+            oid for oid, t in state.object_type.items() if t == obj_type
+        ]
         if len(same_type_objs) > 1:
-            idx = same_type_objs.index(obj_id)
-            if idx == 0:
-                return f"the original {obj_type}"
-            elif idx == 1:
-                return f"the duplicate {obj_type}"
-            else:
-                # Proper ordinal suffix
-                n = idx + 1
-                if 10 <= n % 100 <= 20:
-                    suffix = "th"
-                else:
-                    suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-                return f"the {n}{suffix} {obj_type}"
+            return self.obj_at(obj_type, same_type_objs.index(obj_id) + 1)
         return f"the {obj_type}"
+
+    def obj_at(self, obj_type: str, rank: int) -> str:
+        """Name for the ``rank``-th (1-based) object of a type.
+
+        Same ladder as obj() -- original, duplicate, then ordinals -- but
+        addressable without a WorldState, so a Put can name the object it
+        introduces before the state contains it (render_narrative passes the
+        creation rank it derived from the trace).
+        """
+        if rank == 1:
+            return f"the original {obj_type}"
+        if rank == 2:
+            return f"the duplicate {obj_type}"
+        return f"the {ordinal(rank)} {obj_type}"
 
 
 DISTRACTOR_FLAVOR = [
@@ -115,14 +137,21 @@ def splice_distractors(
     Uses sequential insertion to maintain the correct distribution:
     each distractor is inserted at a uniformly random position in the
     current sequence (which grows by one each time).
+
+    A distractor is never placed directly in front of the Undo sentence: the
+    reader would have to decide whether the inserted sentence was part of the
+    story, and the sentence the Undo inverts must stay adjacent to it. Appending
+    at the end stays available, so the candidate set is never empty and the
+    position distribution is unchanged when no Undo sentence is present.
     """
     if not distractor_sentences:
         return list(op_sentences)
     
     result = list(op_sentences)
     for dist_sentence in distractor_sentences:
-        pos = rng.randint(0, len(result))
-        result.insert(pos, dist_sentence)
+        positions = [p for p in range(len(result) + 1) if p == len(result)
+                     or result[p] != UNDO_SENTENCE]
+        result.insert(positions[rng.randrange(len(positions))], dist_sentence)
     
     return result
     

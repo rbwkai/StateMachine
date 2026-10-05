@@ -50,9 +50,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from experiments._common import (
+    ProbeResult,
+    build_manifest,
     generate_condition,
     probe_reachability,
     write_jsonl,
+    write_manifest,
     verify_generated_records,
     print_factor_summary,
 )
@@ -150,14 +153,14 @@ def main():
 
     print("\n[Step 1] Reachability probe (10 seeds × each family×T)…")
 
-    probe_results: Dict[str, bool] = {}
+    probe_results: Dict[str, ProbeResult] = {}
 
     for (family, E, T_levels, desc) in families:
         num_containers = FAMILY_CONTAINERS[family]
         for T in T_levels:
             key = f"{family}_T{T}"
             query_type = FAMILY_QUERY_TYPES.get(family, "location")
-            ok = probe_reachability(
+            probe_results[key] = probe_reachability(
                 family=family,
                 entity_count=E,
                 target_updates=T,
@@ -166,23 +169,35 @@ def main():
                 n_seeds=10,
                 query_type=query_type,
             )
-            probe_results[key] = ok
 
-    failed = [k for k, ok in probe_results.items() if not ok]
+    # A cell that no probe seed can generate is excluded from the sweep and
+    # named loudly here and in the manifest. A cell that generates on some
+    # seeds is kept: generate_condition() counts the failures, so a partial
+    # condition shows up as a shortfall rather than as a missing one.
+    unreachable = sorted(k for k, r in probe_results.items() if r.excluded)
+    degraded = sorted(
+        k for k, r in probe_results.items() if not r.excluded and not r.reachable
+    )
 
-    if failed:
+    if unreachable:
         print()
         print("=" * 75)
-        print("[HALT] The following conditions failed the reachability probe:")
-        for f in failed:
-            print(f"  ✗  {f}")
-        print()
-        print("Review and fix trajectory constructors before running the experiment.")
-        print("Experiment aborted — no instances generated.")
+        print("[EXCLUDED] These conditions cannot generate a validated instance:")
+        for key in unreachable:
+            print(f"  ✗  {key}")
+        print("They are excluded from this run and listed in the manifest.")
         print("=" * 75)
-        sys.exit(1)
 
-    print("\n  All conditions passed the reachability probe ✓")
+    if degraded:
+        print(f"\n[WARN] {len(degraded)} condition(s) generate on some seeds only "
+              f"({', '.join(degraded)}); expect a shortfall against "
+              f"{args.instances} instances/cond.")
+
+    if unreachable or degraded:
+        kept = len(probe_results) - len(unreachable)
+        print(f"\n  {kept}/{len(probe_results)} conditions passed the reachability probe ✓")
+    else:
+        print("\n  All conditions passed the reachability probe ✓")
 
     if args.dry_run:
         print("\n[DRY-RUN] Probe complete. No instances generated.")
@@ -215,6 +230,11 @@ def main():
             condition_label = (
                 f"{family} E={E} T={T} D={DISTRACTOR_UPDATES}"
             )
+
+            if f"{family}_T{T}" in unreachable:
+                print(f"  [SKIP] {condition_label} — excluded by the "
+                      f"reachability probe")
+                continue
 
             query_type = FAMILY_QUERY_TYPES.get(family, "location")
 
@@ -259,6 +279,8 @@ def main():
     print("RQ1 GENERATION COMPLETE")
     print(f"  Total generated : {len(all_records)}")
     print(f"  Total failures  : {total_failures}")
+    print(f"  Excluded cells  : {len(unreachable)}"
+          + (f" ({', '.join(unreachable)})" if unreachable else ""))
     print(f"  Elapsed         : {elapsed:.1f}s")
     print("=" * 75)
 
@@ -292,6 +314,18 @@ def main():
     print_factor_summary(all_records)
 
     write_jsonl(all_records, output_path)
+
+    # The manifest travels with the dataset so a release can be traced back to
+    # the code, the pinned models and the hashes that produced it.
+    write_manifest(
+        build_manifest(
+            all_records,
+            experiment_tag=EXPERIMENT_TAG,
+            dataset_path=output_path,
+            excluded_conditions=unreachable,
+        ),
+        output_path.parent / "manifest.json",
+    )
 
 
 if __name__ == "__main__":

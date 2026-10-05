@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 from world import (
     Merge, Move, Operation, Put, Redo, Remove, Split, Swap, Undo,
     WorldState, replay_trace,
 )
-from .names import NameRegistry, pluralize_object
+from .names import UNDO_SENTENCE, NameRegistry, pluralize_object
 
 
 def _indefinite_article(word: str) -> str:
@@ -21,10 +21,32 @@ def render_put(
     op: Put,
     before: WorldState,
     names: NameRegistry,
+    shared_rank: int = 0,
 ) -> str:
+    """Render a Put.
+
+    ``shared_rank`` is the 1-based creation rank of this object among the
+    objects of its type, and 0 when the type is not shared. For a shared type
+    the bare "A key was placed ..." leaves the reader unable to resolve the
+    later references to "the original" / "the duplicate" / "the 3rd key", so the
+    sentence names the object with the same phrase obj() will use from then on.
+    The "<word> was placed in <container>." shape is preserved because
+    eval.robustness.PARAPHRASE_RULES matches on it.
+    """
+    if not shared_rank:
+        return (
+            f"{_indefinite_article(op.obj_type)} {op.obj_type} "
+            f"was placed in {names.container(op.container)}."
+        )
+    # "duplicate" on its own does not say the object is the second one, so the
+    # subject carries the ordinal as well.
+    subject = (
+        f"second {op.obj_type}" if shared_rank == 2 else op.obj_type
+    )
     return (
-        f"{_indefinite_article(op.obj_type)} {op.obj_type} "
-        f"was placed in {names.container(op.container)}."
+        f"{_indefinite_article(op.obj_type)} {subject} "
+        f"was placed in {names.container(op.container)} "
+        f"as {names.obj_at(op.obj_type, shared_rank)}."
     )
 
 
@@ -64,7 +86,7 @@ def render_undo(
     before: WorldState,
     names: NameRegistry,
 ) -> str:
-    return "That last action was undone."
+    return UNDO_SENTENCE
 
 
 def render_redo(
@@ -81,11 +103,16 @@ def render_split(
     names: NameRegistry,
 ) -> str:
     container = before.location[op.source_obj_id]
+    obj_type = before.object_type[op.source_obj_id]
     phrase = names.obj(op.source_obj_id, before)
 
+    # Split leaves the source in place and adds an identical object of the same
+    # type in the same container, so the copy is narrated as a placement. That
+    # keeps one sentence template (and one paraphrase rule) for every op that
+    # puts an object somewhere.
     return (
-        f"{phrase.capitalize()} in {names.container(container)} "
-        f"split into two identical copies."
+        f"{_indefinite_article(obj_type)} {obj_type} was placed in "
+        f"{names.container(container)} as an identical copy of {phrase}."
     )
 
 
@@ -123,6 +150,39 @@ RENDER_DISPATCH = {
 }
 
 
+def _creation_ranks(trace) -> Tuple[Dict[str, int], Set[str]]:
+    """1-based creation rank per object, and the types that are ever shared.
+
+    Put and Split are the only operations that introduce an object, so the
+    trace order is the creation order the reader sees. Kept separate from
+    NameRegistry.obj() so a Put can name its object before the state contains
+    it. An Undo can retire an object that a later Put reintroduces, so an id
+    already in the per-type list is re-inserted rather than counted twice.
+
+    Returns (ranks, shared_types); a type is shared once a second object of it
+    has ever existed, which is the point at which the narrative starts saying
+    "the original" / "the duplicate" / "the 3rd key".
+    """
+    ranks: Dict[str, int] = {}
+    per_type: Dict[str, List[str]] = {}
+    shared: Set[str] = set()
+    for op, before, _after in trace:
+        if isinstance(op, Put):
+            obj_id, obj_type = op.obj_id, op.obj_type
+        elif isinstance(op, Split):
+            obj_id = op.new_obj_id
+            obj_type = before.object_type[op.source_obj_id]
+        else:
+            continue
+        live = [oid for oid in per_type.get(obj_type, []) if oid != obj_id]
+        live.append(obj_id)
+        per_type[obj_type] = live
+        ranks[obj_id] = len(live)
+        if len(live) > 1:
+            shared.add(obj_type)
+    return ranks, shared
+
+
 def render_narrative(
     ops: Sequence[Operation],
     containers,
@@ -137,6 +197,11 @@ def render_narrative(
     """
     trace, final_state, _ = replay_trace(ops, containers)
 
+    # Creation rank per object, in the order the reader meets them. Put renders
+    # the rank so "the original key" / "the duplicate key" resolve to a specific
+    # object on first mention instead of appearing unexplained later.
+    creation_rank, shared_types = _creation_ranks(trace)
+
     sentences = []
     for op, before, _after in trace:
         if isinstance(op, Move):
@@ -146,6 +211,15 @@ def render_narrative(
                     before,
                     names,
                     include_source=include_move_sources,
+                )
+            )
+        elif isinstance(op, Put) and op.obj_type in shared_types:
+            sentences.append(
+                render_put(
+                    op,
+                    before,
+                    names,
+                    shared_rank=creation_rank[op.obj_id],
                 )
             )
         else:

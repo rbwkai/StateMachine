@@ -981,29 +981,19 @@ def build_merge_chain(
         companion_ids.append(companion_id)
 
     # --------------------------------------------------------
-    # Merge: relocate everything from start_c to merge_dst
+    # Pre-merge target Moves
     # --------------------------------------------------------
 
-    merge_candidates = [c for c in container_list if c != start_c]
-    merge_dst = rng.choice(merge_candidates)
-
-    state = _merge(
-        state,
-        history,
-        ops,
-        start_c,
-        merge_dst,
-    )
-
-    target_current = merge_dst
-    target_updates_done = 1
-
-    # Additional target moves if target_updates > 1
-    # (Merge counts as 1; subsequent moves add to reach target_updates)
-    while target_updates_done < spec.target_updates:
-        candidates = [
-            c for c in container_list if c != target_current
-        ]
+    # The extra target updates go BEFORE the Merge, not after. A target Move
+    # after the Merge would carry the target out of the Merge destination, and
+    # the count question asks about that destination -- so the gold count would
+    # be 0 whether or not the Merge ran, and the necessity check could not tell
+    # the two traces apart. Pre-merge Moves leave the target in the destination
+    # once the Merge fires, which is what makes Merge causally necessary.
+    target_current = start_c
+    updates_done = 0
+    while updates_done < spec.target_updates - 1:
+        candidates = [c for c in container_list if c != target_current]
         if not candidates:
             break
         dst = rng.choice(candidates)
@@ -1017,7 +1007,25 @@ def build_merge_chain(
         )
 
         target_current = dst
-        target_updates_done += 1
+        updates_done += 1
+
+    # --------------------------------------------------------
+    # Merge: relocate everything from target's container to merge_dst
+    # --------------------------------------------------------
+
+    merge_candidates = [c for c in container_list if c != target_current]
+    merge_dst = rng.choice(merge_candidates)
+
+    state = _merge(
+        state,
+        history,
+        ops,
+        target_current,
+        merge_dst,
+    )
+
+    target_current = merge_dst
+    updates_done += 1
 
     # --------------------------------------------------------
 
@@ -1340,9 +1348,13 @@ def build_undo_chain(
     target_current = target_start
     updates_done = 0
 
-    # Pre-Undo moves (at least 1, at most target_updates - 1)
-    pre_undo_moves = rng.randint(1, spec.target_updates - 1)
-    for _ in range(pre_undo_moves):
+    # All target Moves precede the Undo, so the trace ends on the Undo. A
+    # trailing ordinary Move after the Undo trips check 5 ("no trailing
+    # ordinary move"), which made every generated chain get rejected and forced
+    # the generator to retry until a short chain happened to fit -- mean 12.9
+    # attempts at T=16. Reaching the requested T before the Undo also keeps T
+    # exact: target_updates - 1 Moves plus the Undo.
+    for _ in range(spec.target_updates - 1):
         candidates = [c for c in container_list if c != target_current]
         if not candidates:
             break
@@ -1351,21 +1363,11 @@ def build_undo_chain(
         target_current = dst
         updates_done += 1
 
-    # Undo operation
+    # Undo operation: the final, and only acceptable, last target-affecting op.
     state = _undo(state, history, ops)
     # Read actual target location from state after Undo (not assumed target_start)
     target_current = state.location.get(target, target_start)
     updates_done += 1
-
-    # Post-Undo moves (if any target_updates remain)
-    while updates_done < spec.target_updates:
-        candidates = [c for c in container_list if c != target_current]
-        if not candidates:
-            break
-        dst = rng.choice(candidates)
-        state = _move(state, history, ops, target, dst)
-        target_current = dst
-        updates_done += 1
 
     return ConstructedTrajectory(
         ops=ops,

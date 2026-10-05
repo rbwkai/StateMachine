@@ -14,11 +14,13 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Ensure repo root is importable regardless of where the script is run from.
@@ -30,14 +32,20 @@ if str(_REPO_ROOT) not in sys.path:
 from generator import (
     DEFAULT_MAX_ATTEMPTS,
     TrajectorySpec,
-    # probe_reachability() below asks whether a condition can be CONSTRUCTED at
-    # all, so it calls the public builder directly; it emits no instance record
-    # and therefore has no gate to run.
-    build_trajectory,
     generate_instance_with_retry,
     reset_deduplication_registry,
 )
 from world import GenerationError
+
+
+# How many gate attempts one probe seed may spend. The probe asks "can this cell
+# produce a validated instance at all", so a handful of attempts per seed is
+# enough: the release generator keeps DEFAULT_MAX_ATTEMPTS.
+PROBE_MAX_ATTEMPTS = 10
+
+# Fraction of probe seeds that must pass the gate for a cell to count as
+# reliably reachable.
+PROBE_SUCCESS_RATE = 0.8
 
 
 # ============================================================
@@ -121,12 +129,19 @@ def generate_condition(
     intended_v: Optional[int] = None,
     textual_distractor_count: int = 0,
     query_type: str = "location",
+    seed_group: str = "",
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Generate num_instances for one experimental condition.
 
     Seed calculation:
-        seed = int(sha1(f"{experiment_tag}|{condition_id}|{i}")[:8], 16)
+        seed = int(sha1(f"{experiment_tag}|{seed_group or condition_id}|{i}")[:8], 16)
+
+    ``seed_group`` names a paired design: conditions in the same group take
+    their seeds from the group key instead of their own condition id, so the
+    cells of one group build the same trace at the same instance index. That is
+    what makes an RQ cell pair differ only in the factor under test, instead of
+    also differing in the random draw (SPEC §5, RQ2 "same target trajectory").
     """
 
     # Reset deduplication registry for each new condition batch
@@ -146,7 +161,7 @@ def generate_condition(
     failures = 0
 
     for i in range(num_instances):
-        seed_key = f"{experiment_tag}|{condition_id}|{i}"
+        seed_key = f"{experiment_tag}|{seed_group or condition_id}|{i}"
         seed = int(hashlib.sha1(seed_key.encode("utf-8")).hexdigest()[:8], 16)
 
         instance_id = (
@@ -213,8 +228,208 @@ def write_jsonl(
 
 
 # ============================================================
+# Dataset manifest
+# ============================================================
+
+# Provenance is read from git, never from the environment: a manifest that
+# records an unpinned commit is worse than one that records none.
+_UNKNOWN_COMMIT = "unknown"
+
+
+def _git(*args: str) -> str:
+    """Run one read-only git command in the repo, returning trimmed stdout.
+
+    Returns an empty string outside a git checkout instead of raising, so the
+    manifest is still writable from an unpacked source tree.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=_REPO_ROOT, capture_output=True, text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _last_commit_touching(*paths: str) -> str:
+    """The commit that last touched ``paths``, or ``"unknown"``."""
+    commit = _git("log", "-1", "--format=%H", "--", *paths)
+    return commit or _UNKNOWN_COMMIT
+
+
+def _safe_dataset_name(path: Optional[Path]) -> str:
+    """A dataset name that cannot leak a home directory or machine name.
+
+    Paths come from ``--output``; only the name, or the path relative to the
+    repository root, ever reaches an artifact (AGENTS.md §9).
+    """
+    if path is None:
+        return "dataset"
+    try:
+        return path.resolve().relative_to(_REPO_ROOT).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _records_digest(records: Sequence[Dict[str, Any]]) -> str:
+    """sha1 over the serialised records: the same bytes ``write_jsonl`` writes."""
+    payload = "".join(
+        json.dumps(rec, ensure_ascii=False) + "\n" for rec in records
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _load_eval_registry() -> Dict[str, Any]:
+    """The eval model registry, loaded without importing the ``eval`` package.
+
+    ``eval/__init__.py`` eagerly imports the inference engine, which imports
+    ``torch``. Generation runs are offline and must not need torch (the
+    offline-generation test enforces it), and ``eval/models.py`` itself only
+    needs ``re`` and ``dataclasses``. The registry stays the single source of
+    pinned revisions; it is executed, never copied.
+    """
+    import importlib.util
+
+    path = _REPO_ROOT / "eval" / "models.py"
+    if not path.exists():
+        print(f"  [WARN] no model registry at {path.name}; manifest records no "
+              f"model revisions")
+        return {}
+    spec = importlib.util.spec_from_file_location("_dws_eval_models", path)
+    if spec is None or spec.loader is None:
+        print(f"  [WARN] could not load {path.name}; manifest records no "
+              f"model revisions")
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return dict(getattr(module, "CORE_MODELS", {}))
+
+
+def build_manifest(
+    records: List[Dict[str, Any]],
+    experiment_tag: str = "",
+    dataset_path: Optional[Path] = None,
+    model_keys: Optional[Sequence[str]] = None,
+    excluded_conditions: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Provenance for one generated dataset (checklist 11, SPEC §8 OPEN-12).
+
+    Records the commits that produced the data, the pinned model revisions the
+    data is meant to be evaluated with, and the per-RQ dataset hashes. Nothing
+    here depends on wall-clock time, so re-running a generation writes a
+    byte-identical manifest (determinism, AGENTS.md §6 rule 5).
+    """
+    registry = _load_eval_registry()
+
+    by_condition: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_condition[str(record.get("condition_id", ""))].append(record)
+
+    dataset_name = _safe_dataset_name(dataset_path) or experiment_tag
+
+    model_commits: Dict[str, Dict[str, str]] = {}
+    for key in model_keys or sorted(registry):
+        config = registry.get(key)
+        if config is None:
+            continue
+        model_commits[key] = {
+            "hf_model_id": config.hf_model_id,
+            "revision": config.revision,
+        }
+
+    return {
+        "experiment": experiment_tag,
+        "dataset": dataset_name,
+        "records": len(records),
+        "generator_commit": _last_commit_touching("generator", "world", "render"),
+        "evaluator_commit": _last_commit_touching("eval"),
+        "repo_commit": _git("rev-parse", "HEAD") or _UNKNOWN_COMMIT,
+        # A dirty tree means the commit alone does not reproduce the dataset.
+        "repo_clean": not _git("status", "--porcelain"),
+        "model_commits": model_commits,
+        "dataset_hashes": {
+            dataset_name: {
+                "sha1": _records_digest(records),
+                "records": len(records),
+            },
+            "by_condition": {
+                condition: {
+                    "sha1": _records_digest(condition_records),
+                    "records": len(condition_records),
+                }
+                for condition, condition_records in sorted(by_condition.items())
+            },
+        },
+        "versions": {
+            "generator": records[0].get("generator_version", "") if records else "",
+            "renderer": records[0].get("renderer_version", "") if records else "",
+            "scoring": records[0].get("scoring_version", "") if records else "",
+        },
+        "conditions": {
+            condition: {
+                "family": condition_records[0].get("family", ""),
+                "instances": len(condition_records),
+            }
+            for condition, condition_records in sorted(by_condition.items())
+        },
+        # A cell the reachability probe found unreachable is reported here, so a
+        # reader of the dataset sees the gap instead of inferring a missing cell.
+        "excluded_conditions": sorted(excluded_conditions or ()),
+    }
+
+
+def write_manifest(
+    manifest: Dict[str, Any],
+    path: Path,
+) -> None:
+    """Write a dataset manifest as JSON next to the dataset it describes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"  Wrote manifest → {path}")
+
+
+# ============================================================
 # Quick dry-run reachability probe
 # ============================================================
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Outcome of one reachability probe.
+
+    Truthy when the cell is reliably reachable, so ``if not probe_reachability(...)``
+    keeps reading as it did before this became a value object. ``excluded`` is the
+    stricter question a generation sweep needs: a cell where not one seed
+    produced a validated instance cannot generate anything at all, while a cell
+    that succeeds on some seeds still generates (and simply loses some attempts).
+    """
+
+    family: str
+    entity_count: int
+    target_updates: int
+    distractor_updates: int
+    attempted: int
+    successes: int
+    query_type: str = "location"
+
+    @property
+    def rate(self) -> float:
+        return self.successes / self.attempted if self.attempted else 0.0
+
+    @property
+    def reachable(self) -> bool:
+        return self.rate >= PROBE_SUCCESS_RATE
+
+    @property
+    def excluded(self) -> bool:
+        return self.successes == 0
+
+    def __bool__(self) -> bool:
+        return self.reachable
+
 
 def probe_reachability(
     family: str,
@@ -224,49 +439,71 @@ def probe_reachability(
     num_containers: int = 3,
     n_seeds: int = 10,
     query_type: str = "location",
-) -> bool:
+    textual_distractor_count: int = 0,
+) -> ProbeResult:
     """
-    Test whether a condition is reliably reachable (≥8/10 seeds succeed).
+    Test whether a condition is reachable through the generation gate.
 
-    Returns True if reachable, False otherwise.
-    Prints a diagnostic summary.
+    The probe runs the same validated-instance path the real generation loop
+    runs, not ``build_trajectory``. A constructor that honours the requested
+    factors can still be rejected by the gate afterwards (``SPEC.md`` OPEN-20:
+    that is exactly how ``merge_chain`` fails), and a probe that stops at the
+    constructor reports such a cell as reachable and the grid then ships an
+    empty condition.
+
+    Returns a ``ProbeResult``; prints a diagnostic summary.
     """
     successes = 0
     errors = []
 
     for i in range(n_seeds):
-        seed_key = f"probe|{family}|{i}"
+        seed_key = f"probe|{family}|T{target_updates}|D{distractor_updates}|{query_type}|{i}"
         seed = int(hashlib.sha1(seed_key.encode("utf-8")).hexdigest()[:8], 16)
-        rng = random.Random(seed)
+        # The dedup registry is process-global and rejects a repeat trace_hash;
+        # each probe seed must be judged on its own.
+        reset_deduplication_registry()
         try:
-            total_updates = target_updates + distractor_updates
-            spec = TrajectorySpec(
+            generate_instance(
+                seed=seed,
+                instance_id=f"probe_{family}_T{target_updates}_D{distractor_updates}_i{i}",
                 family=family,
                 entity_count=entity_count,
-                num_containers=num_containers,
-                total_updates=total_updates,
                 target_updates=target_updates,
                 distractor_updates=distractor_updates,
+                num_containers=num_containers,
+                experiment_tag="probe",
+                condition_id=f"{family}_T{target_updates}_D{distractor_updates}",
+                textual_distractor_count=textual_distractor_count,
+                max_attempts=PROBE_MAX_ATTEMPTS,
                 query_type=query_type,
             )
-            build_trajectory(rng, spec)
             successes += 1
-        except Exception as exc:
+        except GenerationError as exc:
+            errors.append(f"seed={seed}: {exc}")
+        except Exception as exc:  # a builder bug must not read as "reachable"
             errors.append(f"seed={seed}: {exc!r}")
 
-    rate = successes / n_seeds
-    status = "OK" if rate >= 0.8 else "FAIL"
+    result = ProbeResult(
+        family=family,
+        entity_count=entity_count,
+        target_updates=target_updates,
+        distractor_updates=distractor_updates,
+        attempted=n_seeds,
+        successes=successes,
+        query_type=query_type,
+    )
 
     print(
-        f"  [{status}] {family} E={entity_count} T={target_updates} "
-        f"D={distractor_updates} — {successes}/{n_seeds} succeeded"
+        f"  [{'OK' if result.reachable else 'FAIL'}] {family} E={entity_count} "
+        f"T={target_updates} D={distractor_updates} — "
+        f"{successes}/{n_seeds} succeeded"
     )
 
     if errors:
         for e in errors[:3]:
             print(f"    {e}")
 
-    return rate >= 0.8
+    return result
 
 
 # ============================================================

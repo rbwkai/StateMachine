@@ -55,9 +55,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from experiments._common import (
+    ProbeResult,
+    build_manifest,
     generate_condition,
     probe_reachability,
     write_jsonl,
+    write_manifest,
     verify_generated_records,
     print_factor_summary,
 )
@@ -89,6 +92,11 @@ LENGTH_MATCHED = True
 # Secondary analysis: superseded-state pairs
 # revision family at same T=8 with/without revision
 SUPERSESSION_FAMILIES = [("revision", 1, [8], "Superseded-state interference")]
+
+# Seed group of the D x N design. Cells in this group share their seeds (see
+# experiments._common.generate_condition), which is how "same target trajectory
+# in the D, N and baseline cells" is realised.
+TARGET_TRAJECTORY = f"{FAMILY}_T{TARGET_UPDATES}_E{ENTITY_COUNT}"
 
 
 def main():
@@ -152,24 +160,25 @@ def main():
 
     print("\n[Step 1] Reachability probe (10 seeds × each condition)…")
 
-    probe_results: Dict[str, bool] = {}
+    probe_results: Dict[str, ProbeResult] = {}
 
     for D, N, tag, label in conditions:
-        ok = probe_reachability(
+        probe_results[tag] = probe_reachability(
             family=FAMILY,
             entity_count=ENTITY_COUNT,
             target_updates=TARGET_UPDATES,
             distractor_updates=D,
             num_containers=NUM_CONTAINERS,
             n_seeds=10,
+            # Probe the cell the sweep generates, narrative distractors included.
+            textual_distractor_count=N,
         )
-        probe_results[tag] = ok
 
     # Supersession conditions
     for fam, E, T_levels, desc in SUPERSESSION_FAMILIES:
         for T in T_levels:
             key = f"{fam}_T{T}"
-            ok = probe_reachability(
+            probe_results[key] = probe_reachability(
                 family=fam,
                 entity_count=E,
                 target_updates=T,
@@ -177,22 +186,34 @@ def main():
                 num_containers=3,
                 n_seeds=10,
             )
-            probe_results[key] = ok
 
-    failed = [k for k, ok in probe_results.items() if not ok]
+    # Same rule as RQ1: a cell no probe seed can generate is excluded from the
+    # sweep and named in the manifest; a cell that generates on some seeds is
+    # kept and its shortfall is counted during generation.
+    unreachable = sorted(k for k, r in probe_results.items() if r.excluded)
+    degraded = sorted(
+        k for k, r in probe_results.items() if not r.excluded and not r.reachable
+    )
 
-    if failed:
+    if unreachable:
         print()
         print("=" * 75)
-        print("[HALT] The following conditions failed the reachability probe:")
-        for f in failed:
-            print(f"  ✗  {f}")
-        print()
-        print("Experiment aborted — no instances generated.")
+        print("[EXCLUDED] These conditions cannot generate a validated instance:")
+        for key in unreachable:
+            print(f"  ✗  {key}")
+        print("They are excluded from this run and listed in the manifest.")
         print("=" * 75)
-        sys.exit(1)
 
-    print("\n  All conditions passed the reachability probe ✓")
+    if degraded:
+        print(f"\n[WARN] {len(degraded)} condition(s) generate on some seeds only "
+              f"({', '.join(degraded)}); expect a shortfall against "
+              f"{args.instances} instances/cond.")
+
+    if unreachable or degraded:
+        kept = len(probe_results) - len(unreachable)
+        print(f"\n  {kept}/{len(probe_results)} conditions passed the reachability probe ✓")
+    else:
+        print("\n  All conditions passed the reachability probe ✓")
 
     if args.dry_run:
         print("\n[DRY-RUN] Probe complete. No instances generated.")
@@ -214,6 +235,10 @@ def main():
     for i, (D, N, tag, label) in enumerate(conditions):
         print(f"\n  Condition {i+1}/{len(conditions)}: {label}")
 
+        if tag in unreachable:
+            print(f"  [SKIP] {label} — excluded by the reachability probe")
+            continue
+
         condition_id = tag
         condition_label = f"{FAMILY} E={ENTITY_COUNT} T={TARGET_UPDATES} {label}"
 
@@ -228,6 +253,10 @@ def main():
             num_containers=NUM_CONTAINERS,
             condition_label=condition_label,
             textual_distractor_count=N,
+            # Paired design: every D and N cell draws from the same seed group,
+            # so cell i of every condition builds the same target trajectory and
+            # the cells differ only in the distractor factors under test.
+            seed_group=TARGET_TRAJECTORY,
         )
 
         all_records.extend(records)
@@ -252,6 +281,10 @@ def main():
     for fam, E, T_levels, desc in SUPERSESSION_FAMILIES:
         for T in T_levels:
             print(f"\n  Supersession condition: {fam} T={T}")
+
+            if f"{fam}_T{T}" in unreachable:
+                print(f"  [SKIP] {fam} T={T} — excluded by the reachability probe")
+                continue
 
             condition_id = f"{fam}_T{T}"
             condition_label = f"{fam} E={E} T={T} {desc}"
@@ -294,6 +327,8 @@ def main():
     print("RQ2 GENERATION COMPLETE")
     print(f"  Total generated : {len(all_records)}")
     print(f"  Total failures  : {total_failures}")
+    print(f"  Excluded cells  : {len(unreachable)}"
+          + (f" ({', '.join(unreachable)})" if unreachable else ""))
     print(f"  Elapsed         : {elapsed:.1f}s")
     print("=" * 75)
 
@@ -348,6 +383,18 @@ def main():
     print_factor_summary(all_records)
 
     write_jsonl(all_records, output_path)
+
+    # The manifest travels with the dataset so a release can be traced back to
+    # the code, the pinned models and the hashes that produced it.
+    write_manifest(
+        build_manifest(
+            all_records,
+            experiment_tag=EXPERIMENT_TAG,
+            dataset_path=output_path,
+            excluded_conditions=unreachable,
+        ),
+        output_path.parent / "manifest.json",
+    )
 
 
 if __name__ == "__main__":
