@@ -441,11 +441,18 @@ def _count_revisits(locations: List[str]) -> int:
 # Count-query target (SPEC §2; single source of truth)
 # ============================================================
 
+# Families whose count question is anchored on the Merge destination. For these,
+# a trace with no Merge cannot answer a count question, so the container is
+# reported as undetermined rather than silently guessed from the target.
+MERGE_ANCHORED_COUNT_FAMILIES = frozenset({"split_chain", "merge_chain"})
+
+
 def count_query_target(
+    family: str,
     ops: Sequence[Operation],
     final_state: WorldState,
     target_obj: str,
-) -> Tuple[str, str]:
+) -> Optional[Tuple[str, str]]:
     """Return ``(container, obj_type)`` that a count question asks about.
 
     One rule, shared by the renderer, the step-wise gold and the structural
@@ -454,21 +461,21 @@ def count_query_target(
     renderer hard-coded ``split_chain`` and structural.py carried a second copy
     of the rule, so a ``count`` cell could be rendered as a location question.
 
-    The container is the first ``Merge`` destination when the trace contains a
-    ``Merge`` (``split_chain``, ``merge_chain``): that is where the structural
-    operation determines the population. Otherwise it is the target's own final
-    container (``swap_chain``, ``undo_chain``).
+    Returns ``None`` when the container cannot be determined: a merge-anchored
+    family whose trace contains no ``Merge``. Callers decide what that means --
+    the renderer rejects the instance, the necessity check falls back to
+    comparing locations.
     """
     for op in ops:
         if isinstance(op, Merge):
             return op.dst_container, final_state.object_type[target_obj]
 
+    if family in MERGE_ANCHORED_COUNT_FAMILIES:
+        return None
+
     container = final_state.location.get(target_obj)
     if container is None:
-        raise GenerationError(
-            f"count query has no container to ask about: target {target_obj!r} "
-            "has no location and the trace contains no Merge"
-        )
+        return None
     return container, final_state.object_type[target_obj]
 
 

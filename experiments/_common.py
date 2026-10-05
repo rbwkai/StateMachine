@@ -423,6 +423,12 @@ def verify_generated_records(
                         total_updates=r["spec"]["total_updates"],
                         target_updates=r["spec"]["target_updates"],
                         distractor_updates=r["spec"]["distractor_updates"],
+                        # The re-check must ask the question the record asked.
+                        # Omitting it defaulted to "location", so a count cell
+                        # was re-validated as a location query and "necessity
+                        # failed" fired on every split_chain instance, making
+                        # RQ1 exit non-zero after generating.
+                        query_type=r["spec"].get("query_type", "location"),
                     )
                     ops = []
                     for op_dict in r["canonical_trace"]:

@@ -425,11 +425,18 @@ def build_validated_instance(
         # numeric gold.
         trace, _, _ = replay_trace(trajectory.ops, trajectory.containers)
         if spec.query_type == "count":
-            probe = CountQuery(
-                *count_query_target(
-                    trajectory.ops, trajectory.final_state, trajectory.target_obj
-                )
+            count_target = count_query_target(
+                spec.family,
+                trajectory.ops,
+                trajectory.final_state,
+                trajectory.target_obj,
             )
+            if count_target is None:
+                raise AssertionError(
+                    f"count query for {spec.family!r} has no container to ask "
+                    "about: the trace contains no Merge"
+                )
+            probe = CountQuery(*count_target)
             op_step_wise_gold_answers = [str(probe.read(after)) for _, _, after in trace]
         else:
             op_step_wise_gold_answers = [
@@ -577,9 +584,17 @@ def build_validated_instance(
     # split_chain, so undo_chain, swap_chain and merge_chain built with
     # query_type="count" still rendered "Where is ...?" with a container as gold.
     if spec.query_type == "count":
-        count_container, count_type = count_query_target(
-            trajectory.ops, final_state, trajectory.target_obj
+        count_target = count_query_target(
+            spec.family,
+            trajectory.ops,
+            final_state,
+            trajectory.target_obj,
         )
+        if count_target is None:
+            raise AssertionError(
+                f"count query for {spec.family!r} has no container to ask about"
+            )
+        count_container, count_type = count_target
         question = question_count(count_container, count_type, names)
         gold_answer = str(gold_count(final_state, count_container, count_type))
         target_container = count_container

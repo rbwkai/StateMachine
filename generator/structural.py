@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from typing import List, Sequence, Set, Tuple
 
-from world import InvalidOperation, Merge, Operation, WorldState, replay_trace
+from world import (
+    InvalidOperation,
+    Merge,
+    Operation,
+    WorldState,
+    gold_count,
+    replay_trace,
+)
 
 from .dataset_spec import REQUIRED_STRUCTURAL_OPS
+from .metadata import count_query_target
 from .trajectory_specs import TrajectorySpec
 
 Trace = Sequence[Tuple[Operation, WorldState, WorldState]]
@@ -129,29 +137,22 @@ def validate_structural_causality(
                 # This is acceptable - the operation is required for validity.
                 continue
             
-            # For count queries (split_chain, merge_chain), the gold answer is the count
-            # in the query container (merge destination), not the target's location.
-            if spec.query_type == "count":
-                # Find the merge destination container
-                merge_ops = [op for op in ops if isinstance(op, Merge)]
-                if merge_ops:
-                    merge_dst = merge_ops[0].dst_container
-                    # Count objects of the target's type in the merge destination
-                    target_type = final_state.object_type.get(target_obj)
-                    gold_final = sum(
-                        1 for oid, typ in final_state.object_type.items()
-                        if typ == target_type and final_state.location.get(oid) == merge_dst
-                    )
-                    cf_final = sum(
-                        1 for oid, typ in counterfactual.object_type.items()
-                        if typ == target_type and counterfactual.location.get(oid) == merge_dst
-                    )
-                else:
-                    # Fallback to location if no merge
-                    gold_final = final_state.location.get(target_obj)
-                    cf_final = counterfactual.location.get(target_obj)
+            # Compare the answer the question actually asks: a count cell is
+            # compared as a count, a location cell as a location. The count
+            # container comes from the shared helper, so the necessity check and
+            # the rendered gold can never drift apart. A merge-anchored family
+            # whose trace has no Merge leaves the container undetermined, and a
+            # trace that cannot answer its own question has nothing to compare.
+            count_target = (
+                count_query_target(family, ops, final_state, target_obj)
+                if spec.query_type == "count"
+                else None
+            )
+            if count_target is not None:
+                count_container, count_type = count_target
+                gold_final = gold_count(final_state, count_container, count_type)
+                cf_final = gold_count(counterfactual, count_container, count_type)
             else:
-                # Location query: gold answer is target's container
                 gold_final = final_state.location.get(target_obj)
                 cf_final = counterfactual.location.get(target_obj)
             
@@ -161,39 +162,6 @@ def validate_structural_causality(
                     f"index={found_idx}, op={trace[found_idx][0]!r}, "
                     f"check=necessity failed (answer unchanged: {gold_final!r})"
                 )
-        
-        # For count queries (split_chain, merge_chain), the gold answer is the count
-        # in the query container (merge destination), not the target's location.
-        if spec.query_type == "count":
-            # Find the merge destination container
-            merge_ops = [op for op in ops if isinstance(op, Merge)]
-            if merge_ops:
-                merge_dst = merge_ops[0].dst_container
-                # Count objects of the target's type in the merge destination
-                target_type = final_state.object_type.get(target_obj)
-                gold_final = sum(
-                    1 for oid, typ in final_state.object_type.items()
-                    if typ == target_type and final_state.location.get(oid) == merge_dst
-                )
-                cf_final = sum(
-                    1 for oid, typ in counterfactual.object_type.items()
-                    if typ == target_type and counterfactual.location.get(oid) == merge_dst
-                )
-            else:
-                # Fallback to location if no merge
-                gold_final = final_state.location.get(target_obj)
-                cf_final = counterfactual.location.get(target_obj)
-        else:
-            # Location query: gold answer is target's container
-            gold_final = final_state.location.get(target_obj)
-            cf_final = counterfactual.location.get(target_obj)
-        
-        if cf_final == gold_final:
-            raise ValueError(
-                f"structural causality failure: family={family!r}, "
-                f"index={found_idx}, op={trace[found_idx][0]!r}, "
-                f"check=necessity failed (answer unchanged: {gold_final!r})"
-            )
 
     # check 5: a trailing ordinary Move must not be the final determinant.
     # Run after the counterfactual replays because Move writes an absolute
