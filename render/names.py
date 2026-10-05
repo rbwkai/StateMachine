@@ -58,7 +58,13 @@ class NameRegistry:
             elif idx == 1:
                 return f"the duplicate {obj_type}"
             else:
-                return f"the {idx+1}th {obj_type}"
+                # Proper ordinal suffix
+                n = idx + 1
+                if 10 <= n % 100 <= 20:
+                    suffix = "th"
+                else:
+                    suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+                return f"the {n}{suffix} {obj_type}"
         return f"the {obj_type}"
 
 
@@ -82,28 +88,19 @@ def make_distractor_sentences(
     exclude_container: str = None,
 ) -> List[str]:
     """
-    Generate distractor sentences, EXCLUDING a specific container name
+    Generate distractor sentences that do not name any containers,
     to prevent answer leakage via elimination.
     """
     sentences = []
-    all_containers = list(names.container_names.values())
-    if exclude_container and exclude_container in all_containers:
-        all_containers.remove(exclude_container)
     unrelated_types = [
         t for t in OBJECT_TYPES if t not in used_object_types
     ] or OBJECT_TYPES
 
     for _ in range(n):
-        if rng.random() < 0.5 and all_containers:
-            c = rng.choice(all_containers)
-            sentences.append(
-                f"{c.capitalize()} {rng.choice(DISTRACTOR_FLAVOR)}."
-            )
-        else:
-            t = rng.choice(unrelated_types)
-            sentences.append(
-                f"Someone mentioned that {pluralize_object(t)} have become harder to find lately."
-            )
+        t = rng.choice(unrelated_types)
+        sentences.append(
+            f"Someone mentioned that {pluralize_object(t)} have become harder to find lately."
+        )
     return sentences
 
 
@@ -114,43 +111,19 @@ def splice_distractors(
 ) -> List[str]:
     """
     Splice distractor sentences into op sentences at random positions.
-    
-    Uses a more efficient O(n+m) algorithm by generating all insertion positions
-    upfront and then building the result in a single pass.
+
+    Uses sequential insertion to maintain the correct distribution:
+    each distractor is inserted at a uniformly random position in the
+    current sequence (which grows by one each time).
     """
     if not distractor_sentences:
         return list(op_sentences)
     
-    n_ops = len(op_sentences)
-    n_dist = len(distractor_sentences)
+    result = list(op_sentences)
+    for dist_sentence in distractor_sentences:
+        pos = rng.randint(0, len(result))
+        result.insert(pos, dist_sentence)
     
-    # Generate all insertion positions upfront (between 0 and n_ops + i for i-th distractor)
-    # This maintains the same distribution as the original sequential insert
-    positions = []
-    for i in range(n_dist):
-        pos = rng.randint(0, n_ops + i)
-        positions.append(pos)
-    
-    # Sort positions with their distractors to process in order
-    indexed_positions = list(zip(positions, distractor_sentences))
-    indexed_positions.sort(key=lambda x: x[0])
-    
-    # Build result in single pass
-    result = []
-    op_idx = 0
-    dist_idx = 0
-    
-    for pos, dist_sentence in indexed_positions:
-        # Add op sentences up to the insertion position
-        while op_idx < n_ops and op_idx <= pos - dist_idx:
-            result.append(op_sentences[op_idx])
-            op_idx += 1
-        result.append(dist_sentence)
-        dist_idx += 1
-    
-    # Add remaining op sentences
-    while op_idx < n_ops:
-        result.append(op_sentences[op_idx])
-        op_idx += 1
+    return result
     
     return result

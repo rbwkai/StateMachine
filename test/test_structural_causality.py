@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import random
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pytest
 
@@ -22,26 +28,51 @@ def _run_once(family: str, seed: int):
             target_updates=3,
             distractor_updates=0,
             min_interleaving=0.0,
+            query_type="count",
+        )
+    elif family == "merge_chain":
+        spec = TrajectorySpec(
+            family=family,
+            entity_count=2,
+            num_containers=3,
+            total_updates=3,
+            target_updates=1,
+            distractor_updates=0,
+            min_interleaving=0.0,
+            query_type="count",
+        )
+    elif family == "swap_chain":
+        spec = TrajectorySpec(
+            family=family,
+            entity_count=2,
+            num_containers=3,
+            total_updates=3,
+            target_updates=1,
+            distractor_updates=0,
+            min_interleaving=0.0,
+            query_type="count",
         )
     elif family == "undo_chain":
         spec = TrajectorySpec(
             family=family,
             entity_count=1,
             num_containers=3,
-            total_updates=5,
-            target_updates=3,
+            total_updates=3,
+            target_updates=2,
             distractor_updates=0,
             min_interleaving=0.0,
+            query_type="count",
         )
     elif family == "undo_redo_chain":
         spec = TrajectorySpec(
             family=family,
             entity_count=1,
             num_containers=3,
-            total_updates=5,
-            target_updates=5,
+            total_updates=7,
+            target_updates=6,
             distractor_updates=0,
             min_interleaving=0.0,
+            query_type="location",
         )
     else:
         spec = TrajectorySpec(
@@ -74,7 +105,7 @@ def test_presence_fires():
         Put(obj_id="o1", obj_type="X", container="c1"),
     ]
     spec = TrajectorySpec(
-        family="split_chain", entity_count=2, num_containers=3, total_updates=2, target_updates=2
+        family="split_chain", entity_count=2, num_containers=3, total_updates=3, target_updates=3, query_type="count"
     )
     try:
         validate_structural_causality(ops, containers, "o1", spec)
@@ -91,7 +122,7 @@ def test_target_effect_fires():
         Split(source_obj_id="o0", new_obj_id="o2"),
     ]
     spec = TrajectorySpec(
-        family="split_chain", entity_count=2, num_containers=3, total_updates=2, target_updates=2
+        family="split_chain", entity_count=2, num_containers=3, total_updates=3, target_updates=3, query_type="count"
     )
     with pytest.raises(ValueError, match="check=target_effect"):
         validate_structural_causality(ops, containers, "o99", spec)
@@ -108,7 +139,7 @@ def test_necessity_fires():
         Merge(src_container="c0", dst_container="c1"),
     ]
     spec = TrajectorySpec(
-        family="swap_chain", entity_count=2, num_containers=3, total_updates=5, target_updates=5
+        family="swap_chain", entity_count=2, num_containers=3, total_updates=5, target_updates=5, query_type="count"
     )
     # gold: o0 ends in c1 both with and without the last Swap.
     with pytest.raises(ValueError, match="check=necessity"):
@@ -121,8 +152,8 @@ def test_unrelated_exempt_passes():
         family="undo_redo_chain",
         entity_count=1,
         num_containers=3,
-        total_updates=5,
-        target_updates=5,
+        total_updates=7,
+        target_updates=6,
         distractor_updates=1,
     )
     res = build_trajectory(rng, spec)
@@ -130,15 +161,23 @@ def test_unrelated_exempt_passes():
 
 
 def test_no_trailing_move_fires():
+    """Test that a trailing Move after a required operation triggers the check.
+    
+    For the new count-query families, the structural operation is the final
+    target-affecting operation, so there's no trailing Move. This test verifies
+    the check using merge_chain with a trailing Move manually added.
+    """
+    # merge_chain requires count query, but we can manually construct a case
+    # with a trailing Move to test the check
     containers = {"c0", "c1", "c2"}
     ops = [
         Put(obj_id="o0", obj_type="X", container="c0"),
-        Put(obj_id="o1", obj_type="X", container="c1"),
-        Swap(container_a="c0", container_b="c1"),
-        Move(obj_id="o0", dst="c2"),
+        Put(obj_id="o1", obj_type="X", container="c0"),
+        Merge(src_container="c0", dst_container="c1"),  # required merge
+        Move(obj_id="o0", dst="c2"),  # trailing move - final determinant
     ]
     spec = TrajectorySpec(
-        family="swap_chain", entity_count=2, num_containers=3, total_updates=4, target_updates=4
+        family="merge_chain", entity_count=2, num_containers=3, total_updates=3, target_updates=2, query_type="count"
     )
     with pytest.raises(ValueError, match="check=no_trailing_ordinary_move"):
         validate_structural_causality(ops, containers, "o0", spec)
@@ -153,11 +192,16 @@ def test_split_child_target():
         total_updates=3,
         target_updates=3,
         distractor_updates=0,
+        query_type="count",
     )
     res = build_trajectory(rng, spec)
     split_ops = [op for op in res.ops if isinstance(op, Split)]
     assert split_ops
-    assert split_ops[0].new_obj_id == res.target_obj
+    # In the new split_chain, the target is the original object, not the child
+    # The child is the new_obj_id from Split
+    split_ops = [op for op in res.ops if isinstance(op, Split)]
+    assert split_ops
+    assert split_ops[0].source_obj_id == res.target_obj
 
 
 def test_undo_redo_both():
@@ -167,8 +211,8 @@ def test_undo_redo_both():
             family="undo_redo_chain",
             entity_count=1,
             num_containers=3,
-            total_updates=5,
-            target_updates=5,
+            total_updates=7,
+            target_updates=6,
             distractor_updates=0,
         )
         res = build_trajectory(rng, spec)
@@ -184,17 +228,18 @@ def test_determinism():
                 family=family,
                 entity_count=2,
                 num_containers=3,
-                total_updates=4,
-                target_updates=4,
+                total_updates=3,
+                target_updates=3,
                 distractor_updates=0,
+                query_type="count",
             )
         else:
             spec = TrajectorySpec(
                 family=family,
                 entity_count=1,
                 num_containers=3,
-                total_updates=5,
-                target_updates=5,
+                total_updates=7,
+                target_updates=6,
                 distractor_updates=0,
             )
         r1 = build_trajectory(rng1, spec)

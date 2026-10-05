@@ -70,7 +70,7 @@ RQ1_FAMILIES: List[Tuple[str, int, List[int], str]] = [
     ("merge_chain",     2, [4, 8, 12, 16],       "Identity consolidation via Merge"),
     ("swap_chain",      2, [4, 8, 12, 16],       "Bilateral exchange via Swap"),
     ("undo_chain",      1, [4, 8, 12, 16],       "Rollback/contradiction via Undo"),
-    ("undo_redo_chain", 1, [4, 8, 12, 16],       "3-way edit history via Undo+Redo"),
+    ("undo_redo_chain", 1, [6, 8, 12, 16],       "3-way edit history via Undo+Redo"),
 ]
 
 DISTRACTOR_UPDATES = 0
@@ -87,6 +87,18 @@ FAMILY_CONTAINERS = {
     "swap_chain": 3,
     "undo_chain": 3,
     "undo_redo_chain": 3,
+}
+
+# Family-specific query types
+FAMILY_QUERY_TYPES = {
+    "split_chain": "count",
+    "merge_chain": "count",
+    "swap_chain": "count",
+    "undo_chain": "count",
+    "basic_chain": "location",
+    "revision": "location",
+    "interleaved_chain": "location",
+    "undo_redo_chain": "location",
 }
 
 
@@ -143,6 +155,7 @@ def main():
         num_containers = FAMILY_CONTAINERS[family]
         for T in T_levels:
             key = f"{family}_T{T}"
+            query_type = FAMILY_QUERY_TYPES.get(family, "location")
             ok = probe_reachability(
                 family=family,
                 entity_count=E,
@@ -150,6 +163,7 @@ def main():
                 distractor_updates=DISTRACTOR_UPDATES,
                 num_containers=num_containers,
                 n_seeds=10,
+                query_type=query_type,
             )
             probe_results[key] = ok
 
@@ -196,10 +210,12 @@ def main():
         family_failures = 0
 
         for T in T_levels:
-            condition_id = f"T{T}"
+            # Use default condition_id which includes family
             condition_label = (
                 f"{family} E={E} T={T} D={DISTRACTOR_UPDATES}"
             )
+
+            query_type = FAMILY_QUERY_TYPES.get(family, "location")
 
             records, failures = generate_condition(
                 family=family,
@@ -212,6 +228,7 @@ def main():
                 num_containers=num_containers,
                 condition_label=condition_label,
                 textual_distractor_count=TEXTUAL_DISTRACTORS,
+                query_type=query_type,
             )
 
             all_records.extend(records)

@@ -159,6 +159,16 @@ def classify_op(
     """
     target_after = location_after.get(target_obj)
     affects_target = location_before.get(target_obj) != target_after
+    
+    # Split special case: target is source or new child
+    if isinstance(op, Split):
+        if getattr(op, "source_obj_id", None) == target_obj:
+            affects_target = True
+        if getattr(op, "new_obj_id", None) == target_obj:
+            affects_target = True
+            # For new child, target_after is the location where it was created
+            target_after = location_after.get(target_obj)
+    
     return TargetEffect(
         affects_target=affects_target,
         location_after=target_after,

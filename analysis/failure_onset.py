@@ -58,22 +58,17 @@ def compute_failure_onset(
     tau: float = 0.70,
 ) -> Optional[Union[int, float]]:
     """
-    Compute failure onset L_f = min { x : A(x) < tau and stays below tau }.
-    
+    Compute failure onset L_f = min { x : A(x) < tau }.
+
     Assumes x_values and accuracies are sorted in increasing order of difficulty x.
-    Uses a "sustained failure" criterion: the first x where accuracy drops below tau
-    and does not recover above tau for the remaining x values.
+    Returns the first x where accuracy drops below tau (per SPEC §7).
     """
     if len(x_values) != len(accuracies):
         raise ValueError("x_values and accuracies must have identical length")
 
-    for i, (x, acc) in enumerate(zip(x_values, accuracies)):
+    for x, acc in zip(x_values, accuracies):
         if acc < tau:
-            # Check if accuracy recovers above tau after this point
-            recovers = any(a >= tau for a in accuracies[i+1:])
-            if not recovers:
-                return x
-            # If it recovers, continue searching for a sustained failure
+            return x
     
     return None
 

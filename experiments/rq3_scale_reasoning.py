@@ -35,7 +35,7 @@ Usage:
   python3 experiments/rq3_scale_reasoning.py --model qwen2.5-3b --prompt direct
   python3 experiments/rq3_scale_reasoning.py --model qwen2.5-3b --prompt structured
   python3 experiments/rq3_scale_reasoning.py --all-models --all-prompts
-  python3 experiments/rq3_scale_reasoning.py --analyze-results
+  python3 experiments/rq3_scale_reasoning.py --analyze
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Import eval modules
 from eval.engine import create_engine
-from eval.eval_harness import evaluate_predictions
+from eval.eval_harness import evaluate_predictions, format_prompt
 from eval.models import ModelConfig, CORE_MODELS
 from eval.scoring import score_prediction
 
@@ -85,15 +85,14 @@ REPRESENTATIVE_CONDITIONS: List[Tuple[str, str, str]] = [
     ("rq1_mutation_depth", "T8", "basic_chain T=8"),
     ("rq1_mutation_depth", "T16", "basic_chain T=16"),
     # RQ2: interference
-    ("rq2_interference", "D0", "D=0 N=0 (baseline)"),
     ("rq2_interference", "D4", "D=4 N=0 (state distractors)"),
     ("rq2_interference", "D8", "D=8 N=0"),
     ("rq2_interference", "D16", "D=16 N=0"),
     ("rq2_interference", "D4_N4", "D=4 N=4 (narrative distractors)"),
     ("rq2_interference", "D4_N8", "D=4 N=8"),
     ("rq2_interference", "D4_N16", "D=4 N=16"),
-    # RQ2: supersession
-    ("rq2_supersession", "revision_T8", "Superseded state (revision T=8)"),
+    # RQ2: supersession - revision at T=8
+    ("rq2_interference", "revision_T8", "Superseded state (revision T=8)"),
 ]
 
 DEVICE = "cuda"
@@ -158,23 +157,34 @@ def run_evaluation(
 
         # Format prompts
         prompts = []
+        instance_ids = []
         for rec in records:
-            if prompt_mode == "structured":
-                # Use CoT prompt template
-                from eval.prompts import format_prompt_v2_cot
-                prompt = format_prompt_v2_cot(rec["context"], rec["question"])
-            else:
-                # Use direct prompt template
-                from eval.prompts import format_prompt_v2
-                prompt = format_prompt_v2(rec["context"], rec["question"])
-            prompts.append({"instance_id": rec["instance_id"], "prompt": prompt})
+            chain_of_thought = (prompt_mode == "structured")
+            prompt = format_prompt(
+                context=rec["context"],
+                question=rec["question"],
+                system_prompt=model_cfg.system_prompt,
+                chain_of_thought=chain_of_thought,
+                prompt_version="v2",
+            )
+            prompts.append(prompt)
+            instance_ids.append(rec["instance_id"])
 
         # Run inference
         try:
-            predictions = engine.generate_batch(prompts, batch_size=BATCH_SIZE)
+            raw_predictions = engine.generate_batch(prompts, max_new_tokens=MAX_NEW_TOKENS)
         except Exception as e:
             print(f"    [ERROR] Generation failed: {e}")
             continue
+
+        # Convert raw predictions to prediction dicts
+        predictions = []
+        for iid, raw_pred in zip(instance_ids, raw_predictions):
+            predictions.append({
+                "instance_id": iid,
+                "pred_answer": raw_pred,
+                "raw_prediction": raw_pred,
+            })
 
         # Score predictions
         scored = evaluate_predictions(records, predictions, chain_of_thought=(prompt_mode == "structured"))

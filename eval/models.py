@@ -43,49 +43,45 @@ class ModelConfig:
     )
 
 
-# 5 Core Models (§13); revisions pinned to specific commits 
-# NOTE: These revision hashes are PLACEHOLDERS and MUST be replaced with actual
-# commit hashes from the respective model repositories on Hugging Face Hub.
-# To find the correct commit hash:
-#   1. Go to the model page on huggingface.co (e.g., https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
-#   2. Click on "Files and versions" → "History" or use the API
-#   3. Copy the full commit hash (40-char SHA)
-# Example: "7b3c8d8e1f2a4b5c6d7e8f9a0b1c2d3e4f5a6b7c"
+# 5 Core Models (§13); revisions pinned to specific commits.
+# Hashes below are the current `sha` of each repository on the Hugging Face Hub,
+# read from https://huggingface.co/api/models/<id>. Re-pin deliberately before a
+# release run; a wrong revision makes from_pretrained fail loudly, not silently.
 CORE_MODELS: Dict[str, ModelConfig] = {
     "qwen2.5-0.5b": ModelConfig(
         name="qwen2.5-0.5b",
         hf_model_id="Qwen/Qwen2.5-0.5B-Instruct",
         family="qwen",
         parameter_count_b=0.5,
-        revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",  # REPLACE with actual commit hash
+        revision="7ae557604adf67be50417f59c2c2f167def9a775",
     ),
     "qwen2.5-3b": ModelConfig(
         name="qwen2.5-3b",
         hf_model_id="Qwen/Qwen2.5-3B-Instruct",
         family="qwen",
         parameter_count_b=3.0,
-        revision="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",  # REPLACE with actual commit hash
+        revision="aa8e72537993ba99e69dfaafa59ed015b17504d1",
     ),
     "qwen2.5-7b": ModelConfig(
         name="qwen2.5-7b",
         hf_model_id="Qwen/Qwen2.5-7B-Instruct",
         family="qwen",
         parameter_count_b=7.0,
-        revision="cccccccccccccccccccccccccccccccccccccccc",  # REPLACE with actual commit hash
+        revision="a09a35458c702b33eeacc393d103063234e8bc28",
     ),
     "llama-3.2-3b": ModelConfig(
         name="llama-3.2-3b",
         hf_model_id="meta-llama/Llama-3.2-3B-Instruct",
         family="llama",
         parameter_count_b=3.2,
-        revision="dddddddddddddddddddddddddddddddddddddddd",  # REPLACE with actual commit hash
+        revision="0cb88a4f764b7a12671c53f0838cd831a0843b95",
     ),
     "olmo-2-1b": ModelConfig(
         name="olmo-2-1b",
         hf_model_id="allenai/OLMo-2-0425-1B",
         family="olmo",
         parameter_count_b=1.0,
-        revision="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # REPLACE with actual commit hash
+        revision="a1847dff35000b4271fa70afc5db10fd29fedbdf",
     ),
 }
 
@@ -96,13 +92,13 @@ OPTIONAL_MODELS: Dict[str, ModelConfig] = {
         hf_model_id="microsoft/Phi-4-mini-instruct",
         family="phi",
         parameter_count_b=3.8,
-        revision="ffffffffffffffffffffffffffffffffffffffff",  # REPLACE with actual commit hash
+        revision="cfbefacb99257ffa30c83adab238a50856ac3083",
     ),
     "olmo-2-7b": ModelConfig(
         name="olmo-2-7b",
         hf_model_id="allenai/OLMo-2-1124-7B-Instruct",
         family="olmo",
         parameter_count_b=7.0,
-        revision="gggggggggggggggggggggggggggggggggggggggg",  # REPLACE with actual commit hash
+        revision="470b1fba1ae01581f270116362ee4aa1b97f4c84",
     ),
 }

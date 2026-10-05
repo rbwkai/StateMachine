@@ -58,13 +58,14 @@ from generator.constants import SCORING_VERSION
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Paths mirror the producers in generate_all.py / experiments/*.py. The distractor
+# sweep has no separate producer: it is the interleaved_chain family inside
+# rq2_interference.jsonl, so 'rq3' is an alias for the same file.
 DATASET_SHORTCUTS = {
     "full": _REPO_ROOT / "data" / "full_benchmark.jsonl",
-    "rq1": _REPO_ROOT / "data" / "rq1_depth" / "rq1_depth.jsonl",
-    "rq2": _REPO_ROOT / "data" / "rq2_revision" / "rq2_revision.jsonl",
-    "rq3": _REPO_ROOT / "data" / "rq3_distractor" / "rq3_distractor.jsonl",
-    "rq4": _REPO_ROOT / "data" / "rq4_entity_load" / "rq4_entity_load.jsonl",
-    "rq5": _REPO_ROOT / "data" / "rq5_pilot" / "rq5_pilot.jsonl",
+    "rq1": _REPO_ROOT / "data" / "rq1_mutation_depth" / "rq1_mutation_depth.jsonl",
+    "rq2": _REPO_ROOT / "data" / "rq2_interference" / "rq2_interference.jsonl",
+    "rq3": _REPO_ROOT / "data" / "rq2_interference" / "rq2_interference.jsonl",
 }
 
 
@@ -319,18 +320,20 @@ def run_evaluation(
         family_buckets.setdefault(family, []).append(result_item)
 
         # Factor specific sweeps
+        # Sweep membership: family is the reliable key, because the superseded
+        # revision family is generated inside the rq2_interference file.
         req = rec.get("requested_factors", {})
-        if exp == "rq1_depth" or family == "basic_chain":
+        if exp == "rq1_mutation_depth" or family == "basic_chain":
             t_val = req.get("T")
             if t_val is not None:
                 rq1_by_t.setdefault(t_val, []).append(is_correct)
 
-        if exp == "rq2_revision" or family == "revision":
+        if exp == "rq2_interference" or family == "revision":
             t_val = req.get("T")
             if t_val is not None:
                 rq2_by_t.setdefault(t_val, []).append(is_correct)
 
-        if exp == "rq3_distractor" or family == "interleaved_chain":
+        if exp == "rq2_interference" or family == "interleaved_chain":
             d_val = req.get("D")
             if d_val is not None:
                 rq3_by_d.setdefault(d_val, []).append(is_correct)
@@ -526,7 +529,10 @@ def main():
         "--dataset",
         type=str,
         default="full",
-        help="Dataset shortcut ('full', 'rq1', 'rq2', 'rq3', 'rq4', 'rq5') or path to JSONL",
+        help=(
+            "Dataset shortcut ('full', 'rq1', 'rq2', 'rq3') or path to JSONL. "
+            "'rq3' reads the interleaved_chain distractor sweep from rq2_interference."
+        ),
     )
     parser.add_argument("--device", type=str, default="auto", help="Device: 'auto', 'cuda', 'cpu', 'mps'")
     parser.add_argument(

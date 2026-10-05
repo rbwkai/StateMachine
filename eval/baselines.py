@@ -17,7 +17,11 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
-from eval.scoring import candidate_answers, extract_instance_answer
+from eval.scoring import (
+    candidate_answers,
+    extract_instance_answer,
+    normalize_text,
+)
 
 
 @dataclass
@@ -30,12 +34,30 @@ class BaselineResult:
     baseline_type: str
 
 
+def query_type_of(instance: Dict[str, Any]) -> str:
+    """Resolve the query type of an instance record.
+
+    ``TrajectorySpec.query_type`` is not serialised into the record's ``spec``
+    block (see ``generator.instance.build_validated_instance``), so a plain
+    ``spec['query_type']`` lookup silently returns "location" for every count
+    instance. Prefer an explicit key when present, otherwise read it off the
+    rendered question, which is the only place the answer contract survives in
+    the record: ``render.narrative.question_count`` always starts with "How many".
+    """
+    spec = instance.get("spec") or {}
+    declared = instance.get("query_type") or spec.get("query_type")
+    if declared in {"location", "count", "redo_validity"}:
+        return str(declared)
+    return "count" if str(instance.get("question", "")).startswith("How many") else "location"
+
+
 def compute_stateless_baseline(instances: Sequence[Dict[str, Any]]) -> List[BaselineResult]:
     """
     Stateless baseline: answer based on initial state only.
 
     For each instance, extract the target's initial container from the
-    first Put operation in the canonical trace.
+    target's Put operation in the canonical trace.
+    For count queries, predict the initial count.
     """
     results: List[BaselineResult] = []
     
@@ -43,26 +65,55 @@ def compute_stateless_baseline(instances: Sequence[Dict[str, Any]]) -> List[Base
         iid = inst["instance_id"]
         gold = str(inst.get("gold_answer", "")).strip()
         
-        # Find initial location from canonical trace
+        # Determine query type from instance
+        family = inst.get("family", "")
+        query_type = query_type_of(inst)
+        
+        # Find target's initial location from canonical trace
         trace = inst.get("canonical_trace", [])
+        target_obj = inst.get("query_entity", "")
         initial_container = None
+        target_type = None
+        
         for op_dict in trace:
             if op_dict.get("op_type") == "PUT":
-                # This is a Put operation; check if it's the target
-                # We need to match by obj_id or assume first Put is target
-                initial_container = op_dict.get("container")
-                break
+                op_obj_id = op_dict.get("obj_id")
+                if op_obj_id == target_obj:
+                    initial_container = op_dict.get("container")
+                    target_type = op_dict.get("obj_type")
+                    break
         
-        if initial_container is None:
-            pred = ""
-        else:
-            # Get display name from final_state container_names if available
-            final_state = inst.get("final_state", {})
-            container_names = final_state.get("container_names") or final_state.get("container_display_names")
-            if isinstance(container_names, dict):
-                pred = container_names.get(initial_container, initial_container)
+        if query_type == "count":
+            # For count queries, predict initial count of target_type in the query container
+            # The query container is the merge destination for split_chain
+            if family == "split_chain":
+                # Find the merge destination
+                merge_dst = None
+                for op_dict in trace:
+                    if op_dict.get("op_type") == "MERGE":
+                        merge_dst = op_dict.get("dst_container")
+                        break
+                if merge_dst and target_type:
+                    # Count initial objects of target_type in merge_dst
+                    # Initially, only the target exists, and it's in its initial container
+                    # which is not merge_dst (since merge_dst is different from start)
+                    pred = "0"  # Initially 0 in merge destination
+                else:
+                    pred = "0"
             else:
-                pred = initial_container
+                pred = "0"
+        else:
+            # Location query: predict target's initial container
+            if initial_container is None:
+                pred = ""
+            else:
+                # Use display name from final_state container_names to match candidates
+                final_state = inst.get("final_state", {})
+                container_names = final_state.get("container_names") or final_state.get("container_display_names")
+                if isinstance(container_names, dict):
+                    pred = container_names.get(initial_container, initial_container)
+                else:
+                    pred = initial_container
         
         # Use scoring extraction for fair comparison
         cands = candidate_answers(inst, dataset_context=list(instances))
@@ -88,6 +139,7 @@ def compute_mfc_baseline(instances: Sequence[Dict[str, Any]]) -> List[BaselineRe
     Most-Frequent-Class (MFC) baseline: always predict the most common gold answer.
 
     Computed per condition (family + T + D) to avoid leakage across conditions.
+    Uses normalized gold answers (container IDs) to avoid per-instance display name randomization.
     """
     # Group by condition
     from collections import defaultdict
@@ -98,10 +150,10 @@ def compute_mfc_baseline(instances: Sequence[Dict[str, Any]]) -> List[BaselineRe
         cond_key = f"{inst.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
         cond_instances[cond_key].append(inst)
     
-    # Find MFC per condition
+    # Find MFC per condition using normalized gold answers
     cond_mfc: Dict[str, str] = {}
     for cond_key, cond_insts in cond_instances.items():
-        answers = [str(inst.get("gold_answer", "")).strip() for inst in cond_insts if inst.get("gold_answer")]
+        answers = [normalize_text(inst.get("gold_answer", "")) for inst in cond_insts if inst.get("gold_answer")]
         if answers:
             cond_mfc[cond_key] = Counter(answers).most_common(1)[0][0]
         else:

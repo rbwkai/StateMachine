@@ -158,7 +158,7 @@ def evaluate_predictions(
         pred_traj = pred_info.get("pred_trajectory")
         error_analysis_dict = None
 
-        if gold_traj and pred_traj and len(gold_traj) == len(pred_traj):
+        if gold_traj and pred_traj and len(gold_traj) == len(pred_traj) + 1:
             analysis = analyze_first_error(gold_traj, pred_traj)
             error_analysis_dict = analysis.to_dict()
 

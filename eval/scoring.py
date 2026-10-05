@@ -241,7 +241,7 @@ def candidate_answers(
         container_names = final_state.get("container_names") or final_state.get("container_display_names")
         if container_names:
             if isinstance(container_names, dict):
-                raw_candidates.extend(str(v) for v in container_names if v)
+                raw_candidates.extend(str(v) for v in container_names.values() if v)
 
     unique: Dict[str, str] = {}
     for value in raw_candidates:

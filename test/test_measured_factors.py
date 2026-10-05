@@ -36,6 +36,8 @@ def build_and_measure(family, entity_count, target_updates,
                       seed=42):
     """Build a trajectory and return (trajectory, measured_factors)."""
     total_updates = target_updates + distractor_updates
+    # split_chain, merge_chain, swap_chain, undo_chain require query_type='count' for causal validity
+    query_type = "count" if family in ("split_chain", "merge_chain", "swap_chain", "undo_chain") else "location"
     spec = TrajectorySpec(
         family=family,
         entity_count=entity_count,
@@ -43,6 +45,7 @@ def build_and_measure(family, entity_count, target_updates,
         total_updates=total_updates,
         target_updates=target_updates,
         distractor_updates=distractor_updates,
+        query_type=query_type,
     )
     t = build_trajectory(random.Random(seed), spec)
     return t, t.measured_factors
@@ -234,8 +237,8 @@ print("=" * 70)
 print("9. undo_redo_chain measured factors")
 print("=" * 70)
 
-# undo_redo_chain requires exactly 4 target_updates (move1 + move2 + undo + redo)
-for T in [4]:
+# undo_redo_chain requires at least 6 target_updates (moveA + moveB + moveC + undo + undo + redo)
+for T in [6]:
     for seed in range(5):
         t, m = build_and_measure("undo_redo_chain", 1, T, 0, seed=seed)
         assert m.E_actual == 1, f"undo_redo T={T} s={seed}: E_actual={m.E_actual}"
@@ -243,7 +246,7 @@ for T in [4]:
         assert m.T_actual == T, \
             f"undo_redo T={T} s={seed}: T_actual={m.T_actual} != {T}"
 
-print("undo_redo_chain (T=4 × 5 seeds): PASS")
+print("undo_redo_chain (T=6 × 5 seeds): PASS")
 
 
 # ============================================================

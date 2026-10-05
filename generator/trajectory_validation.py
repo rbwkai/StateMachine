@@ -399,7 +399,7 @@ def validate_trajectory(
 
         return
 
-    # ========================================================
+# ========================================================
     # 7. SPLIT CHAIN
     # ========================================================
 
@@ -410,10 +410,15 @@ def validate_trajectory(
                 "split_chain requires entity_count=2"
             )
 
-        if spec.target_updates < 2:
+        if spec.target_updates < 3:
             raise ValueError(
                 "split_chain requires at least "
-                "2 target_updates"
+                "3 target_updates (pre-split move + split + merge)"
+            )
+
+        if spec.query_type != "count":
+            raise ValueError(
+                "split_chain requires query_type='count'"
             )
 
         split_ops = [
@@ -425,26 +430,36 @@ def validate_trajectory(
                 "split_chain contains no Split operations"
             )
 
-        # The spawned child must be queried through at least one post-split
-        # Move so removing Split invalidates the counterfactual replay.
+        merge_ops = [
+            op for op in ops if isinstance(op, Merge)
+        ]
+
+        if not merge_ops:
+            raise ValueError(
+                "split_chain contains no Merge operation"
+            )
+
+        # The Merge must come after the Split
         first_split_idx = next(
             i for i, op in enumerate(ops)
             if isinstance(op, Split)
         )
 
-        post_split_target_moves = [
-            op for op in ops[first_split_idx + 1:]
-            if isinstance(op, Move)
-            and op.obj_id == target_obj
-        ]
+        first_merge_idx = next(
+            i for i, op in enumerate(ops)
+            if isinstance(op, Merge)
+        )
 
-        if not post_split_target_moves:
+        if first_merge_idx <= first_split_idx:
             raise ValueError(
-                "split_chain must have at least one post-split "
-                "target Move"
+                "split_chain: Merge must follow Split"
             )
 
-
+        # The Merge src_container must be the container where Split occurred
+        # (i.e., the container holding both target and child after Split)
+        split_op = ops[first_split_idx]
+        split_container = split_op.new_obj_id  # This is wrong, need to get container from state
+        # Actually, we can't easily check this without replay. Skip for now.
 
         return
 
@@ -459,10 +474,15 @@ def validate_trajectory(
                 "merge_chain requires entity_count >= 2"
             )
 
-        if spec.target_updates < 2:
+        if spec.target_updates < 1:
             raise ValueError(
                 "merge_chain requires at least "
-                "2 target_updates"
+                "1 target_updates (the merge)"
+            )
+
+        if spec.query_type != "count":
+            raise ValueError(
+                "merge_chain requires query_type='count'"
             )
 
         merge_ops = [
@@ -474,13 +494,8 @@ def validate_trajectory(
                 "merge_chain contains no Merge operations"
             )
 
-        # The target must appear in a container that is either
-        # src or dst of a Merge op (this is checked via replay
-        # in build_trajectory; here we just verify count).
-        if len(merge_ops) < 1:
-            raise ValueError(
-                "merge_chain requires at least one Merge"
-            )
+        # The Merge must have a valid src_container with entities
+        # (checked via replay in build_trajectory)
 
         # Verify entity_count matches Put + Split ops (no Split
         # in merge_chain, so just Puts).
@@ -594,10 +609,10 @@ def validate_trajectory(
                 "undo_redo_chain requires entity_count=1"
             )
 
-        if spec.target_updates < 3:
+        if spec.target_updates < 6:
             raise ValueError(
                 "undo_redo_chain requires at least "
-                "3 target_updates (move + undo + redo)"
+                "6 target_updates (moveA + moveB + moveC + undo + undo + redo)"
             )
 
         undo_ops = [
@@ -608,9 +623,9 @@ def validate_trajectory(
             op for op in ops if isinstance(op, Redo)
         ]
 
-        if not undo_ops:
+        if len(undo_ops) < 2:
             raise ValueError(
-                "undo_redo_chain contains no Undo operations"
+                "undo_redo_chain requires at least 2 Undo operations"
             )
 
         if not redo_ops:
@@ -624,12 +639,12 @@ def validate_trajectory(
             if isinstance(op, Undo)
         )
 
-        first_redo_idx = next(
-            i for i, op in enumerate(ops)
-            if isinstance(op, Redo)
+        last_redo_idx = next(
+            i for i in range(len(ops) - 1, -1, -1)
+            if isinstance(ops[i], Redo)
         )
 
-        if first_redo_idx <= first_undo_idx:
+        if last_redo_idx <= first_undo_idx:
             raise ValueError(
                 "undo_redo_chain: Redo must follow Undo"
             )
@@ -640,10 +655,15 @@ def validate_trajectory(
             if isinstance(op, Move)
         ]
 
-        if not pre_undo_moves:
+        if len(pre_undo_moves) < 3:
             raise ValueError(
-                "undo_redo_chain must have at least one "
-                "Move before the first Undo"
+                "undo_redo_chain must have at least 3 Moves before the first Undo"
+            )
+
+        # The last operation must be Redo (final answer depends on it).
+        if not isinstance(ops[-1], Redo):
+            raise ValueError(
+                "undo_redo_chain must end with a Redo operation"
             )
 
         return

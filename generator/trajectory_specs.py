@@ -83,6 +83,12 @@ class TrajectorySpec:
 
     target_obj: Optional[str] = None
 
+    # --------------------------------------------------------
+    # Query type (location or count)
+    # --------------------------------------------------------
+    
+    query_type: str = "location"  # "location" or "count"
+
     def __post_init__(self):
         # ====================================================
         # General validation

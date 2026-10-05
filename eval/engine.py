@@ -76,19 +76,30 @@ class MockInferenceEngine(InferenceEngine):
     ) -> List[str]:
         responses: List[str] = []
         prompt_tokens_list = []
+        system_prompts = []
         for p in prompts:
             if isinstance(p, list):
-                text = " ".join([m.get("content", "") for m in p])
+                # Chat message format: extract system prompt from messages
+                system_prompt = "default"
+                text_parts = []
+                for m in p:
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    if role == "system":
+                        system_prompt = content
+                    text_parts.append(content)
+                text = " ".join(text_parts)
             else:
                 text = str(p)
-
-            # Extract system prompt if embedded in the prompt
-            system_prompt = "default"
-            if "[SYSTEM_PROMPT:" in text:
-                import re
-                match = re.search(r"\[SYSTEM_PROMPT: ([^\]]+)\]", text)
-                if match:
-                    system_prompt = match.group(1)
+                # Extract system prompt if embedded in the prompt (legacy format)
+                system_prompt = "default"
+                if "[SYSTEM_PROMPT:" in text:
+                    import re
+                    match = re.search(r"\[SYSTEM_PROMPT: ([^\]]+)\]", text)
+                    if match:
+                        system_prompt = match.group(1)
+            
+            system_prompts.append(system_prompt)
 
             if "Where is" in text or "where is" in text:
                 # Vary response based on system prompt for testing
@@ -114,7 +125,7 @@ class MockInferenceEngine(InferenceEngine):
                 "has_final_answer": "final answer:" in response.lower(),
                 "enforce_greedy": enforce_greedy,
                 "prompt_tokens": prompt_tokens_list[i],
-                "system_prompt": system_prompt,
+                "system_prompt": system_prompts[i],
             }
             for i, response in enumerate(responses)
         ]

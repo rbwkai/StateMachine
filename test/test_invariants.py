@@ -52,13 +52,18 @@ def verify_batch(seeds_per_family: int = 25) -> None:
             rng = random.Random(seed)
 
             # Parameter variations across seeds
-            if family in ("basic_chain", "revision", "undo_chain", "undo_redo_chain"):
+            if family in ("basic_chain", "revision", "undo_chain"):
                 entity_count = 1
                 target_updates = 3 + (seed % 4)
                 distractor_updates = 0
+            elif family == "undo_redo_chain":
+                entity_count = 1
+                target_updates = 6 + (seed % 4)  # undo_redo_chain requires T>=6
+                distractor_updates = 0
             elif family in ("split_chain", "swap_chain"):
                 entity_count = 2
-                target_updates = 2 + (seed % 3)
+                # split_chain requires T>=3 (pre-split move + split + merge)
+                target_updates = 3 + (seed % 3)
                 distractor_updates = seed % 2
             elif family == "interleaved_chain":
                 entity_count = 2 + (seed % 3)
@@ -66,10 +71,13 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 distractor_updates = 2 + (seed % 3)
             elif family == "merge_chain":
                 entity_count = 2 + (seed % 2)
-                target_updates = 2 + (seed % 3)
+                target_updates = 1  # merge_chain requires T=1 for structural causality with count query
                 distractor_updates = seed % 2
 
             total_updates = target_updates + distractor_updates
+
+            # split_chain, merge_chain, swap_chain, and undo_chain require query_type='count' for causal validity
+            query_type = "count" if family in ("split_chain", "merge_chain", "swap_chain", "undo_chain") else "location"
 
             spec = TrajectorySpec(
                 family=family,
@@ -78,6 +86,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 total_updates=total_updates,
                 target_updates=target_updates,
                 distractor_updates=distractor_updates,
+                query_type=query_type,
             )
 
             # 1. Build and validate structurally
@@ -132,6 +141,9 @@ def verify_batch(seeds_per_family: int = 25) -> None:
             # 7a. Same seed -> same record
             seed_test = int(hashlib.sha1(f"test|{family}|{seed}".encode("utf-8")).hexdigest()[:8], 16)
 
+            # split_chain, merge_chain, swap_chain, and undo_chain require query_type='count'
+            query_type = "count" if family in ("split_chain", "merge_chain", "swap_chain", "undo_chain") else "location"
+
             # Reset deduplication registry for determinism check
             reset_deduplication_registry()
             rec1 = generate_instance(
@@ -144,6 +156,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 num_containers=3,
                 experiment_tag="test_exp",
                 condition_id=f"cond_{family}",
+                query_type=query_type,
             )
             reset_deduplication_registry()
             rec2 = generate_instance(
@@ -156,6 +169,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 num_containers=3,
                 experiment_tag="test_exp",
                 condition_id=f"cond_{family}",
+                query_type=query_type,
             )
             assert rec1 is not None and rec2 is not None, "generate_instance returned None"
             assert rec1["canonical_trace"] == rec2["canonical_trace"], "Same seed -> canonical_trace mismatch"
@@ -166,6 +180,8 @@ def verify_batch(seeds_per_family: int = 25) -> None:
             total_tested += 1
 
         # 7b. Different seeds in same condition -> mostly different traces; measured factors constant
+        # split_chain, merge_chain, swap_chain, and undo_chain require query_type='count'
+        query_type = "count" if family in ("split_chain", "merge_chain", "swap_chain", "undo_chain") else "location"
         records_diff = []
         for i in range(20):
             s = int(hashlib.sha1(f"diversity|{family}|{i}".encode("utf-8")).hexdigest()[:8], 16)
@@ -179,6 +195,7 @@ def verify_batch(seeds_per_family: int = 25) -> None:
                 num_containers=3,
                 experiment_tag="diversity_test",
                 condition_id=f"cond_{family}",
+                query_type=query_type,
             )
             if r is not None:
                 records_diff.append(r)

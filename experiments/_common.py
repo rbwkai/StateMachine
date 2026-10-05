@@ -59,6 +59,7 @@ def generate_instance(
     textual_distractor_count: int = 0,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     rng: Optional[random.Random] = None,
+    query_type: str = "location",
 ) -> Dict[str, Any]:
     """
     Generate one fully-verified DWS-Bench instance.
@@ -84,6 +85,7 @@ def generate_instance(
         total_updates=total_updates,
         target_updates=target_updates,
         distractor_updates=distractor_updates,
+        query_type=query_type,
     )
 
     return generate_instance_with_retry(
@@ -118,6 +120,7 @@ def generate_condition(
     min_v: Optional[int] = None,
     intended_v: Optional[int] = None,
     textual_distractor_count: int = 0,
+    query_type: str = "location",
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Generate num_instances for one experimental condition.
@@ -130,7 +133,7 @@ def generate_condition(
     reset_deduplication_registry()
 
     if not condition_id:
-        condition_id = f"T{target_updates}_D{distractor_updates}_E{entity_count}"
+        condition_id = f"{family}_T{target_updates}_D{distractor_updates}_E{entity_count}"
 
     label = condition_label or (
         f"{family} {condition_id}"
@@ -166,6 +169,7 @@ def generate_condition(
                 min_v=min_v,
                 intended_v=intended_v,
                 textual_distractor_count=textual_distractor_count,
+                query_type=query_type,
             )
         except GenerationError as exc:
             # One unreachable instance must not abort the whole sweep: count it
@@ -219,6 +223,7 @@ def probe_reachability(
     distractor_updates: int,
     num_containers: int = 3,
     n_seeds: int = 10,
+    query_type: str = "location",
 ) -> bool:
     """
     Test whether a condition is reliably reachable (≥8/10 seeds succeed).
@@ -242,6 +247,7 @@ def probe_reachability(
                 total_updates=total_updates,
                 target_updates=target_updates,
                 distractor_updates=distractor_updates,
+                query_type=query_type,
             )
             build_trajectory(rng, spec)
             successes += 1
@@ -365,8 +371,11 @@ def verify_generated_records(
         structural_families = []
     v_floor_failures = 0
     for r in records:
-        min_v = r.get("spec", {}).get("min_v") or r.get("spec", {}).get("V_min")
-        intended_v = r.get("spec", {}).get("intended_v") or r.get("spec", {}).get("V")
+        # min_v and intended_v are passed at generation time but not stored in the record's spec.
+        # They are only available if the experiment script stores them. For now, skip this check
+        # unless the record explicitly has them.
+        min_v = r.get("spec", {}).get("min_v")
+        intended_v = r.get("spec", {}).get("intended_v")
         meas = r["measured_factors"]
         v_actual = meas.get("V_actual", 0)
 
@@ -378,7 +387,7 @@ def verify_generated_records(
             all_ok = False
 
     if v_floor_failures == 0:
-        if any(r.get("spec", {}).get("min_v") or r.get("spec", {}).get("V_min") for r in records):
+        if any(r.get("spec", {}).get("min_v") is not None or r.get("spec", {}).get("intended_v") is not None for r in records):
             print("  [✓] All V_actual meet minimum floor")
     else:
         print(f"  [FAIL] {v_floor_failures} records fail V floor")
@@ -496,6 +505,11 @@ def verify_generated_records(
     for r in records:
         step_gold_answers = r.get("step_wise_gold_answers", [])
         final_gold = r["gold_answer"]
+        # For count queries (split_chain), step_wise_gold_answers are container names
+        # while final_gold is a count number - they won't match. Skip check for count queries.
+        query_type = r.get("spec", {}).get("query_type", "location")
+        if query_type == "count":
+            continue
         if step_gold_answers and step_gold_answers[-1] != final_gold:
             gold_mismatches += 1
             all_ok = False
