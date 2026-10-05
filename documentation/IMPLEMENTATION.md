@@ -1,150 +1,96 @@
 # DWS-Bench Generator: Complete Implementation Reference
 
-**Repository state described:** 2026-10-04  
-**Purpose:** Explain how the generator currently works, the decisions that govern it,
-and the places where the implementation still differs from the written contract.
+**Repository state described:** 2026-10-05, commit `447116e`
+**Purpose:** explain how the generator currently works, which decisions govern it,
+and where the implementation still differs from the written contract.
 
-This document is an implementation reference, not a proposal. It distinguishes:
+This is an implementation reference, not a proposal. It distinguishes:
 
-- **Implemented behavior:** what the current Python code actually does.
-- **Contract decision:** what `SPEC.md`, `AGENTS.md`, or `documentation/DECISIONS.md`
-  says the system must do.
-- **Open divergence:** a place where those two are not yet the same.
+- **Implemented behavior** — what the current Python code actually does.
+- **Contract decision** — what `SPEC.md`, `AGENTS.md`, `requirements.md`, or
+  `documentation/DECISIONS.md` says the system must do.
+- **Open divergence** — a place where those two are not yet the same.
 
-The governing authority order is:
+Authority order:
 
-1. thesis proposal;
+1. thesis proposal (not in this repository);
 2. [`SPEC.md`](../SPEC.md);
 3. [`AGENTS.md`](../AGENTS.md);
-4. docstrings and comments;
-5. executable code.
+4. [`requirements.md`](../requirements.md) and [`documentation/DECISIONS.md`](DECISIONS.md);
+5. docstrings and comments;
+6. executable code.
 
-When this document reports a divergence, it is not silently choosing code over the
-contract. It is recording the gap that must be resolved before a dataset is frozen.
+A divergence below is recorded, not silently resolved in favour of code.
 
 ---
 
 ## 1. Generator purpose
 
 DWS-Bench is a symbolic-first benchmark generator for dynamic world-state tracking.
-It creates a sequence of valid world operations, selects or receives a query about
-the resulting world, computes symbolic gold answers, renders the operation trace as
-natural language, and records enough metadata to audit the generated instance.
-
-The central design decision is:
+It builds valid operation trajectories, replays them once, derives gold and
+step-wise gold from that replay, renders the trace as natural language, measures the
+realized factors, and records enough metadata to audit the instance.
 
 > The simulator is the source of truth. Natural-language text is a rendering of the
 > simulator trace, never a second state machine.
 
-The generator is intended to isolate structural factors such as:
+The generator isolates: target-relevant update depth (`T`), distractor updates
+(`D`), lifetime entity count (`E`), revision complexity (`V`), narrative
+distractors (`N`), canonical update count (`U`), rendered length (`L`), and
+operation family.
 
-- target-relevant update depth (`T`);
-- distractor updates (`D`);
-- lifetime entity count (`E`);
-- state revision (`V`);
-- narrative distractors (`N`);
-- canonical update count (`U`);
-- rendered length (`L`);
-- operation family and structural semantics.
-
-The generator itself does not establish model performance. Model inference and
-scoring consume serialized instances later. The current repository has generation
-and validation infrastructure, but no current frozen dataset or run results in the
-working tree.
+The generator makes no model-performance claim. **The working tree contains no
+dataset and no model results**: `data/` and `results/` are gitignored and absent.
 
 ---
 
-## 2. Three Research Questions
+## 2. Three research questions
 
-The generator is designed around three research questions:
+| RQ | Question | Experiment |
+|---|---|---|
+| RQ1 | How does target-relevant depth affect recovery of the final world state, and does degradation depend on mutation structure rather than depth alone? | `experiments/rq1_mutation_depth.py` |
+| RQ2 | With the target trajectory fixed, how do state-changing distractors, narrative distractors, and context length differentially affect reasoning, and does superseded information produce a distinct stale-state failure? | `experiments/rq2_interference.py` |
+| RQ3 | How do model scale and explicit reasoning prompting alter accuracy and failure profile, and does prompting interact with mutation structure? | `experiments/rq3_scale_reasoning.py` (evaluation only) |
 
-### RQ1 — Sequential Dependency and Mutation Structure
-How does increasing target-relevant state depth affect the ability of small
-instruction-tuned language models to recover the final world state, and does
-degradation depend on the type of state mutation rather than depth alone?
-
-**Core experiment:** Vary `T` across 7 mutation structures. Keep `E`, `D`, `N` controlled.
-
-### RQ2 — Interference Decomposition and Supersession
-When target-relevant state transitions are held constant, how do state-changing
-distractors, narrative distractors, and context length differentially affect
-dynamic-state reasoning, and does superseded-information interference produce a
-distinct stale-state failure pattern?
-
-**Core experiment:** Fixed target trajectory (interleaved_chain, E=3, T=8). Cross `D × N` with length-matched controls. Supersession via revision family.
-
-### RQ3 — Model Scale and Reasoning Strategy
-How do model scale and explicit reasoning prompting alter the accuracy and failure
-profile of dynamic-state reasoning, and does the effect of reasoning prompting
-depend on mutation structure?
-
-**Core experiment:** 0.5B / 3B / 7B × Direct / Structured on representative RQ1/RQ2 conditions.
+D-018 collapsed the earlier five-RQ structure into these three; RQ4 entity load
+became a covariate and the RQ5 structural pilot became RQ1's mutation axis.
 
 ---
 
 ## 3. Repository layers
 
-The active architecture is split into the following layers.
+```
+world            <- render, analysis
+world            <- generator
+render, analysis <- generator
+analysis         <- eval (scoring helpers only, in the offline audit script)
+```
 
-### 2.1 World simulator
+`world/` owns `WorldState`, `History`, operation validity and application,
+undo/redo semantics, and canonical replay. It knows nothing about prompts, models,
+factors, or templates.
 
-[`world/`](../world/) owns:
+`generator/` owns family registries, constructors, family validation, factor
+measurement, query and probe construction, the structural-causality gate, and the
+single instance gate.
 
-- `WorldState`;
-- `History`;
-- operation validity and application;
-- undo/redo stack semantics;
-- canonical replay.
+`render/` owns the name vocabulary, operation sentences, distractor sentences, and
+question wording. It consumes replay output and never mutates state.
 
-It knows nothing about prompts, models, factor sweeps, or natural-language
-templates.
+`eval/` is downstream: prompts, model registry, engines, extraction, scoring,
+baselines, robustness.
 
-### 2.2 Generator
+`analysis/` owns query analysis, the first-error taxonomy, curve fits, failure
+onset, and the solubility audit.
 
-[`generator/`](../generator/) owns:
-
-- family and condition definitions;
-- trajectory constructors;
-- family-specific validation;
-- measured factor computation;
-- query and probe construction;
-- generation-facing constants.
-
-### 2.3 Renderer
-
-[`render/`](../render/) owns:
-
-- human-readable names;
-- operation sentence rendering;
-- textual distractor insertion;
-- question wording.
-
-The renderer consumes replay-derived information. It must not mutate the symbolic
-world or independently decide the gold answer.
-
-### 2.4 Experiment layer
-
-[`experiments/`](../experiments/) turns conditions into batches. It:
-
-1. derives deterministic seeds;
-2. constructs a `TrajectorySpec`;
-3. builds a trajectory;
-4. renders it;
-5. measures factors again with rendered sentences;
-6. filters or rejects the instance;
-7. serializes JSONL records.
-
-### 2.5 Evaluation layer
-
-[`eval/`](../eval/) is downstream. It formats prompts, runs mock or Hugging Face
-engines, extracts answers, and scores predictions. It is not part of symbolic
-trajectory construction.
+`torch` and `transformers` may only be imported by `eval/engine.py`. `world` and
+`generator` import without them.
 
 ---
 
-## 3. World state model
+## 4. World state model
 
-The world state is defined in [`world/state.py`](../world/state.py):
+`world/state.py`:
 
 ```python
 WorldState(
@@ -155,632 +101,249 @@ WorldState(
 )
 ```
 
-### 3.1 `object_type`
-
-`object_type` maps every entity that has ever existed to its type:
-
-```text
-o0 -> key
-o1 -> cup
-```
-
-This mapping intentionally survives removal. Keeping type metadata allows later
-rendering, queries, and diagnostics to refer to an entity that is no longer placed.
-
-### 3.2 `location`
-
-`location` is a partial mapping containing only currently placed entities:
-
-```text
-o0 -> c1
-```
-
-If an object is removed, its `object_type` entry remains but its `location` entry
-is deleted. Therefore:
-
-```python
-gold_location(state, obj_id) is None
-```
-
-means the object is not currently placed. It does not necessarily mean that the
-object was never created.
-
-### 3.3 `containers`
-
-The container set is fixed for a trajectory. Operations may move objects between
-containers but do not create or delete containers.
-
-The default number of containers is three, and the minimum is two.
-
-### 3.4 `step_index`
-
-`step_index` advances once for every successfully applied operation, including
-`Undo` and `Redo`. It is not the same thing as the number of target-relevant
-updates.
-
-### 3.5 History
-
-[`History`](../world/state.py) contains:
-
-```python
-undo_stack: List[WorldState]
-redo_stack: List[WorldState]
-```
-
-History stores complete cloned states, not inverse operation descriptions.
+- `object_type` maps every entity that has ever existed to its type and **never
+  shrinks**. A removed object keeps its type entry.
+- `location` is a partial map of *placed* objects only. A removed object has no
+  `location` entry, so a `None` gold means "not placed", not "never existed".
+- `containers` is fixed for the trajectory. Operations move objects between
+  containers but never create or delete one. Default 3, minimum 2.
+- `step_index` advances once per successfully applied operation, including `Undo`
+  and `Redo`. It is not `T`.
+- `History` holds `undo_stack` and `redo_stack` as **complete cloned states**, not
+  inverse operations.
 
 ---
 
-## 4. Operation semantics
+## 5. Operation semantics
 
-[`world/operations.py`](../world/operations.py) defines the operation dataclasses
-and `apply_op`.
+`world/operations.py` defines the dataclasses and `apply_op`, the single state
+transition dispatcher.
 
-`apply_op` is the only central state-transition dispatcher. Builders, replay, and
-probes are expected to use it rather than mutating `WorldState` directly.
+| Operation | Validity | Effect |
+|---|---|---|
+| `Put(obj_id, obj_type, container)` | id never seen; container in `C` | creates type and location entries |
+| `Move(obj_id, dst)` | placed; `dst` in `C`; `dst` != current | changes one location entry |
+| `Remove(obj_id)` | placed | deletes location entry, keeps type entry |
+| `Split(source_obj_id, new_obj_id)` | source placed; new id unseen | child copies type, placed in the source's container |
+| `Merge(src_container, dst_container)` | `src != dst`; both in `C`; `src` non-empty | moves all source contents to destination |
+| `Swap(container_a, container_b)` | `a != b`; both in `C`, empties allowed | atomic exchange of contents |
+| `Undo` | undo stack non-empty | clones current to redo stack, restores previous full state |
+| `Redo` | redo stack non-empty | restores the last undone state, clones current to undo stack |
 
-### 4.1 `Put`
+Every non-history operation pushes a clone of the prior state onto `undo_stack` and
+**clears `redo_stack`**. That rule is what makes redo-validity probes meaningful.
 
-```text
-Put(obj_id, obj_type, container)
-```
+`Put` is setup. It is excluded from `U`, `T`, and `D`.
 
-Valid only when:
-
-- `obj_id` has never appeared in `object_type` or `location`;
-- `container` is in the fixed container set.
-
-Effect:
-
-- creates the type entry;
-- creates the location entry.
-
-`Put` operations are initialization/setup operations. They are excluded from `U`,
-`T`, and `D` under the current factor contract.
-
-### 4.2 `Move`
-
-```text
-Move(obj_id, dst)
-```
-
-Valid only when:
-
-- the object is currently placed;
-- `dst` is a valid container;
-- `dst` differs from the current location.
-
-Effect:
-
-- changes exactly one location entry.
-
-### 4.3 `Remove`
-
-```text
-Remove(obj_id)
-```
-
-Valid only when the object is currently placed.
-
-Effect:
-
-- deletes the object from `location`;
-- preserves its `object_type`.
-
-`Remove` remains part of the simulator vocabulary and sampler capability, but
-decision D-006 says the benchmark trajectory families do not emit it. If a future
-family includes it, that must be an explicit design decision.
-
-### 4.4 `Split`
-
-```text
-Split(source_obj_id, new_obj_id)
-```
-
-Valid only when:
-
-- the source is currently placed;
-- the new id has never existed.
-
-Effect:
-
-- creates the child id;
-- copies the source type;
-- places the child in the source's current container;
-- leaves the source in place.
-
-This changes entity cardinality and is the required structural operation for
-`split_chain`.
-
-### 4.5 `Merge`
-
-```text
-Merge(src_container, dst_container)
-```
-
-Valid only when:
-
-- source and destination differ;
-- both containers are valid;
-- source is non-empty.
-
-Effect:
-
-- moves every object currently in the source container to the destination.
-
-This is a whole-container relocation, not a single-object move.
-
-### 4.6 `Swap`
-
-```text
-Swap(container_a, container_b)
-```
-
-Valid only when:
-
-- the containers differ;
-- both are valid.
-
-Empty containers are allowed.
-
-Effect:
-
-- atomically exchanges all contents between the two containers.
-
-The implementation first snapshots both contents before writing either side, so
-objects are not accidentally moved twice.
-
-### 4.7 `Undo`
-
-`Undo` requires a non-empty undo stack.
-
-Effect:
-
-1. clone the current state onto the redo stack;
-2. pop the latest prior state from the undo stack;
-3. restore it;
-4. increment `step_index`.
-
-### 4.8 `Redo`
-
-`Redo` requires a non-empty redo stack.
-
-Effect:
-
-1. clone the current state onto the undo stack;
-2. pop the latest undone state from the redo stack;
-3. restore it;
-4. increment `step_index`.
-
-### 4.9 New ordinary operations clear redo history
-
-For every non-history operation:
-
-1. validate against the current state;
-2. push a clone of the current state to `undo_stack`;
-3. clear `redo_stack`;
-4. clone and apply the operation;
-5. increment `step_index`.
-
-This rule is central to redo-validity probes.
+`Remove` remains available to the simulator and the sampler but is not emitted by
+any released family (D-006 in `SPEC.md` §5, `requirements.md` §4).
 
 ---
 
-## 5. Canonical replay
+## 6. Canonical replay
 
-[`world/replay.py`](../world/replay.py) provides:
+`world/replay.py`:
 
 ```python
-replay_trace(
-    ops,
-    containers,
-    history=None,
-) -> (trace, final_state, final_history)
+replay_trace(ops, containers, history=None) -> (trace, final_state, final_history)
 ```
 
-Replay starts from an empty world and applies operations in order through
-`apply_op`.
-
-Each trace element is:
-
-```text
-(operation, state_before, state_after)
-```
-
-The same trace is intended to feed:
+Each trace element is `(operation, state_before, state_after)`. Replay starts from
+an empty world and applies every operation through `apply_op`. One pass feeds:
 
 - final-state gold;
 - step-wise gold;
 - factor measurement;
 - narrative rendering;
-- counterfactual probes;
-- constructor/replay consistency checks.
+- structural-causality counterfactual replays;
+- constructor/replay equality checks.
 
-If an operation is invalid at its position, replay raises `InvalidOperation`.
-This is especially important for counterfactual deletion: deleting one earlier
-operation can make a later operation invalid, which is a distinct result from a
-valid replay whose answer stays the same.
+Invalid operations raise `InvalidOperation`. That is deliberately distinct from a
+valid replay whose answer is unchanged, which matters for counterfactual deletion.
 
 ---
 
-## 6. Family taxonomy
+## 7. Family taxonomy
 
-[`generator/dataset_spec.py`](../generator/dataset_spec.py) groups the eight
-families into five capability groups.
+`generator/dataset_spec.py` groups the eight families into five capability groups.
 
-| Capability group | Families | Intended phenomenon |
+| Capability group | Families | Phenomenon |
 |---|---|---|
-| Sequential state tracking | `basic_chain`, `revision` | ordinary chains and revisits |
+| Sequential state tracking | `basic_chain`, `revision` | ordinary chains, revisits |
 | Multi-entity interference | `interleaved_chain` | target updates mixed with other entities |
-| Identity transformation | `split_chain`, `merge_chain` | entity creation and whole-container fusion |
+| Identity transformation | `split_chain`, `merge_chain` | entity creation, whole-container fusion |
 | Global state operations | `swap_chain` | bilateral container exchange |
 | Temporal edit history | `undo_chain`, `undo_redo_chain` | rollback and reapplication |
 
-The family registry is currently defined in
-[`generator/dataset_spec.py`](../generator/dataset_spec.py), but related family
-sets also exist in validation and trajectory modules. Centralization remains an
-open cleanup item.
+**Open divergence (SPEC OPEN-6).** The family list exists in four places:
+`generator/trajectories.py::_CONSTRUCTORS`,
+`generator/sampler.py::_CONSTRUCTORS`,
+`generator/dataset_spec.py::FAMILY_TO_CAPABILITY_GROUP`, and the validation sets in
+`trajectory_specs.py`. They are currently equal, but nothing enforces that.
+
+**Open divergence (SPEC OPEN-7).** `OBJECT_TYPES` is declared twice with different
+contents: `render/names.py:12` (the owner per `AGENTS.md` §5) and
+`generator/trajectories.py:274`.
 
 ---
 
-## 7. Requested condition model
+## 8. Requested condition model
 
-`Condition` in [`generator/dataset_spec.py`](../generator/dataset_spec.py)
-represents an experimental request:
+`Condition` in `generator/dataset_spec.py` represents an experimental request:
+`family`, `T`, `E`, `D`, `experiment`, `generation_status`.
 
-- `family`;
-- `T`;
-- `E`;
-- `D`;
-- `experiment`;
-- `generation_status`.
-
-Derived values:
+Derived:
 
 ```text
 U = T + D
 S = initial_placements + U
 ```
 
-Initial placements are normally `E`. `split_chain` is special: it initially places
-one source entity and creates the second entity later through `Split`.
+`initial_placements` is normally `E`; `split_chain` places one entity and creates
+the second through `Split`.
 
-### 7.1 Numeric checks
+Numeric checks enforce `T >= 1`, `E >= 1`, `D >= 0`. The old `D < T` restriction was
+removed deliberately: `D >= T` is legal (RESOLVED-2).
 
-The current `Condition` constructor enforces:
-
-- `T >= 1`;
-- `E >= 1`;
-- `D >= 0`.
-
-The earlier `D < T` restriction was deliberately removed. Conditions with more
-distractor updates than target updates are legal.
-
-### 7.2 Generation status
-
-The intended lifecycle is:
+Generation status lifecycle:
 
 ```text
-PENDING_CALIBRATION
-        ↓
-PENDING_GENERATION
-        ↓
-GENERATED
+PENDING_CALIBRATION -> PENDING_GENERATION -> GENERATED
 ```
 
-`GENERATED` is intended to be immutable. The current working tree has no generated
-dataset, so this lifecycle has not yet been exercised for a new release.
+`GENERATED` is immutable. No condition has reached `GENERATED` in this working
+tree, because no dataset exists.
 
 ---
 
-## 8. `TrajectorySpec`
+## 9. `TrajectorySpec`
 
-[`generator/trajectory_specs.py`](../generator/trajectory_specs.py) is the
-constructor-level specification. It contains:
+`generator/trajectory_specs.py` is the constructor-level specification: `family`,
+`entity_count`, `num_containers`, `total_updates`, `target_updates`,
+`distractor_updates`, `min_interleaving`, `revision_count`,
+`min_unique_target_locations`, `structural_ops`, and an optional `target_obj`.
 
-- `family`;
-- `entity_count`;
-- `num_containers`;
-- `total_updates`;
-- `target_updates`;
-- `distractor_updates`;
-- `min_interleaving`;
-- `revision_count`;
-- `min_unique_target_locations`;
-- `structural_ops`;
-- optional `target_obj`.
+Generic checks: family is registered, entity count positive, container count meets
+the minimum, updates positive, distractor count non-negative, interleaving in
+`[0, 1]`, revision count non-negative, minimum unique target locations positive.
 
-### 8.1 Generic checks
+For non-structural families it also requires `total_updates == target_updates +
+distractor_updates`. For structural families that check is skipped, because the
+constructors read `target_updates` under family-specific conventions — one of the
+contract ambiguities in `requirements.md` §16.
 
-It checks:
+**Resolved since the last audit.** The transitional `schema_version` property is
+gone. `TrajectorySpec` has no `schema_version` field, `generate.py` no longer
+advertises `--schema-version`, and the record schema contains no `schema_version`
+key. `test/test_factor_contract.py` asserts that constructing with
+`schema_version="v2"` fails. The v1/v2 duality described in earlier revisions of this
+document is closed.
 
-- family is registered;
-- entity count is positive;
-- container count meets the minimum;
-- total updates are positive;
-- target updates are positive;
-- distractor updates are non-negative;
-- interleaving is in `[0, 1]`;
-- revision count is non-negative;
-- minimum unique target locations is positive.
-
-### 8.2 Ordinary update-count consistency
-
-For ordinary families, it requires:
-
-```text
-total_updates = target_updates + distractor_updates
-```
-
-For structural families, this check is skipped because the current constructors
-interpret `target_updates` using family-specific structural conventions.
-
-### 8.3 Current schema inconsistency
-
-The written decisions originally moved toward one contract and removed the
-v1/v2 duality. However, the active file currently exposes a transitional
-`schema_version` property that returns `"v1"` and does not accept
-`schema_version` as a dataclass constructor field.
-
-At the same time:
-
-- `generate.py` advertises `--schema-version`;
-- experiment code passes `schema_version`;
-- trajectory constructors contain schema-dependent branches;
-- tests expect `TrajectorySpec(..., schema_version="v2")` to fail.
-
-Therefore, the intended schema behavior and active constructor behavior are not
-fully reconciled. This must be resolved before relying on schema-specific
-generation.
+**Open divergence (SPEC OPEN-15).** `revision_count` is accepted and stored but never
+enforced against measured `V`. This is the single test failure not named
+`test_failsnow_*`: `test_known_findings.py::test_f10_revision_count_is_enforced`.
 
 ---
 
-## 9. Trajectory construction
+## 10. Trajectory construction
 
-[`generator/trajectories.py`](../generator/trajectories.py) is the main constructor
-module.
+`generator/trajectories.py` holds the family constructors. Every helper routes
+operations through `apply_op`. Each builds an empty world with fixed containers,
+adds setup `Put`s, adds family-specific target and distractor operations, and
+returns a `ConstructedTrajectory` (`ops`, `containers`, `final_state`, `history`,
+`target_obj`, `spec`, optional measured factors).
 
-Every helper routes operations through `apply_op`. The general pattern is:
+`build_trajectory` is the only normal entry point: it selects the constructor from
+`_CONSTRUCTORS`, replays, compares constructor state against replay state, runs
+`validate_trajectory`, and attaches measured factors. Direct constructor calls
+happen only in tests (AGENTS.md hard rule 4).
 
-1. create an empty world with fixed containers;
-2. add setup `Put` operations;
-3. add family-specific target and distractor operations;
-4. maintain the constructor's current state/history;
-5. return a `ConstructedTrajectory`.
+Family shapes:
 
-`ConstructedTrajectory` contains:
+- **`basic_chain`** — one entity, `D=0`, every post-setup op moves the target to a
+  new destination.
+- **`interleaved_chain`** — at least two entities, at least one target and one
+  distractor move, and genuine interleaving: a distractor must fall between two
+  consecutive target moves. Validation computes an interleaving score
+  (distractors between target moves ÷ all move ops) against `min_interleaving`.
+- **`revision`** — one entity, `D=0`, `T >= 3`, at least `min_unique_target_locations`
+  distinct destinations, and a genuine revisit: a location recurring after at least
+  one different location in between.
+- **`split_chain`** — two entities, `query_type="count"` required, a pre-split move,
+  then `Split` then `Merge` with `Merge` after `Split`.
+- **`merge_chain`** — at least two entities, `query_type="count"` required, one
+  `Merge`, and `Put` count equal to `entity_count`.
+- **`swap_chain`** — at least two entities, one `Swap`.
+- **`undo_chain`** — one entity, at least one `Move` before the first `Undo`, and
+  **no** `Redo`.
+- **`undo_redo_chain`** — one entity, at least two `Undo` and one `Redo`, at least
+  three `Move`s before the first `Undo`, and the trace must end with `Redo` so the
+  final answer depends on it.
 
-- `ops`;
-- `containers`;
-- `final_state`;
-- `history`;
-- `target_obj`;
-- `spec`;
-- optional measured factors.
+### 10.1 Enforced family minima vs contract
 
-### 9.1 `basic_chain`
+`T_min` in the `SPEC.md` frontmatter is the requested **target-update** floor
+(`TrajectorySpec.target_updates`, symbol $T$), not a total-op count. These are the
+floors `generator/trajectory_validation.py` actually rejects below:
 
-Shape:
+| Family | Enforced | `SPEC.md` frontmatter | `requirements.md` §4 |
+|---|---:|---:|---:|
+| `basic_chain` | `T >= 1` (from `TrajectorySpec`) | 1 | 1 |
+| `revision` | `T >= 3` | 3 | 3 |
+| `interleaved_chain` | `T >= 1`, `D >= 1`, `E >= 2` | 1 | 1 |
+| `split_chain` | **`T >= 3`** | 2 | composition only |
+| `merge_chain` | **`T >= 1`** | 2 | composition only |
+| `swap_chain` | `T >= 1` | 1 | 1 |
+| `undo_chain` | `T >= 2` | 2 | 2 |
+| `undo_redo_chain` | **`T >= 6`** | 3 | composition only |
 
-```text
-Put(target)
-Move(target)
-Move(target)
-...
-```
+Three divergences, tracked as SPEC OPEN-17. The contract wins; the validator must be
+corrected. In practice the enforced minimum is stricter, so a legal-per-contract
+request is rejected rather than silently accepted — a safe direction, but still a
+contract violation. The global `T >= 1` floor lives in `TrajectorySpec.__post_init__`
+(`generator/trajectory_specs.py:128`), not in the validator.
 
-Properties:
-
-- exactly one entity;
-- no distractor updates;
-- every post-setup operation moves the target;
-- each destination differs from the current destination.
-
-### 9.2 `interleaved_chain`
-
-Shape:
-
-```text
-Put(target)
-Put(distractor_1)
-Put(distractor_2)
-...
-interleaved target Moves and distractor Moves
-```
-
-Properties:
-
-- at least two entities;
-- at least one target update;
-- at least one distractor update;
-- target and distractor operations are deliberately interleaved;
-- validation measures whether distractors occur between target updates.
-
-### 9.3 `revision`
-
-Shape:
-
-```text
-Put(target)
-target Moves with at least one revisit
-```
-
-The destination pattern is designed to revisit a previous location after an
-intervening different location. The family requires at least three target
-updates, but `revision_count` is not currently enforced as an exact requested
-factor.
-
-### 9.4 `split_chain`
-
-The family creates a child through `Split`.
-
-The intended corrected design queries the spawned child so that the split itself
-is causally meaningful:
-
-```text
-Put(source)
-source movement
-Split(source, child)
-...
-```
-
-The legacy and intended corrected paths differ. The current schema inconsistency
-means callers must not assume the corrected branch is reachable without first
-resolving `TrajectorySpec`.
-
-### 9.5 `merge_chain`
-
-The target is placed in a source container and a `Merge` moves the source
-container's contents into another container.
-
-The corrected structural design places `Merge` as the last target-affecting
-operation, preventing a later ordinary target move from overwriting the answer.
-
-### 9.6 `swap_chain`
-
-The target and a companion are placed in participating containers. `Swap`
-exchanges their contents.
-
-The corrected structural design places `Swap` at the end of target-affecting
-operations so the final answer depends on the exchange rather than a later
-ordinary `Move`.
-
-### 9.7 `undo_chain`
-
-The corrected design ends with `Undo`:
-
-```text
-target moves
-Undo
-```
-
-This keeps rollback visible in the final answer.
-
-### 9.8 `undo_redo_chain`
-
-The corrected design reserves history operations near the end:
-
-```text
-target Move
-Undo
-Redo
-```
-
-Both `Undo` and `Redo` must be causally relevant under the structural rule.
+`SPEC.md` also declares `containers_min: 2` for `swap_chain` while `requirements.md`
+§4 asks for at least three. Only two are enforced, by `TrajectorySpec.__post_init__`
+against `NUM_CONTAINERS_MIN` and by `_initial_world`
+(`generator/trajectories.py:81`). RQ1 requests three, so released `swap_chain`
+records satisfy both.
 
 ---
 
-## 10. Public construction gate
+## 11. Family validation
 
-`build_trajectory(...)` is intended to be the only normal constructor entry point.
+`generator/trajectory_validation.py` runs after construction.
 
-The intended gate is:
+**Generic (non-structural) checks:** non-empty trace; target created by a `Put`;
+exactly `entity_count` `Put` operations; no duplicate creation; correct
+target/distractor counts.
 
-```text
-family constructor
-    ↓
-canonical replay
-    ↓
-constructor/replay state equality
-    ↓
-family validation
-    ↓
-factor measurement
-    ↓
-rendering
-    ↓
-rendered-factor verification
-```
+**`interleaved_chain`:** `E >= 2`, `T >= 1`, `D >= 1`, at least one target and one
+distractor `Move`, real interleaving, and `min_interleaving`.
 
-The current implementation performs the following inside or around the build path:
+**`revision`:** `E == 1`, `D == 0`, `T >= 3`, enough unique destinations, genuine
+revisit.
 
-1. selects the family constructor;
-2. constructs operations;
-3. replays them;
-4. compares final location, object-type, and container data;
-5. applies an inline structural necessity check in relevant paths;
-6. calls `validate_trajectory`;
-7. attaches measured factors.
+**Structural families:** `split_chain` (`E == 2`, `T >= 3`, `query_type="count"`,
+a `Split`, a `Merge`, `Merge` after `Split`); `merge_chain` (`E >= 2`, `T >= 1`,
+`query_type="count"`, a `Merge`, `Put` count matches); `swap_chain` (`E >= 2`,
+`T >= 1`, a `Swap`); `undo_chain` (`E == 1`, `T >= 2`, an `Undo`, no `Redo`, a
+pre-`Undo` `Move`); `undo_redo_chain` (`E == 1`, `T >= 6`, two `Undo`s, a `Redo`
+after the first `Undo`, three pre-`Undo` `Move`s, last op is `Redo`).
 
-### 10.1 Important current gap
-
-`build_trajectory` measures factors but does not universally call:
-
-- `verify_factors`;
-- `verify_length`.
-
-The experiment pipeline performs manual `E/T/D` equality checks and optional `V`
-checks after rendering. The lightweight CLI path does not currently provide the
-same complete verification gate.
-
-This is a release blocker for a strict frozen-data workflow.
-
----
-
-## 11. Family-specific validation
-
-[`generator/trajectory_validation.py`](../generator/trajectory_validation.py)
-checks family invariants after construction.
-
-### 11.1 Common checks
-
-Validation checks include:
-
-- operation sequence is non-empty;
-- target exists in the expected identity set;
-- expected setup entity count;
-- no duplicate entity creation;
-- required operation counts;
-- target and distractor counts;
-- unsupported operation rejection.
-
-### 11.2 Basic validation
-
-Requires:
-
-- one entity;
-- zero distractor updates;
-- every move targets the queried entity.
-
-### 11.3 Interleaving validation
-
-Requires:
-
-- at least two entities;
-- target moves;
-- distractor moves;
-- distractors between target moves;
-- `min_interleaving` threshold.
-
-The interleaving score is approximately:
-
-```text
-distractor moves between consecutive target moves
-------------------------------------------------
-total move operations
-```
-
-### 11.4 Revision validation
-
-Requires:
-
-- one entity;
-- no distractor updates;
-- at least three target updates;
-- enough unique target locations;
-- a genuine revisit after an intervening location.
-
-### 11.5 Structural validation
-
-Structural validation checks required operation types and family-specific identity
-constraints. Split has special handling because the queried target may be the
-spawned child in the corrected design.
+A family with no validator raises `ValueError`, so an unregistered family cannot
+pass silently.
 
 ---
 
 ## 12. Structural causality
 
-Structural families declare required operations:
+`generator/structural.py::validate_structural_causality` is the single
+implementation. It is called from `build_trajectory` for every structural family
+and is not duplicated in the constructors.
+
+Declared requirements, `generator/dataset_spec.py::REQUIRED_STRUCTURAL_OPS`:
 
 | Family | Required operation |
 |---|---|
@@ -788,623 +351,589 @@ Structural families declare required operations:
 | `merge_chain` | `Merge` |
 | `swap_chain` | `Swap` |
 | `undo_chain` | `Undo` |
-| `undo_redo_chain` | `Undo` and `Redo` |
+| `undo_redo_chain` | `Undo`, `Redo` |
 
-The intended decision is D-004:
+Checks, in order:
 
-1. required operation is present;
-2. it affects the queried target or creates the queried identity;
-3. deleting it either changes the final answer or invalidates replay;
-4. unrelated structural operations do not have to be causal;
-5. a final ordinary target `Move` cannot be the only determinant of the answer.
+1. **presence** — every required operation type appears;
+2. **target effect** — at least one occurrence of each required type changes the
+   target. This is read off the replay (`state_before.location[target] !=
+   state_after.location[target]`), with a `Split` special case for the target being
+   the source or the spawned child. A field-matching predicate is explicitly
+   rejected here, because `Undo`/`Redo` carry no reference to the event they
+   reverse;
+3. **necessity** — deleting **each** occurrence either makes replay invalid or
+   changes the gold answer. For `query_type="count"` the compared quantity is the
+   count of the target's type in the `Merge` destination, not the target's location;
+4. **no trailing ordinary move** — a trailing target `Move` must not be the final
+   determinant. Exempt families: `split_chain` (the `Split` creates its child in the
+   source's container, so a later `Move` of that child is part of the intended
+   chain) and `undo_redo_chain` (history operations are intentionally placed before
+   final moves).
 
-### 12.1 Duplicate implementation warning
+Check 5 runs after the counterfactual replays on purpose: `Move` writes an absolute
+location, so a trailing target `Move` also trips check 3 and would mask the real
+cause.
 
-[`generator/structural.py`](../generator/structural.py) contains a reusable
-structural-causality validator. The trajectory build path also contains inline
-structural checks. These are not yet guaranteed to be identical or centrally
-wired.
+**Open divergence (SPEC OPEN-18) — live defect.** Lines 165–196 are a second copy of
+the count/location comparison that was left *outside* the `for found_idx` loop that
+binds `counterfactual`. When every occurrence deleted at that step raised
+`InvalidOperation`, the loop body never executes, `counterfactual` is unbound, and
+Python raises `UnboundLocalError` instead of a structural-causality verdict. This
+is what breaks `split_chain` in `test/test_invariants.py` and, indirectly, several
+`test_failsnow_*` markers. It is a code bug, not documentation drift.
 
-Before freezing data, one implementation should become the authoritative gate and
-the other should be removed or made a thin wrapper.
+Measured reach, 15 seeds per cell, 50 retry attempts each, dedup registry reset
+between cells:
+
+| Condition | Outcome |
+|---|---|
+| `split_chain T=4 D=0` | 14 accepted, 1 rejected |
+| `split_chain T=8 D=0` | 15 accepted |
+| `split_chain T=16 D=0` | 15 accepted |
+| `split_chain T=4/8/16 D=1` | 0 accepted, `structural_causality` |
+| `split_chain T=4/8/16 D=2` | 0 accepted, `structural_causality` |
+
+So the trigger is trace shape, not the family name: with at least one distractor
+update the sampler emits a single `Split`, every deletion is invalid, and the cell
+becomes unreachable. RQ1 asks for `D=0`, so the released grid mostly escapes it, but
+`test_invariants.py` sweeps `D=1` and dies.
 
 ---
 
 ## 13. Factor measurement
 
-[`generator/metadata.py`](../generator/metadata.py) is the intended single owner of
-factor definitions.
+`generator/metadata.py` is the single owner. `MeasuredFactors` carries
+`E_actual`, `T_actual`, `D_actual`, `V_actual`, `N_actual`, `L_word`.
 
-`MeasuredFactors` contains:
+- **`E`** — unique ids created by `Put.obj_id` and `Split.new_obj_id`. The
+  implementation also folds in `Split.source_obj_id`, which cannot change the union
+  because the source must already exist.
+- **`T` / `D`** — state-based. For every post-setup operation, compare the target's
+  location before and after; changed means `T`, unchanged means `D`. This is
+  deliberately not an operation whitelist, so `Split`, `Merge`, `Swap`, target-
+  affecting `Undo`/`Redo`, and `Remove` are classified by their actual effect.
+  `classify_op` carries the exhaustive boundary table (target as split source vs
+  child, target in merge source/destination/neither, target on either side of a
+  swap, and so on).
+- **`U`** — `T + D`; every non-`Put` operation lands in exactly one bucket.
+- **`V`** — target-location revisits plus target-affecting `Undo`/`Redo`. A revisit
+  requires returning to a previous destination after an intervening different one.
+  **Open divergence (SPEC OPEN-4):** a target-affecting `Undo` can be counted both
+  as a revisit and as a reversal. The double count is pinned by tests and still
+  undecided.
+- **`N`** — pure-text distractor sentences with no symbolic transition. Measured
+  from the sentence list when sentences are supplied, otherwise from the explicit
+  requested count.
+- **`L_word`** — `sum(len(sentence.split()) for sentence in sentences)`. The
+  generation ceiling is `L_MAX_WORDS = 600`. Tokenizer length `L_tok` is a
+  downstream diagnostic recorded by `eval/engine.py` and never a gate.
 
-- `E_actual`;
-- `T_actual`;
-- `D_actual`;
-- `V_actual`;
-- `L_word`;
-- `N_actual`.
+`L_actual` no longer exists. It duplicated `L_word` under a second name and was
+removed; only `L_word` is serialized.
 
-Derived:
-
-```text
-U_actual = T_actual + D_actual
-L_actual = L_word
-```
-
-### 13.1 `E`: lifetime entities
-
-Count the unique ids created by:
-
-- `Put.obj_id`;
-- `Split.new_obj_id`.
-
-The implementation also folds in `Split.source_obj_id`; because the source must
-already have existed, this normally does not change the union.
-
-### 13.2 `T` and `D`: state-based target effect
-
-For every post-setup operation, compare the target location before and after:
-
-```text
-affects_target =
-    location_before[target] != location_after[target]
-```
-
-If true, count the operation in `T`; otherwise count it in `D`.
-
-This means `T` can include:
-
-- target `Move`;
-- `Split` creating or changing the target;
-- `Merge` moving the target;
-- `Swap` moving the target;
-- target-affecting `Undo`;
-- target-affecting `Redo`;
-- target `Remove`, because location changes to `None`.
-
-This is deliberately state-based rather than a syntactic operation whitelist.
-
-### 13.3 `U`
-
-```text
-U = T + D
-```
-
-All non-`Put` operations are classified into exactly one of these two groups.
-
-### 13.4 `V`: revisions
-
-Current definition:
-
-```text
-V =
-    target-location revisits
-    + target-affecting Undo/Redo count
-```
-
-A revisit requires returning to a previous destination after an intervening
-different location.
-
-Known unresolved behavior: one target-affecting `Undo` or `Redo` can be counted
-both as a revisit and as a history reversal. This double count is pinned by tests
-and remains an open contract decision.
-
-### 13.5 `N`: narrative distractors
-
-`N` counts pure-text distractor sentences that perform no symbolic transition.
-
-If explicit rendered sentences are available, measurement can derive `N` from
-the supplied count or from the difference between sentence count and operation
-count. If sentences are not supplied, the explicit count is retained.
-
-### 13.6 `L`: rendered word count
-
-`L_word` is:
-
-```python
-sum(len(sentence.split()) for sentence in sentences)
-```
-
-The generation ceiling is `L_MAX_WORDS = 600`.
-
-The decision log separates:
-
-- `L_word`: generation gate;
-- `L_tok`: tokenizer diagnostic for downstream evaluation.
-
-The generator does not require `transformers` and does not use tokenizer length
-as its primary gate.
-
-### 13.7 Verification
-
-`verify_factors` checks exact equality for:
-
-- requested `E` vs `E_actual`;
-- requested `T` vs `T_actual`;
-- requested `D` vs `D_actual`.
-
-`V` is checked only when a caller supplies `min_v` or `intended_v`.
-
-`verify_length` checks the word ceiling, but an unrendered sentinel length of `-1`
-can pass unless the caller renders first. The release pipeline must therefore
-verify length only after rendering.
+`verify_factors` asserts exact equality for `E`, `T`, `D`, and checks `V` only when
+the caller supplies `min_v` or `intended_v`. `verify_length` asserts the word
+ceiling, so it must be called after rendering — an unrendered sentinel length of
+`-1` would pass.
 
 ---
 
 ## 14. Query construction
 
-[`generator/probes.py`](../generator/probes.py) defines:
+`generator/probes.py` defines `LocationQuery`, `CountQuery`, and
+`RedoValidityQuery`.
 
-- `LocationQuery`;
-- `CountQuery`;
-- `RedoValidityQuery`.
+- Location gold is `state.location.get(obj_id)`, so a removed object's gold is
+  `None`.
+- Count gold is the number of objects of a type currently in a container.
+- Redo-validity gold reads history (`can_redo(history)`), not `WorldState`, which is
+  why records must preserve history or a derived label.
 
-### 14.1 Location query
+`analysis/query_analysis.py` can filter candidate queries on measured properties:
+relevant steps, dependency depth, interleaving, revisions, answer change.
 
-Reads `state.location.get(obj_id)`.
-
-The result is a container id or `None`.
-
-### 14.2 Count query
-
-Reads the number of objects of a type currently in a container.
-
-### 14.3 Redo-validity query
-
-Reads history state rather than `WorldState`:
-
-```text
-can_redo(history)
-```
-
-This is why redo-validity records must preserve the final history object or an
-equivalent derived label.
-
-### 14.4 Candidate selection
-
-Candidate queries can include:
-
-- location queries for known entity ids;
-- count queries for container/type combinations.
-
-`select_query` can use `analysis/query_analysis.py` to filter candidates based on
-measured or syntactically inferred properties such as relevance, dependency depth,
-interleaving, revision, and answer changes.
-
-### 14.5 Relevance divergence
-
-There are two notions of relevance:
-
-1. `metadata.py`: actual before/after target-state change;
-2. `query_analysis.py`: syntactic operation/query relationship.
-
-They can disagree. The decision log keeps this open because changing either one
-would affect query selection and factor interpretation.
+**Open divergence (SPEC OPEN-5).** There are two notions of "target-relevant":
+state-change in `metadata.py` (used for `T`/`D`) and syntactic in
+`query_analysis.py` (used for candidate filtering). They can disagree. Both are
+carried; neither is authoritative for the other.
 
 ---
 
 ## 15. Counterfactual probes
 
-The current probe system classifies every candidate operation removal into:
+Every candidate removal is classified into exactly one bucket:
 
-1. `valid_answer_changing`;
-2. `valid_answer_preserving`;
-3. `invalid_replay`;
-4. `excluded_setup`.
+1. `valid_answer_changing`
+2. `valid_answer_preserving`
+3. `invalid_replay`
+4. `excluded_setup`
 
-For each candidate:
+For each candidate: remove exactly one operation, replay, classify invalid replay
+separately from a valid replay with an unchanged answer, and record the index and
+outcome. Setup `Put` operations are excluded by default, because deleting setup
+changes initial conditions rather than intervening on an event.
 
-1. remove exactly one operation;
-2. replay the reduced sequence;
-3. classify invalid replay separately;
-4. compare final query answers when replay succeeds;
-5. record the operation index and answer outcome.
+The accounting object asserts that the four buckets conserve all candidates. A
+valid `None` answer (target removed) is distinct from an invalid replay. Probe
+selection prefers one sensitive plus one insensitive valid deletion and reports the
+degeneracy rather than presenting it as balanced.
 
-Setup `Put` operations are excluded by default because deleting setup changes the
-initial conditions rather than intervening on a post-initialization event.
-
-The accounting object asserts that all candidates are represented by exactly one
-bucket.
-
-The selected probe set can request a balance between valid answer-changing and
-valid answer-preserving probes. If one class is unavailable, the degeneracy is
-reported rather than silently presented as balanced.
-
-A valid `None` answer for a removed target is distinct from an invalid replay.
-
-### 15.1 Redo probes
-
-Redo-validity examples are deliberately constructed in two classes:
-
-- valid redo: perform `Undo` and stop;
-- invalid redo: perform `Undo`, then a new ordinary operation that clears redo.
-
-The label is read from `can_redo(history)`, not assumed from the requested class.
+Redo-validity probes are built in two classes: valid redo (`Undo` then stop) and
+invalid redo (`Undo`, then a new ordinary operation that clears the redo stack). The
+label is read from history, never assumed from the requested class.
 
 ---
 
 ## 16. Rendering
 
-The active renderer is [`render/narrative.py`](../render/narrative.py).
+`render/narrative.py` is the only renderer. `render/templates.py` has been deleted,
+so the duplicate-renderer risk described in earlier revisions of this document is
+closed.
 
-It:
+`RENDER_DISPATCH` maps each operation class to a sentence renderer. For each
+operation the renderer uses the corresponding `state_before` for source-sensitive
+wording, then returns the sentence list and final state.
 
-1. replays the operation sequence;
-2. renders one sentence per operation;
-3. uses the corresponding `state_before` for source-sensitive wording;
-4. returns sentences and final state.
+`Move` uses destination-only wording ("The object was moved to container B") for
+all families, with no schema-dependent or family-specific transition branch.
 
-### 16.1 Names
+`render/names.py` provides the seeded `NameRegistry`, the `OBJECT_TYPES`
+vocabulary, container display names, ordinal and duplicate surface-name forms, and
+the two distractor helpers:
 
-[`render/names.py`](../render/names.py) provides deterministic names using a
-seeded local random generator.
+- `make_distractor_sentences` builds pure-text filler sentences;
+- `splice_distractors` inserts them at seeded positions.
 
-Repeated object types receive distinct surface names using ordinal/duplicate
-forms.
+Text distractors increase `N` and `L_word` and never touch symbolic state or gold.
 
-### 16.2 Move wording
+---
 
-The corrected design uses destination-only Move wording to reduce source-location
-shortcuts:
+## 17. The single instance gate
+
+`generator/instance.py` is the one request-to-record path. It replaced two
+producers that had disagreed on the key set and had never called
+`verify_factors` or `verify_length`.
+
+`build_validated_instance` runs, in order:
+
+| Step | Check | Failure reason |
+|---|---|---|
+| 1 | `build_trajectory` | `build_trajectory` |
+| 2 | render narrative, splice distractors | `render_narrative` |
+| 3 | `measure_factors` | `measure_factors` |
+| 4 | structural causality | `structural_causality` |
+| 4b | `verify_factors` | `verify_factors` |
+| 4c | `verify_length` | `verify_length` |
+| 4d | answer leakage | `answer_leakage` |
+| 4e | duplicate trace | `duplicate_trace` |
+| 5 | record assembly and schema assertion | — |
+
+A rejection returns `InstanceGateFailure` naming the check, the requested and
+measured values, and a description. It is never swallowed into a bare `ValueError`.
+
+`generate_instance_with_retry` counts rejection reasons across attempts and raises
+`GenerationError` with the full histogram plus the first three failures once the
+budget (default 50) is spent. Attempt 0 uses the caller's seed verbatim; later
+attempts use `attempt_seed(seed, attempt)`, a SHA-1-derived sub-seed, so a retry is a
+fresh trajectory rather than a rerun of the same draw.
+
+### 17.1 Record schema
+
+`INSTANCE_RECORD_KEYS` declares the schema once, and `build_validated_instance`
+asserts the assembled record matches it exactly, in order. A field added on one side
+only fails loudly with `raise AssertionError` so the two cannot drift.
 
 ```text
-The object was moved to container B.
+instance_id, family, experiment, condition_id, seed, trace_hash, attempt,
+generator_version, renderer_version, scoring_version,
+requested_factors, measured_factors, spec, canonical_trace, sentences, context,
+question, query_entity, gold_container, gold_answer,
+step_wise_gold, step_wise_gold_answers, final_state
 ```
 
-The decision log says this wording should apply under one contract, not only to a
-schema-specific family. The active code still contains transition branches, so
-this must be verified before generation.
+There is no `schema_version` and no `query_type` field. The `spec` sub-dict carries
+`entity_count`, `target_updates`, `distractor_updates`, `num_containers`,
+`total_updates`, `initial_placements`, `total_transitions`.
 
-### 16.3 Text distractors
+**Open divergence.** `query_type` is not serialized, so a consumer cannot tell from
+the record whether the question is a location or a count question.
+`test_questions_and_records.py::test_failsnow_record_serialises_the_query_type` marks
+this.
 
-Textual distractors are inserted into the sentence sequence at seeded positions.
-They:
+`trace_hash` is SHA-1 over the serialized canonical trace only. It does not cover
+family, target identity, or container set, and the `_SEEN_TRACE_HASHES` registry is
+process-global, so duplicates cannot be detected across separate generation
+processes. See SPEC RESOLVED-13 and `requirements.md` §12.
 
-- increase narrative length;
-- increase `N`;
-- do not mutate symbolic state;
-- do not alter symbolic gold.
+### 17.2 Count-query gold
 
-### 16.4 Duplicate renderer
+Count-query handling exists **only for `split_chain`**:
 
-[`render/templates.py`](../render/templates.py) remains as a second, overlapping
-renderer surface. The active paths generally use `narrative.py`, but the duplicate
-implementation creates maintenance and vocabulary-drift risk.
+```python
+if spec.family == "split_chain" and spec.query_type == "count":
+    merge_dst = first Merge operation's destination
+    question = question_count(merge_dst, target_type, names)
+    gold_answer = str(count)
+```
 
----
+Everything else uses `question_location` and a container display name. This matters
+because `experiments/rq1_mutation_depth.py::FAMILY_QUERY_TYPES` requests
+`query_type="count"` for `merge_chain`, `swap_chain`, and `undo_chain` too. Those
+records therefore carry a location question while their family contract says count.
+`gold_container` is always the target's final location, never the `Merge`
+destination the count question asks about, and `query_type` is not serialized, so
+downstream analysis cannot detect the substitution.
 
-## 17. Experiment generation pipeline
+Verified on 2026-10-05 through `experiments/_common.generate_instance`, requesting
+`query_type="count"`:
 
-[`experiments/_common.py`](../experiments/_common.py) is the main batch path.
+| Family | Result |
+|---|---|
+| `swap_chain T=4 D=0` | accepted; `question='Where is the coin now?'`, `gold='the tall basket'` |
+| `undo_chain T=4 D=0` | accepted; `question='Where is the map now?'`, `gold='the old chest'` |
+| `merge_chain T=4/8 D=0` | never accepted; `verify_factors:T` on all 50 attempts, every seed |
 
-For each requested instance it:
+`merge_chain` is separately unreachable: the sampler never reproduces the requested
+$T$, so RQ1 would emit zero `merge_chain` records. The dry-run probe does not catch
+this, because `probe_reachability` calls `build_trajectory` and never enters the gate.
 
-1. derives a deterministic seed;
-2. creates separate trajectory and naming RNG streams;
-3. creates a `TrajectorySpec`;
-4. calls `build_trajectory`;
-5. assigns names;
-6. renders the canonical trace;
-7. inserts optional text distractors;
-8. measures factors again using rendered sentences;
-9. checks requested/measured `E`, `T`, and `D`;
-10. checks optional `V` requirements;
-11. serializes the canonical trace;
-12. computes a trace hash;
-13. computes step-wise gold;
-14. creates question and final answer fields;
-15. emits a JSON-serializable record.
+This is the root of the red `test_questions_and_records.py` markers:
 
-Failed attempts are retried with derived seeds. After retry exhaustion, the
-instance fails rather than silently emitting an invalid record.
+- `test_failsnow_count_query_renders_a_count_question_for_every_count_family`
+- `test_failsnow_gold_container_is_the_container_the_question_asks_about[split_chain-T4]`
+- `test_failsnow_step_wise_gold_answers_are_counts_for_count_cells`
 
-### 17.1 Record fields
+### 17.3 Answer leakage
 
-Records can contain:
+`_check_answer_leakage(sentences, gold_answer, num_op_sentences, suffix_k=3)` slices
+off the operation sentences and checks the last `suffix_k` **distractor** sentences
+for the lower-cased gold as a substring. The caller passes `distractors` directly
+with `num_op_sentences=0`, and the check only runs when
+`textual_distractor_count` is non-zero.
 
-- `schema_version`;
-- `instance_id`;
-- `family`;
-- `experiment`;
-- `condition_id`;
-- `seed`;
-- `trace_hash`;
-- `requested_factors`;
-- `measured_factors`;
-- `spec`;
-- `canonical_trace`;
-- `sentences`;
-- `context`;
-- `question`;
-- `query_entity`;
-- `gold_container`;
-- `gold_answer`;
-- `step_wise_gold`;
-- `step_wise_gold_answers`;
-- `final_state`.
+Consequences, tracked as SPEC PARTIAL-10:
 
-The exact active schema still depends on the schema-version inconsistency described
-earlier.
+- a record with `N = 0` is never checked, and all RQ1 conditions have `N = 0`;
+- `suffix_k` is a keyword default rather than a `SPEC.md` constant;
+- normalization is substring matching after `lower().strip()`, not punctuation
+  trimming and article removal;
+- no rejection reason or location is persisted.
 
 ---
 
-## 18. Experiment families and grids
+## 18. Experiment generation pipeline
 
-The scripts currently define these planned sweeps for the three research questions.
+`experiments/_common.py` is the batch path: `generate_instance` derives a seed and
+calls `generate_instance_with_retry`; `generate_condition` loops a cell and returns
+records plus a failure count; `verify_generated_records` re-checks a written file;
+`print_factor_summary` prints the measured distributions.
 
-### 18.1 RQ1 — Mutation & Depth
+`verify_generated_records` is a post-hoc re-read of the JSONL, not a second
+generator.
 
-[`experiments/rq1_mutation_depth.py`](../experiments/rq1_mutation_depth.py):
+### 18.1 RQ1 — mutation and depth
 
-| Family | E | D | N | T levels | Instances/cond |
-|---|---|---|---|---|---|
-| basic_chain | 1 | 0 | 0 | {2, 4, 6, 8, 12, 16} | 50 |
-| revision | 1 | 0 | 0 | {4, 8, 12, 16} | 50 |
-| split_chain | 2 | 0 | 0 | {4, 8, 12, 16} | 50 |
-| merge_chain | 2 | 0 | 0 | {4, 8, 12, 16} | 50 |
-| swap_chain | 2 | 0 | 0 | {4, 8, 12, 16} | 50 |
-| undo_chain | 1 | 0 | 0 | {4, 8, 12, 16} | 50 |
-| undo_redo_chain | 1 | 0 | 0 | {4, 8, 12, 16} | 50 |
+`experiments/rq1_mutation_depth.py`, `D = 0`, `N = 0`, 50 instances per condition:
 
-Total: ~1,500 instances.
+| Family | E | T levels | Query type | Conditions |
+|---|---:|---|---|---:|
+| `basic_chain` | 1 | 2, 4, 6, 8, 12, 16 | location | 6 |
+| `revision` | 1 | 4, 8, 12, 16 | location | 4 |
+| `split_chain` | 2 | 4, 8, 12, 16 | count | 4 |
+| `merge_chain` | 2 | 4, 8, 12, 16 | count | 4 |
+| `swap_chain` | 2 | 4, 8, 12, 16 | count | 4 |
+| `undo_chain` | 1 | 4, 8, 12, 16 | count | 4 |
+| `undo_redo_chain` | 1 | **6**, 8, 12, 16 | location | 4 |
 
-### 18.2 RQ2 — Interference & Supersession
+30 conditions × 50 = **1,500 records**. Every family uses 3 containers.
+`undo_redo_chain` starts at 6 because the validator requires `T >= 6`.
 
-[`experiments/rq2_interference.py`](../experiments/rq2_interference.py):
+### 18.2 RQ2 — interference and supersession
 
-**Main D×N grid** (fixed target: interleaved_chain, E=3, T=8):
+`experiments/rq2_interference.py`: `interleaved_chain`, E=3, T=8, 4 containers,
+`LENGTH_MATCHED = True` (a flag with no implementation behind it).
 
-| Condition | D | N | Instances |
-|---|---|---|---|
-| D=4, N=0 | 4 | 0 | 50 |
-| D=8, N=0 | 8 | 0 | 50 |
-| D=16, N=0 | 16 | 0 | 50 |
-| D=4, N=4 | 4 | 4 | 50 |
-| D=4, N=8 | 4 | 8 | 50 |
-| D=4, N=16 | 4 | 16 | 50 |
+| Condition | D | N | Conditions |
+|---|---:|---:|---:|
+| `D4`, `D8`, `D16` | 4, 8, 16 | 0 | 3 |
+| `D4_N4`, `D4_N8`, `D4_N16` | 4 | 4, 8, 16 | 3 |
+| `revision_T8` supersession | 0 | 0 | 1 |
 
-**Supersession** (revision family, same T=8 target trajectory):
+7 conditions × 50 = **350 records**. `D = 0` is not a cell; the
+`basic_chain T=8` record is treated as the baseline.
 
-| Condition | Family | E | T | V floor |
-|---|---|---|---|---|
-| revision T=8 | revision | 1 | 8 | V_actual ≥ 2 |
+**Open divergence.** `generate_all.py::EXPERIMENT_SCRIPTS` declares an expected RQ2
+count of 700, and the module docstring repeats it. The tuple element is unpacked as
+`expected_count` and then never read, so nothing validates or reports it. The RQ2
+script defaults to 50 instances per condition and therefore plans 350. The stale
+700 predates the current default and must be corrected.
 
-Total: ~700 instances.
+**Open divergence.** The `N` sweep is not length matched. See
+[`documentation/LENGTH_CONTROLS.md`](LENGTH_CONTROLS.md).
 
-### 18.3 RQ3 — Scale & Reasoning
+### 18.3 RQ3 — scale and reasoning
 
-[`experiments/rq3_scale_reasoning.py`](../experiments/rq3_scale_reasoning.py):
-
-Evaluation-only (consumes RQ1/RQ2 data). No data generation.
-
-| Model | Prompt | Conditions |
-|---|---|---|
-| qwen2.5-0.5b | direct | Representative RQ1/RQ2 conditions |
-| qwen2.5-0.5b | structured | Representative RQ1/RQ2 conditions |
-| qwen2.5-3b | direct | Representative RQ1/RQ2 conditions |
-| qwen2.5-3b | structured | Representative RQ1/RQ2 conditions |
-| qwen2.5-7b | direct | Representative RQ1/RQ2 conditions |
-| qwen2.5-7b | structured | Representative RQ1/RQ2 conditions |
+`experiments/rq3_scale_reasoning.py` is evaluation-only: 0.5B / 3B / 7B × direct /
+structured over representative RQ1 and RQ2 conditions. It generates no data.
+`test_failsnow_rq3_condition_ids_are_unique_per_family` is red, so its condition ids
+are not yet unique per family.
 
 ---
 
-## 19. CLI generation path
+## 19. Lightweight CLI path
 
-[`generate.py`](../generate.py) provides lightweight family examples and exposes:
+`generate.py` produces family examples through `build_validated_instance`. It
+exposes `--family`, `--count`, `--seed`, `--output`. It has no `--schema-version`
+flag any more.
 
-- family;
-- count;
-- seed;
-- output path;
-- advertised schema version.
-
-This path is not equivalent to the experiment pipeline. It currently does not
-attach the same measured-factor record, does not apply the full rendered-length
-gate, and has compatibility issues around passing `schema_version` into the
-current `TrajectorySpec`.
-
-For benchmark release generation, the experiment pipeline and a strict freeze
-check should be preferred over the lightweight example CLI.
+Because it now goes through the shared gate, the earlier finding that it skipped
+`verify_factors`/`verify_length` is closed. It is still not a substitute for the
+experiment pipeline: it is not an RQ sweep and it does not enforce a grid.
 
 ---
 
 ## 20. Determinism
 
-The design requires:
+Required and implemented:
 
-- explicit `random.Random` instances;
-- no module-global random calls;
-- deterministic seed derivation;
-- deterministic name assignment;
-- no timestamps or UUIDs in instance content;
-- stable serialization;
-- trace hashes for diversity and identity checks.
+- explicit `random.Random` instances only, no module-global `random.*` calls;
+- no time, uuid, or ambient process state in instance content;
+- no set-iteration order in serialized content;
+- stable serialization and a per-record `trace_hash`;
+- separate trajectory and naming RNG streams, so changing surface names does not
+  shift symbolic construction.
 
-The experiment layer separates trajectory RNG from naming RNG so changing surface
-names does not silently change symbolic trajectory construction.
-
-The intended reproducibility property is:
+Intended property:
 
 ```text
-same condition + same seed + same code/spec
-    -> same symbolic trace and same serialized instance bytes
+same condition + same seed + same code/spec -> identical trace and identical bytes
 ```
 
-Changing RNG consumption, operation wording, gold extraction, or factor semantics
-requires a contract/version decision and regeneration.
+`test_experiment_scripts.py::test_rerun_regenerates_a_byte_identical_file` covers
+the rerun case.
+
+Changing RNG consumption, wording, gold extraction, or factor semantics requires a
+SPEC version bump and regeneration.
+
+**Open divergence (SPEC OPEN-16).** `SPEC.md` declares `version: 0.3.0` while
+`generator/constants.py::SPEC_VERSION` is `"0.2.0-v2"` and is what
+`generator_version`, `renderer_version`, and `scoring_version` stamp into every
+record. Data provenance and contract version therefore disagree.
 
 ---
 
-## 21. Dataset-level release gates
+## 21. Release gates and what is missing
 
-Before a condition can move from pending generation to generated, the release
-process should verify:
+Before a condition may move to `PENDING_GENERATION`, the process requires: contract
+consistency, import smoke, lint/type, unit and integration tests, a seed sweep, a
+family reachability sweep, factor verification, a structural-causality audit, probe
+accounting, a leakage audit, a solubility pilot, trace deduplication, a length
+audit, and manual pilot inspection.
 
-1. all reachability probes pass;
-2. every trajectory replays successfully;
-3. constructor and replay final states agree;
-4. requested `E/T/D` equal measured `E/T/D`;
-5. required `V` floors or exact values pass;
-6. rendered `L_word <= 600`;
-7. structural operations are causally necessary;
-8. no forbidden trailing target Move hides structural behavior;
-9. seeds are unique;
-10. trace hashes meet the distinctness threshold;
-11. probe classes are balanced or the imbalance is explicitly recorded;
-12. record serialization is deterministic;
-13. no secrets or local machine paths enter artifacts.
+Implemented and runnable:
 
-The old benchmark and result outputs were removed by decision D-001/D-010. They
-must not be treated as evidence for the current generator.
+- reachability probe — `generate_all.py --dry-run`, currently green for RQ1 and RQ2;
+- the ordered instance gate, including factors, length, leakage, and dedup;
+- byte-identical rerun test.
 
----
+Missing, and blocking a `GENERATED` declaration:
 
-## 22. Tests
+1. a release manifest builder and a manifest file next to the data (three
+   `test_failsnow_*` markers in `test_reproducibility_freeze.py`);
+2. `revision_count` enforcement (SPEC OPEN-15);
+3. the `generator/structural.py` defect (SPEC OPEN-18);
+4. version-stamp reconciliation (SPEC OPEN-16);
+5. family-minimum reconciliation (SPEC OPEN-17);
+6. count-query gold for `merge_chain`, `swap_chain`, and `undo_chain` (§17.2);
+7. a leakage check that inspects operation sentences, not only distractor tails
+   (SPEC PARTIAL-10);
+8. an independent factor/gold checker (SPEC OPEN-12);
+9. cross-process deduplication;
+10. length matching with `matched_*` metadata.
 
-Relevant test surfaces include:
-
-- [`test/smoke_test_trajectories.py`](../test/smoke_test_trajectories.py):
-  all eight families, invalid specs, replay consistency, determinism;
-- [`test/test_invariants.py`](../test/test_invariants.py):
-  randomized invariant and trace-diversity checks;
-- [`test/test_measured_factors.py`](../test/test_measured_factors.py):
-  factor measurement and mismatch detection;
-- [`test/test_factor_contract.py`](../test/test_factor_contract.py):
-  condition rules, state-based classification, length checks, and RNG separation;
-- [`test/test_probes.py`](../test/test_probes.py):
-  counterfactual accounting and redo labels;
-- [`test/test_scoring.py`](../test/test_scoring.py):
-  downstream extraction and protocol behavior.
-
-The current repository state is not fully green:
-
-- the deleted datasets cause the CLI evaluation test to fail because it expects
-  `data/rq1_depth/rq1_depth.jsonl`;
-- the master runner has a known `hashlib` import issue in
-  [`test/test_invariants.py`](../test/test_invariants.py).
-
-These are repository-state/test integration issues, not evidence that the
-generator release is ready.
+D-001 paused freezing until the factor contract is locked and a pilot is inspected by
+hand. D-010 removed the old data and results and forbids treating them as evidence.
 
 ---
 
-## 23. Decisions of record
+## 22. Evaluation and analysis
 
-### D-001: pause freezing
+### 22.1 Model registry
 
-No new dataset is frozen until the factor contract is locked and a small pilot is
-inspected. Old data and results are not reused as current evidence.
+`eval/models.py::ModelConfig` is frozen with `hf_model_id`, a pinned commit-hash
+`revision`, and decoding fields `temperature=0.0`, `top_p=1.0`, `do_sample=False`,
+`max_new_tokens=256`. Core: `qwen2.5-0.5b`, `qwen2.5-3b`, `qwen2.5-7b`,
+`llama-3.2-3b`, `olmo-2-1b`. Optional: `phi-4-mini`, `olmo-2-7b`.
 
-### D-002: two length quantities
+`HuggingFaceEngine.generate_batch` defaults to the model config's
+`max_new_tokens` and enforces greedy decoding unless `enforce_greedy=False`. This
+closes SPEC OPEN-8 (RESOLVED-8).
 
-`L_word` controls generation. Tokenizer length is a downstream diagnostic.
+### 22.2 Scoring
 
-### D-003: one contract
+`eval/scoring.py` is the single scoring authority. It takes the first `Final Answer:`
+line so echoed continuation text cannot replace the answer, normalises candidates
+(lower-case, trimmed punctuation, leading article dropped), and requires an exact
+single-candidate match. `strict_correct = semantic_correct AND
+protocol_compliant`; under CoT, protocol requires `Step k:` lines. Candidates are
+step-wise gold ∪ gold ∪ final-state container display names.
 
-The intended end state removes v1/v2 behavioral branching. Existing code still
-contains a transitional schema mismatch and must be reconciled.
+Count gold is a decimal string (`gold_answer = str(count)`), so scoring only ever
+sees strings (RESOLVED-9).
 
-### D-004: required structural operations
+`eval/eval_harness.py` reports `format_compliance_rate` per condition and
+`overall_format_compliance_rate` overall, separating format failure from reasoning
+failure. One gap remains red:
+`test_failsnow_wrong_numeric_answers_are_extracted_as_wrong_not_dropped`.
 
-Structural causality is declared by family. It is not inferred from every
-structural operation being relevant.
+### 22.3 Not wired into `run_eval.py`
 
-### D-005: one factor owner
+Three modules are implemented and tested but never invoked by the CLI:
 
-`generator/metadata.py` owns factor definitions. Requested factors must be checked
-against replay-measured values.
+| Module | Provides |
+|---|---|
+| `eval/baselines.py` | `compute_stateless_baseline`, `compute_mfc_baseline`, `summarize_baselines`, `run_all_baselines`, `BaselineResult` |
+| `eval/robustness.py` | `PROMPT_TEMPLATES` (3 variants), `build_prompt_variants`, `apply_paraphrase`, `evaluate_prompt_sensitivity`, `evaluate_paraphrase_robustness`, `run_robustness_suite` |
+| `analysis/solubility.py` | `check_answer_uniqueness`, `check_solubility_llm`, `run_solubility_audit`, `SolubilityResult` |
 
-### D-006: `Remove` remains outside families
+`run_eval.py` has no `--baselines` or `--robustness` flag, and `--prompt-version`
+accepts only `v1` and `v2`, so the third robustness template is unreachable from the
+CLI. Dataset shortcuts are `full`, `rq1`, `rq2`; the help text also advertises `rq3`,
+which has no dataset entry.
 
-The simulator supports `Remove`; the current benchmark families do not emit it.
+`analysis/evaluate_existing_predictions.py` re-scores prediction files offline
+without inference. It does not independently recompute gold, so it does not satisfy
+SPEC OPEN-12.
 
-### D-007: probe accounting
+### 22.4 Analysis
 
-Every candidate removal belongs to an explicit accounting class. Invalid replay is
-not silently discarded.
+`analysis/query_analysis.py` (`QuerySpec`, `analyze_trajectory`, `QueryAnalysis`),
+`analysis/first_error.py` (`ErrorType`, `analyze_first_error` with `NO_ERROR`,
+`LOCAL_ERROR`, `PROPAGATING_ERROR`, `FINAL_ONLY_ERROR`, `CANCELLATION_ERROR`),
+`analysis/failure_onset.py` (`compute_failure_onset` against
+`FAILURE_THRESHOLD_TAU = 0.70`), and the curve fits in `analysis/curves.py`
+(`fit_linear`, `fit_exponential`, `fit_sigmoid`, `compare_curves`,
+`best_fitting_curve`).
 
-### D-008: legacy implementations
-
-The decision log says root-level legacy modules were removed. The current working
-tree still contains some legacy files, so the decision and filesystem are not yet
-fully synchronized.
-
-### D-009: retain all planned family sweeps
-
-No family or factor is removed merely to make generation pass.
-
-### D-010: data/results are regenerated
-
-Datasets and results are not committed as current evidence. They are generated
-from recorded conditions and seeds after the contract is locked.
-
-### D-011: central constants
-
-Thresholds, limits, and version stamps belong in
-[`generator/constants.py`](../generator/constants.py).
-
----
-
-## 24. Open implementation issues before freezing
-
-The following issues must be resolved or explicitly accepted in a freeze decision:
-
-1. Reconcile the schema-version property, constructor calls, and tests.
-2. Wire one structural-causality validator into the normal build gate.
-3. Make `verify_factors` and `verify_length` unavoidable after rendering.
-4. Define one interpretation of structural `target_updates` and `total_updates`.
-5. Decide whether `revision_count` means an exact `V` target or only a descriptive
-   request.
-6. Resolve the `V` double-count for target-affecting history operations.
-7. Reconcile state-based factor relevance with syntactic query analysis.
-8. Centralize family registries.
-9. Centralize object-type vocabulary.
-10. Remove or explicitly quarantine duplicate renderer and legacy module surfaces.
-11. Repair tests that assume deleted data without weakening their purpose.
-12. Run a seed sweep and inspect generated records by hand.
-13. Generate a small pilot before any large immutable release.
+All of `test_analysis_curves.py`'s seven tests are `test_failsnow_*`: confidence
+intervals, small-noise model selection, parameter recovery, the chance floor, the
+50-success cell threshold, and McNemar availability are not yet implemented.
 
 ---
 
-## 25. End-to-end summary
+## 23. Tests
 
-The intended complete path is:
+`test/` is pytest-based: 611 collected, 529 passed, 79 failed, 3 skipped. 78 failures
+are `test_failsnow_*` markers for known gaps; the one unmarked failure is
+`test_known_findings.py::test_f10_revision_count_is_enforced`.
+
+The known-gap markers cluster as follows.
+
+| Area | Failing markers | Theme |
+|---|---|---|
+| `test_shortcut_audits.py` | 19 | solvers beat chance; `gold_container` balance; majority-class shortcut |
+| `test_baseline_solvers.py` | 15 | stateless and MFC solver ceilings, empty-prediction rate |
+| `test_questions_and_records.py` | 10 | count-question rendering, `gold_container`, `query_type` serialization |
+| `test_experiment_scripts.py` | 7 | script CLI parity, full-run generation, RQ2 length matching, RQ3 condition ids |
+| `test_analysis_curves.py` | 7 | curve-fit statistics and confidence intervals |
+| `test_harness_inference.py` | 5 | cell pooling, greedy path, prediction trajectory filling |
+| `test_generator_invariants.py` | 5 | RQ1 grid cell generation, query-type map vs builders, `V <= T` |
+| `test_rendering.py` | 4 | paraphrase coverage, distractor placement around `Undo`, ordinal order, "original and duplicate" explanation |
+| `test_reproducibility_freeze.py` | 3 | manifest builder and manifest file |
+| `test_world_sim.py` | 1 | invalid operation names the offending index |
+| `test_scoring_extraction.py` | 1 | wrong numeric answers scored wrong, not dropped |
+| `test_post_run_sanity.py` | 1 | sanity checks exposed as a helper |
+
+### 23.1 Legacy standalone runner
+
+`python3 test/run_all.py` runs seven scripts directly: `smoke_test`,
+`smoke_test_trajectories`, `test_invariants`, `test_measured_factors`,
+`test_analysis_and_eval`, `test_eval_pipeline`, `test_scoring`. Five pass, two fail
+for code reasons:
+
+- `smoke_test_trajectories.py` constructs a `split_chain` spec without
+  `query_type="count"`, which `build_split_chain` now requires, and dies at
+  `generator/trajectories.py:749`;
+- `test_invariants.py` hits the `UnboundLocalError` from SPEC OPEN-18.
+
+Use pytest as the source of truth.
+
+### 23.2 Audit scripts
+
+`analysis/audits/` holds nine standalone behavioural audit scripts, documented in
+its own README. They print summary statistics rather than pass/fail and are not in
+CI.
+
+---
+
+## 24. Decisions of record
+
+Summarised from [`documentation/DECISIONS.md`](DECISIONS.md); the log remains the
+normative narrative.
+
+| Id | Decision |
+|---|---|
+| D-001 | Freeze paused until the factor contract is locked and a pilot is inspected |
+| D-002 | Two length quantities: `L_word` gates generation, `L_tok` is diagnostic |
+| D-003 | One contract; no v1/v2 branching |
+| D-004 | Structural causality is declared per family, not inferred |
+| D-005 | `generator/metadata.py` owns factor definitions |
+| D-006 | `Remove` stays outside released families; `L_actual` alias removed |
+| D-007 | Probe accounting conserves all eligible deletions |
+| D-008 | Legacy root modules removed |
+| D-009 | No family or factor is dropped to make generation pass |
+| D-010 | Data and results are regenerated, never fabricated as fixtures |
+| D-011 | Thresholds and version stamps live in `generator/constants.py` |
+| D-018 | Three-RQ structure; RQ4 and RQ5 folded into RQ1/RQ2 |
+
+---
+
+## 25. Open issues before freezing
+
+1. Fix `generator/structural.py:165-196` (SPEC OPEN-18).
+2. Make `merge_chain` reachable, and make `probe_reachability` enter the gate so the
+   next unreachable condition is caught before a grid is frozen (OPEN-20).
+3. Enforce or retire `TrajectorySpec.revision_count` (OPEN-15).
+4. Reconcile `SPEC_VERSION` with the `SPEC.md` frontmatter version (OPEN-16).
+5. Reconcile the three family minima (OPEN-17).
+6. Implement count-query gold for `merge_chain`, `swap_chain`, `undo_chain`, and
+   align `gold_container` with the container the question asks about (OPEN-19, §17.2).
+7. Serialize `query_type` on the record (OPEN-19).
+8. Extend the leakage gate to operation sentences and lock `k` in `SPEC.md`
+   (PARTIAL-10).
+9. Decide the `V` double count (OPEN-4).
+10. Reconcile state-change relevance with syntactic query analysis (OPEN-5).
+11. Centralize the family registry (OPEN-6).
+12. Centralize the object-type vocabulary (OPEN-7).
+13. Add a release manifest builder and file.
+14. Make deduplication cross-process.
+15. Implement RQ2 length matching with `matched_*` metadata.
+16. Wire baselines, robustness, and solubility into the evaluation path.
+17. Add per-condition `L_tok` summaries.
+18. Lock an independent factor/gold checker (OPEN-12).
+19. Run a seed sweep and inspect a generated pilot by hand.
+
+---
+
+## 26. End-to-end summary
 
 ```text
 Condition
-  ↓
-TrajectorySpec
-  ↓
-family constructor
-  ↓
-apply_op for every operation
-  ↓
-canonical replay trace
-  ↓
-constructor/replay equality
-  ↓
-family validation
-  ↓
-measured E/T/D/V
-  ↓
-required factor verification
-  ↓
-replay-driven query and step-wise gold
-  ↓
-replay-driven rendering
-  ↓
-text distractor insertion
-  ↓
-rendered L/N measurement
-  ↓
-length and release gates
-  ↓
-counterfactual and redo probes
-  ↓
-deterministic JSONL record
+  -> TrajectorySpec
+  -> family constructor (every op through apply_op)
+  -> canonical replay trace
+  -> constructor/replay equality
+  -> validate_trajectory
+  -> structural causality (counterfactual replays)
+  -> measure_factors
+  -> verify_factors / verify_length
+  -> answer-leakage check
+  -> duplicate-trace check
+  -> record assembly with schema assertion
+  -> JSONL
 ```
 
-The most important engineering invariant is that no later stage is allowed to
-invent symbolic state. If a sentence, answer, factor, or probe cannot be traced
-back to the canonical replay, the instance is not compliant with the generator
-contract.
+The engineering invariant: no stage may invent symbolic state. Any sentence, answer,
+factor, or probe that cannot be traced back to the canonical replay is not compliant
+with the contract.

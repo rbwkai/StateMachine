@@ -541,15 +541,76 @@ Rationale: Each RQ now maps to a distinct experimental axis (mutation structure 
 
 ---
 
+## D-019 — Documentation is synchronized with the code, and contract drift is recorded rather than edited into the prose
+
+**Date:** 2026-10-05
+**Status:** in force
+**Cites:** documentation audit of commit `447116e`
+
+Every project Markdown file was re-read against the code, the tests, and the
+experiment scripts. The purpose was to remove claims that the repository can no
+longer support and to name, rather than hide, every place where the code and the
+contract disagree.
+
+**What changed:**
+
+- `README.md`: removed `diagrams/`, `data/`, and `results/` from the structure
+  table as if they were source; replaced the "master test runner" framing with the
+  pytest baseline and the `test_failsnow_*` convention; corrected the dataset plan
+  to 1,500 (RQ1) + 350 (RQ2) = 1,850; listed all seven registered models with their
+  pinned revisions; documented that `eval/baselines.py`, `eval/robustness.py`, and
+  `analysis/solubility.py` exist but are not called by `run_eval.py`.
+- `documentation/IMPLEMENTATION.md`: rewritten. Closed the schema-version,
+  `L_actual`, `render/templates.py`, duplicate-structural-checker, and
+  lightweight-CLI-gate findings, all of which are now settled in code.
+- `documentation/EVIDENCE_AUDIT.md`: rewritten. The five-RQ framing, the checked-in
+  1,800-record benchmark, and the `L_actual` factor are all obsolete.
+- `documentation/LENGTH_CONTROLS.md`: rewritten for the three-RQ structure, and now
+  states plainly that length matching is specified but not implemented.
+- `IMPLEMENTATION_PLAN.md`: converted from a forward plan into a status record,
+  since all twelve gaps now have code.
+- `SPEC.md`, `requirements.md`, `AGENTS.md`: family minima, version stamps, and the
+  agent/skill directory paths corrected; new OPEN items recorded.
+
+**What this decision refuses to do:** it does not edit the contract to match the
+code where the code is wrong. Three family minima, the `SPEC_VERSION` mismatch, and
+the `structural.py` defect are recorded as OPEN-17, OPEN-16, and OPEN-18 with the
+contract value retained. Per the authority order, the SPEC wins; the code is what
+must change.
+
+**Forces:** a release gate remains closed, and the blockers were measured rather
+than assumed on 2026-10-05 by calling `experiments/_common.generate_instance`
+directly:
+
+- Count-query gold exists only for `split_chain`; `merge_chain`, `swap_chain`, and
+  `undo_chain` silently emit location questions (OPEN-19).
+- `merge_chain` never passes the gate — `verify_factors:T` fails on all 50 attempts
+  for every seed and every `$T$` tested — so RQ1 would emit zero records for that
+  family (OPEN-20).
+- The structural gate raises `UnboundLocalError` whenever every deletion of a
+  required op is invalid; `split_chain` is accepted at `D=0` and rejected on every
+  attempt at `D>=1` (OPEN-18).
+- No release manifest exists (OPEN-12).
+
+---
+
 ## Open items carried forward, not yet decided
 
 | Item | Question | Blocks |
 |---|---|---|
 | `SPEC.md` OPEN-4 / finding F8 | $V$ double-counts: one target-affecting `Undo` contributes to both the revisit count and the history-reversal count. Which term is wrong? | any $V$-derived result; `revision` factor sweep |
 | `SPEC.md` OPEN-5 | Two definitions of "target-relevant": state-change (`measure_factors`) vs syntactic (`query_analysis`) | query selection |
-| `SPEC.md` OPEN-8 | `eval/models.py::ModelConfig.max_new_tokens = 256` vs the `generate_batch` defaults of 128 in `eval/engine.py`. Which runs? | cross-model comparability |
-| `SPEC.md` OPEN-9 | Scoring assumes string candidates; `CountQuery` gold is an `int` | count queries |
-| `SPEC.md` OPEN-10 | `TrajectorySpec.revision_count` is never enforced nor checked against measured $V$ | `rq2_revision` |
-| `SPEC.md` §2 wording | $T$ is specified as ops that "change the target's **location**"; the code and D-005 say "state **or** location". A `Remove` is $T$ in code but reads as no-change under the literal SPEC wording | SPEC text needs one word changed |
 | `SPEC.md` OPEN-3 / F7 | The sampler counts `Put` inside `update_count`; $U$ excludes `Put` | sampler vs factor contract |
-| OPEN-7 / F1 | `OBJECT_TYPES` is defined twice, in `generator/trajectories.py` and `render/names.py`, with different contents | name rendering |
+| `SPEC.md` OPEN-6 | Family registry lives in four places (`trajectories._CONSTRUCTORS`, `sampler._CONSTRUCTORS`, `FAMILY_TO_CAPABILITY_GROUP`, spec validation sets); currently equal, not enforced | family list consistency |
+| `SPEC.md` OPEN-7 / F1 | `OBJECT_TYPES` is defined twice, in `generator/trajectories.py:274` and `render/names.py:12`, with different contents | name rendering |
+| `SPEC.md` OPEN-12 | No independent factor/gold checker. `analysis/evaluate_existing_predictions.py` re-scores offline but never recomputes gold from the trace | release verification |
+| `SPEC.md` OPEN-15 (was OPEN-10 in this log) | `TrajectorySpec.revision_count` is never enforced nor checked against measured $V$ | `revision` factor sweep; the only non-`failsnow` test failure |
+| `SPEC.md` PARTIAL-10 | The leakage gate inspects only distractor-sentence tails, so it never fires on any RQ1 condition where $N=0$; suffix length is a code default, not a SPEC constant | answer-leakage gate |
+| `SPEC.md` OPEN-16 | `SPEC.md` declares `version: 0.3.0`; `generator/constants.py::SPEC_VERSION` is `"0.2.0-v2"` and stamps every record | data provenance |
+| `SPEC.md` OPEN-17 | `T_min` means the requested target-update floor ($T$ = `target_updates`), and three families disagree with the validator: `split_chain` 2 vs 3, `merge_chain` 2 vs 1, `undo_redo_chain` 3 vs 6. `swap_chain` also asks for two containers here and three in `requirements.md` §4; only two are enforced | contract/code agreement |
+| `SPEC.md` OPEN-18 | `generator/structural.py:165-196` reads `counterfactual` after the loop that binds it, so every deletion of a required op being invalid turns into `UnboundLocalError`. Measured: `split_chain` accepted at `D=0`, rejected on all attempts at `D>=1` | structural gate for `split_chain`; `test/test_invariants.py` |
+| `SPEC.md` OPEN-19 | Count-query gold is implemented only for `split_chain`. `merge_chain`, `swap_chain`, `undo_chain` accept `query_type="count"` and emit a location question with location gold, and the record has no `query_type` field | RQ1 count cells; the red `test_questions_and_records.py` markers |
+| `SPEC.md` OPEN-20 | `merge_chain` cannot pass the gate: `verify_factors:T` fails on all 50 attempts at every `$T$` tested. The dry-run probe cannot detect it because `probe_reachability` stops at `build_trajectory` | RQ1 release grid — zero `merge_chain` records |
+| `SPEC.md` §2 wording | $T$ is specified as ops that "change the target's **location**"; the code and D-005 say "state **or** location". A `Remove` is $T$ in code but reads as no-change under the literal SPEC wording | SPEC text needs one word changed |
+| `run_eval.py` dataset map | The help text advertises an `rq3` shortcut with no entry in the dataset map | CLI surface |
+| `generate_all.py` bookkeeping | Expected RQ2 record count is 700; the RQ2 script plans 350, and the declared count is never read | reported totals only |
