@@ -37,15 +37,16 @@ def test_gold_large_basket_extracted() -> None:
     assert res.protocol_compliant is True
 
 
-def test_first_final_answer_is_the_contract() -> None:
+def test_echoed_placeholder_marker_is_skipped() -> None:
+    """An echoed template line is not an answer; the next marker is read."""
     res = extract_instance_answer(
         "Final Answer: <answer>\nFinal Answer: the red crate",
         CANDIDATES,
         gold_answer="the red crate",
     )
-    assert res.answer == ""
+    assert res.answer == "the red crate"
     assert res.method == "final_answer"
-    assert res.semantic_correct is False
+    assert res.semantic_correct is True
 
 
 def test_first_final_answer_wins() -> None:

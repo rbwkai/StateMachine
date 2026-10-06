@@ -11,6 +11,10 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# Prompt slot text is owned by eval/prompts.py (AGENTS.md §5). prompts imports
+# nothing from eval, so this cannot cycle.
+from eval.prompts import ANSWER_SLOTS
+
 logger = logging.getLogger(__name__)
 
 _WARNED_RQ2_CANDIDATES = False
@@ -39,23 +43,80 @@ _STEP_LINE = re.compile(
 )
 
 
+# ------------------------------------------------------------
+# Markdown / LaTeX unwrapping of an extracted answer segment.
+#
+# Models wrap answers as "**1**", "`1`", "$1$", "\\boxed{1}", "\\(1\\)" and so on.
+# The unwrap is plain string slicing (no regex over untrusted text, AGENTS.md
+# §6.13): each pass is O(n) and the pass count is capped, so adversarial input
+# such as "*" * 50000 stays linear. Only wrappers are removed; the inner text
+# still goes through the count grammar or candidate matching, so a hedge such
+# as "**about 2**" is still rejected. Leading punctuation is never stripped:
+# ".5" must not become "5".
+# ------------------------------------------------------------
+_UNWRAP_EDGE_CHARS = " \t\r*_`$"
+_UNWRAP_TRAILING_PUNCT = " \t\r.,;!?"
+_UNWRAP_LATEX_COMMANDS: Tuple[str, ...] = ("\\boxed{", "\\textbf{", "\\text{")
+_UNWRAP_LATEX_DELIMS: Tuple[Tuple[str, str], ...] = (("\\(", "\\)"), ("\\[", "\\]"))
+_UNWRAP_MAX_PASSES = 8
+
+
+def unwrap_answer_segment(segment: str) -> str:
+    """Strip markdown emphasis, code ticks and LaTeX wrappers around an answer."""
+    text = str(segment)
+    for _ in range(_UNWRAP_MAX_PASSES):
+        before = text
+        text = text.rstrip(_UNWRAP_TRAILING_PUNCT).strip(_UNWRAP_EDGE_CHARS)
+        for command in _UNWRAP_LATEX_COMMANDS:
+            if text.startswith(command) and text.endswith("}"):
+                text = text[len(command):-1]
+                break
+        for opener, closer in _UNWRAP_LATEX_DELIMS:
+            if (
+                len(text) >= len(opener) + len(closer)
+                and text.startswith(opener)
+                and text.endswith(closer)
+            ):
+                text = text[len(opener):-len(closer)]
+                break
+        if text == before:
+            break
+    return text.strip()
+
+
+def _slot_payload(slot: str) -> str:
+    """The placeholder part of a prompt slot ("Final Answer: <x>" -> "x")."""
+    head, sep, tail = slot.partition(":")
+    payload = tail if sep and normalize_text(head) == "final answer" else slot
+    return normalize_text(payload.strip().strip("<>"))
+
+
+# Every answer slot the prompts print. An echoed slot is template text, not an
+# answer (bug: "Final Answer: <a single integer>" used to win over a real
+# later marker).
+_PROMPT_SLOT_PLACEHOLDERS = frozenset(
+    _slot_payload(slot)
+    for slots in ANSWER_SLOTS.values()
+    for slot in slots.values()
+)
+_GENERIC_PLACEHOLDERS = frozenset({"answer", "container"})
+
+
 def _is_placeholder(segment: str) -> bool:
-    cleaned = segment.strip()
+    """True for an empty segment or an echoed template slot.
+
+    Recognises the generic "<answer>" / "<container>" forms (with or without
+    angle brackets, markdown emphasis or a trailing colon) and every slot in
+    ``eval.prompts.ANSWER_SLOTS``.
+    """
+    cleaned = unwrap_answer_segment(segment)
     if not cleaned:
         return True
-    # Match placeholder patterns like <answer>, <container>, < answer >, etc.
-    if re.fullmatch(r"<\s*(?:answer|container)\s*>", cleaned, re.IGNORECASE):
+    # Bounded character strip, not a regex: "< answer >" -> "answer".
+    inner = normalize_text(cleaned.strip("<> \t").rstrip(":"))
+    if not inner:
         return True
-    # Match bare placeholder words
-    if cleaned.lower() in {"<answer>", "<container>", "answer", "container"}:
-        return True
-    # Match "Answer:" or "Container:" prefix (with or without colon)
-    if re.match(r"^(?:answer|container):?$", cleaned, re.IGNORECASE):
-        return True
-    # Match markdown bold placeholders
-    if re.fullmatch(r"\*\*(?:answer|container)\*\*", cleaned, re.IGNORECASE):
-        return True
-    return False
+    return inner in _GENERIC_PLACEHOLDERS or inner in _PROMPT_SLOT_PLACEHOLDERS
 
 
 def _unique_candidate_match(text: str, candidates: Sequence[str]) -> Optional[str]:
@@ -200,8 +261,21 @@ def read_count_answer(segment: str, question: Optional[str] = None) -> Optional[
     ``question`` is the instance's question text; its object noun is the only
     non-generic unit word accepted ("2 keys" for "How many keys ...?"). Without
     a question only the generic nouns are accepted.
+
+    Markdown / LaTeX wrappers ("**2**", "\\boxed{2}", "$2$") are removed first
+    by :func:`unwrap_answer_segment`; the unwrapped text must still follow the
+    grammar, so "**about 2**" is rejected.
     """
-    text = normalize_text(segment)
+    # Emphasis inside the segment ("**2** keys") carries no content for a count.
+    unwrapped = (
+        unwrap_answer_segment(segment).replace("*", "").replace("`", "").strip()
+    )
+    # normalize_text trims a leading "." and the grammar ignores "-", so ".5"
+    # and "-1" would otherwise read as 5 and 1; a signed or fractional
+    # number is never a count.
+    if unwrapped[:1] in (".", "-", "+") and unwrapped[1:2].isdigit():
+        return None
+    text = normalize_text(unwrapped)
     if not text:
         return None
     tokens = text.split(" ")
@@ -263,6 +337,47 @@ def _fallback_answer_segments(
         yield "last_line", lines[-1]
 
 
+# "Final Answer:" marker. Tolerates markdown emphasis around the marker and the
+# colon ("**Final Answer:** 1", "**Final Answer**: 1", "Final Answer**:** 1");
+# emphasis left in the payload ("1**") is removed by unwrap_answer_segment.
+# No two adjacent quantifiers share characters, so nothing backtracks. The
+# payload is the rest of the marker's own line; an empty one is resolved by
+# _final_answer_segments, which reads the next line instead.
+_FINAL_ANSWER_MARKER = re.compile(
+    r"final[ \t]+answer[*_]{0,3}[ \t]*:[*_]{0,3}[ \t]*([^\n]*)",
+    re.IGNORECASE,
+)
+
+
+def _final_answer_segments(raw_response: str) -> List[str]:
+    """Payload of every "Final Answer:" marker, in order.
+
+    A marker with nothing after it on its line takes the next line instead
+    ("Final Answer:\n2"), unless that line is itself a marker. A marker with
+    no payload on either line (a reply truncated right after "Final Answer:")
+    is dropped, so the reply falls through to fallback extraction.
+    """
+    segments: List[str] = []
+    for match in _FINAL_ANSWER_MARKER.finditer(raw_response):
+        payload = match.group(1).strip()
+        if not payload:
+            end = match.end()
+            if raw_response.startswith("\r\n", end):
+                end += 2
+            elif raw_response.startswith("\n", end):
+                end += 1
+            else:
+                continue
+            newline = raw_response.find("\n", end)
+            next_line = raw_response[end:] if newline == -1 else raw_response[end:newline]
+            if _FINAL_ANSWER_MARKER.search(next_line):
+                continue
+            payload = next_line.strip()
+        if payload:
+            segments.append(payload)
+    return segments
+
+
 def extract_instance_answer(
     raw_response: str,
     candidates: Sequence[str],
@@ -277,26 +392,27 @@ def extract_instance_answer(
 
     ``instance`` (when given) supplies the question text, whose object noun is
     the only non-generic unit word a count answer may carry.
+
+    ``first_final_answer`` selects among "Final Answer:" markers whose payload
+    is not an echoed placeholder (see :func:`_is_placeholder`): True (the
+    scoring contract, used by :func:`score_prediction`) takes the first such
+    marker, since later markers may be echoed or continuation text; False takes
+    the last. When every marker is a placeholder the answer is empty.
     """
     question = str(instance.get("question") or "") if instance else None
-    final_matches = list(
-        re.finditer(
-            r"final\s+answer\s*:\s*(.+?)(?:\n|$)",
-            raw_response,
-            re.IGNORECASE,
-        )
-    )
-    has_final_answer = len(final_matches) > 0
+    final_segments = _final_answer_segments(raw_response)
+    has_final_answer = len(final_segments) > 0
     has_step = _STEP_LINE.search(raw_response) is not None
 
     if has_final_answer:
-        # The single scoring contract uses the first marker. Later markers may
-        # be echoed or generated continuation text.
-        final_match = final_matches[0]
-        final_segment = final_match.group(1).strip()
+        real_segments = [seg for seg in final_segments if not _is_placeholder(seg)]
+        if real_segments:
+            final_segment = real_segments[0] if first_final_answer else real_segments[-1]
+        else:
+            final_segment = ""
         protocol_compliant = not chain_of_thought or has_step
 
-        if _is_placeholder(final_segment):
+        if not final_segment:
             answer = ""
             method = "final_answer"
         elif _numeric_answer_space(gold_answer):
@@ -311,7 +427,9 @@ def extract_instance_answer(
                 answer = ""
                 method = "ambiguous"
         else:
-            cand_match = _unique_candidate_match(final_segment, candidates)
+            cand_match = _unique_candidate_match(
+                unwrap_answer_segment(final_segment), candidates
+            )
             if cand_match is not None:
                 answer = cand_match
                 method = "final_answer"

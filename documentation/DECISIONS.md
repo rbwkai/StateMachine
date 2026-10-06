@@ -636,6 +636,30 @@ undo_redo_chain.
 
 ---
 
+## D-023 — Scoring reads wrapped and next-line answers; OLMo core model is the Instruct variant
+
+**Status:** accepted · **Cites:** SPEC §6, AGENTS.md §6.6, second f1 audit (items 2, 8, 12); user decision 2026-10-06
+
+1. **Scoring contract (SPEC §6).** The first `Final Answer:` marker whose payload is
+   not an echoed prompt slot is read; an empty marker line takes the next line; a
+   marker with no payload counts as absent, so a reply truncated after the marker
+   falls back to the answer sentence. Markdown/LaTeX wrappers are stripped. Count
+   answers use a strict token grammar: hedges ("about 2", "1 or 2", "exactly 1"),
+   signed and fractional numbers are never credited. Chat-tuned models emit
+   `**2**` and `\boxed{2}`; before this, count cells under-scored them while
+   location cells did not. Changed scoring changes numbers, so `SPEC_VERSION`
+   (and with it `SCORING_VERSION`) moves 0.4.0 -> 0.4.1 and old prediction rows
+   show as drift in `analysis/evaluate_existing_predictions.py`.
+2. **OLMo.** `allenai/OLMo-2-0425-1B` (base, no chat template, never emits EOS
+   after the answer) is replaced by `allenai/OLMo-2-0425-1B-Instruct` pinned at
+   `48d788eca847d4d7548f375ad03d3c9312f6139e`, registry key `olmo-2-1b-instruct`.
+   The key is renamed so base and Instruct runs can never share an output
+   directory. This supersedes item 2 of the earlier OLMo id entry ("KEPT").
+3. **Chat-templated prompts** are tokenized with `add_special_tokens=False`; the
+   templates already contain BOS.
+
+---
+
 ## Open items carried forward, not yet decided
 
 | Item | Question | Blocks |
@@ -647,7 +671,7 @@ undo_redo_chain.
 | `SPEC.md` OPEN-12 | No independent factor/gold checker. `analysis/evaluate_existing_predictions.py` re-scores offline but never recomputes gold from the trace | release verification |
 | `SPEC.md` OPEN-15 (was OPEN-10 in this log) | `TrajectorySpec.revision_count` is never enforced nor checked against measured $V$ | `revision` factor sweep; the only non-`failsnow` test failure |
 | `SPEC.md` PARTIAL-10 | The leakage gate inspects only distractor-sentence tails, so it never fires on any RQ1 condition where $N=0$; suffix length is a code default, not a SPEC constant | answer-leakage gate |
-| `SPEC.md` OPEN-16 | Aligned at 0.4.0 by D-022; IMPLEMENTATION/EVIDENCE_AUDIT prose still cites the old pair | data provenance |
+| `SPEC.md` OPEN-16 | Aligned at 0.4.1 (D-022, D-023); IMPLEMENTATION/EVIDENCE_AUDIT prose still cites the old pair | data provenance |
 | `SPEC.md` OPEN-17 | `T_min` means the requested target-update floor ($T$ = `target_updates`), and three families disagree with the validator: `split_chain` 2 vs 3, `merge_chain` 2 vs 1, `undo_redo_chain` 3 vs 6. `swap_chain` also asks for two containers here and three in `requirements.md` §4; only two are enforced | contract/code agreement |
 | `SPEC.md` OPEN-18 | `generator/structural.py:165-196` reads `counterfactual` after the loop that binds it, so every deletion of a required op being invalid turns into `UnboundLocalError`. Measured: `split_chain` accepted at `D=0`, rejected on all attempts at `D>=1` | structural gate for `split_chain`; `test/test_invariants.py` |
 | `SPEC.md` OPEN-19 | Count branch now generic via `count_query_target` and serialises `query_type`; merge/swap/undo count cells render count gold (D-020) | RQ1 count cells |
