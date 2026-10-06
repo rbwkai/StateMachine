@@ -46,6 +46,31 @@ FAILURE_THRESHOLD_TAU: float = 0.70
 
 
 # ============================================================
+# Per-condition release gates (experiments._common.check_condition_gates)
+#
+# Both gates run on the accepted records of one cell after its generation loop,
+# because neither property is visible from a single instance.
+# ============================================================
+
+# Most-frequent-class margin. A cell fails when its modal gold value covers more
+# than uniform chance (1 / |answer space|) plus this margin, or when it has only
+# one distinct gold value: past that point a constant-answer guesser scores
+# well above chance and accuracy no longer measures tracking. 0.15 tolerates
+# sampling noise at n=50 (one binomial SE at p=1/3 is ~0.067, so the margin is
+# a bit over two SEs) while still catching the constant-gold count cells.
+MFC_MARGIN: float = 0.15
+
+# Structural-diversity floor. structure_hash relabels containers and objects by
+# first mention and drops obj_type, so surface variants of one op skeleton
+# collapse to one structure. A cell needs at least
+# min(n_requested, MIN_DISTINCT_STRUCTURES) distinct structures; below that,
+# n instances are a handful of skeletons re-skinned, and bootstrap/McNemar
+# intervals clustered on structure_id would rest on too few clusters. 10 is the
+# smallest cluster count at which a cluster bootstrap is customarily trusted.
+MIN_DISTINCT_STRUCTURES: int = 10
+
+
+# ============================================================
 # World-size limits (SPEC constants block, TrajectorySpec)
 # ============================================================
 

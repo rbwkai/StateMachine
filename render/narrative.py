@@ -28,8 +28,8 @@ def render_put(
     ``shared_rank`` is the 1-based creation rank of this object among the
     objects of its type, and 0 when the type is not shared. For a shared type
     the bare "A key was placed ..." leaves the reader unable to resolve the
-    later references to "the original" / "the duplicate" / "the 3rd key", so the
-    sentence names the object with the same phrase obj() will use from then on.
+    later references to "the first key" / "the second key", so the sentence
+    names the object with the same phrase obj() will use from then on.
     The "<word> was placed in <container>." shape is preserved because
     eval.robustness.PARAPHRASE_RULES matches on it.
     """
@@ -38,13 +38,8 @@ def render_put(
             f"{_indefinite_article(op.obj_type)} {op.obj_type} "
             f"was placed in {names.container(op.container)}."
         )
-    # "duplicate" on its own does not say the object is the second one, so the
-    # subject carries the ordinal as well.
-    subject = (
-        f"second {op.obj_type}" if shared_rank == 2 else op.obj_type
-    )
     return (
-        f"{_indefinite_article(op.obj_type)} {subject} "
+        f"{_indefinite_article(op.obj_type)} {op.obj_type} "
         f"was placed in {names.container(op.container)} "
         f"as {names.obj_at(op.obj_type, shared_rank)}."
     )
@@ -101,18 +96,30 @@ def render_split(
     op: Split,
     before: WorldState,
     names: NameRegistry,
+    after: WorldState = None,
 ) -> str:
     container = before.location[op.source_obj_id]
     obj_type = before.object_type[op.source_obj_id]
-    phrase = names.obj(op.source_obj_id, before)
 
     # Split leaves the source in place and adds an identical object of the same
     # type in the same container, so the copy is narrated as a placement. That
     # keeps one sentence template (and one paraphrase rule) for every op that
     # puts an object somewhere.
+    if after is None:
+        phrase = names.obj(op.source_obj_id, before)
+        return (
+            f"{_indefinite_article(obj_type)} {obj_type} was placed in "
+            f"{names.container(container)} as an identical copy of {phrase}."
+        )
+    # With the post-split state both objects are named exactly as every later
+    # sentence names them ("the first key" / "the second key"), so the split is
+    # where the reader learns which ordinal is the copy. No comma: the
+    # paraphrase rule's phrase class does not cross punctuation.
+    copy_phrase = names.obj(op.new_obj_id, after)
+    source_phrase = names.obj(op.source_obj_id, after)
     return (
-        f"{_indefinite_article(obj_type)} {obj_type} was placed in "
-        f"{names.container(container)} as an identical copy of {phrase}."
+        f"{copy_phrase.capitalize()} was placed in {names.container(container)} "
+        f"as an identical copy of {source_phrase}."
     )
 
 
@@ -161,7 +168,7 @@ def _creation_ranks(trace) -> Tuple[Dict[str, int], Set[str]]:
 
     Returns (ranks, shared_types); a type is shared once a second object of it
     has ever existed, which is the point at which the narrative starts saying
-    "the original" / "the duplicate" / "the 3rd key".
+    "the first key" / "the second key" / "the third key".
     """
     ranks: Dict[str, int] = {}
     per_type: Dict[str, List[str]] = {}
@@ -198,12 +205,12 @@ def render_narrative(
     trace, final_state, _ = replay_trace(ops, containers)
 
     # Creation rank per object, in the order the reader meets them. Put renders
-    # the rank so "the original key" / "the duplicate key" resolve to a specific
+    # the rank so "the first key" / "the second key" resolve to a specific
     # object on first mention instead of appearing unexplained later.
     creation_rank, shared_types = _creation_ranks(trace)
 
     sentences = []
-    for op, before, _after in trace:
+    for op, before, after in trace:
         if isinstance(op, Move):
             sentences.append(
                 render_move(
@@ -213,6 +220,8 @@ def render_narrative(
                     include_source=include_move_sources,
                 )
             )
+        elif isinstance(op, Split):
+            sentences.append(render_split(op, before, names, after=after))
         elif isinstance(op, Put) and op.obj_type in shared_types:
             sentences.append(
                 render_put(

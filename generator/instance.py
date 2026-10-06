@@ -39,7 +39,7 @@ import hashlib
 import json
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from world import (
@@ -47,6 +47,7 @@ from world import (
     Merge,
     Operation,
     Put,
+    Split,
     gold_count,
     replay_trace,
 )
@@ -100,19 +101,74 @@ DEFAULT_MAX_ATTEMPTS = 50
 # to diagnose a systematic cause, short enough to stay readable.
 FAILURE_REPORT_LIMIT = 3
 
-# Global deduplication registry: trace_hash -> instance_id that first produced it
-# This is populated during generation and used to reject duplicates.
-_SEEN_TRACE_HASHES: Dict[str, str] = {}
+# ============================================================
+# Deduplication registry (hard rule 10)
+# ============================================================
+
+@dataclass
+class DedupRegistry:
+    """
+    The dedup scope for one generation run, passed in explicitly.
+
+    It rejects a repeat ``trace_hash`` exactly as the old module-global dict did
+    (same key, same message), and additionally counts ``structure_hash`` so a
+    caller can see how many op skeletons a cell really contains: surface
+    variants (other containers, other object types) pass trace dedup but share
+    one structure. ``experiments._common.generate_condition`` owns one registry
+    per condition, so two cells, or a probe and a sweep, can never reject each
+    other's traces.
+    """
+
+    trace_hashes: Dict[str, str] = field(default_factory=dict)
+    structure_counts: Dict[str, int] = field(default_factory=dict)
+
+    def first_seen(self, trace_hash: str) -> Optional[str]:
+        """Instance id that first registered ``trace_hash``, or None."""
+        return self.trace_hashes.get(trace_hash)
+
+    def register(self, trace_hash: str, structure_hash: str, instance_id: str) -> None:
+        self.trace_hashes[trace_hash] = instance_id
+        self.structure_counts[structure_hash] = (
+            self.structure_counts.get(structure_hash, 0) + 1
+        )
+
+    def clear(self) -> None:
+        # In place, so _SEEN_TRACE_HASHES below stays an alias of the default.
+        self.trace_hashes.clear()
+        self.structure_counts.clear()
+
+    @property
+    def n_unique_traces(self) -> int:
+        return len(self.trace_hashes)
+
+    @property
+    def n_distinct_structures(self) -> int:
+        return len(self.structure_counts)
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "unique_traces": self.n_unique_traces,
+            "distinct_structures": self.n_distinct_structures,
+        }
+
+
+# Default scope for callers that pass no registry (generate.py, tests that
+# build instances one by one). It keeps the documented process-wide behaviour of
+# hard rule 10 for them; release sweeps pass their own registry instead.
+_DEFAULT_REGISTRY = DedupRegistry()
+
+# Backward-compatible alias of the default registry's trace map (same object).
+_SEEN_TRACE_HASHES: Dict[str, str] = _DEFAULT_REGISTRY.trace_hashes
 
 
 def reset_deduplication_registry() -> None:
-    """Clear the deduplication registry (for testing or new generation runs)."""
-    _SEEN_TRACE_HASHES.clear()
+    """Clear the default registry (callers passing no explicit registry)."""
+    _DEFAULT_REGISTRY.clear()
 
 
 def get_deduplication_stats() -> Dict[str, int]:
-    """Return deduplication statistics."""
-    return {"unique_traces": len(_SEEN_TRACE_HASHES)}
+    """Statistics of the default registry."""
+    return {"unique_traces": _DEFAULT_REGISTRY.n_unique_traces}
 
 
 # The record schema, declared once. Both producers build their record in
@@ -125,6 +181,8 @@ INSTANCE_RECORD_KEYS: Tuple[str, ...] = (
     "condition_id",
     "seed",
     "trace_hash",
+    "structure_hash",
+    "structure_id",
     "attempt",
     "generator_version",
     "renderer_version",
@@ -137,7 +195,10 @@ INSTANCE_RECORD_KEYS: Tuple[str, ...] = (
     "context",
     "question",
     "query_entity",
+    "target_entity",
     "gold_container",
+    "query_container",
+    "target_final_container",
     "gold_answer",
     "step_wise_gold",
     "step_wise_gold_answers",
@@ -315,6 +376,78 @@ def _canonical_trace(ops: Sequence[Operation]) -> List[Dict[str, Any]]:
     return canonical_trace
 
 
+def trace_hash_of(canonical_trace: Sequence[Mapping[str, Any]]) -> str:
+    """sha1 over the serialised canonical trace (RESOLVED-13; bytes unchanged)."""
+    return hashlib.sha1(
+        json.dumps(list(canonical_trace), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+# Fields of a canonical-trace step that name a container or an object. Every
+# other field is either op_type (kept) or obj_type (dropped).
+_CONTAINER_FIELDS = frozenset(
+    {"dst", "container", "src_container", "dst_container", "container_a", "container_b"}
+)
+_OBJECT_FIELDS = frozenset({"obj_id", "source_obj_id", "new_obj_id"})
+
+
+def _structure_trace(canonical_trace: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    The op skeleton of a canonical trace.
+
+    Containers are relabelled ``C0, C1, ...`` and objects ``O0, O1, ...`` in
+    order of first mention (walking steps in order and fields in the frozen
+    ``_canonical_trace`` order); ``obj_type`` is dropped. Two traces that differ
+    only in which containers they use, which object ids they carry, or which
+    object types they name therefore share one skeleton.
+    """
+    containers: Dict[str, str] = {}
+    objects: Dict[str, str] = {}
+    skeleton: List[Dict[str, Any]] = []
+    for step in canonical_trace:
+        out: Dict[str, Any] = {}
+        for key, value in step.items():
+            if key == "obj_type":
+                continue
+            if key in _CONTAINER_FIELDS:
+                value = containers.setdefault(value, f"C{len(containers)}")
+            elif key in _OBJECT_FIELDS:
+                value = objects.setdefault(value, f"O{len(objects)}")
+            out[key] = value
+        skeleton.append(out)
+    return skeleton
+
+
+def structure_hash_of(canonical_trace: Sequence[Mapping[str, Any]]) -> str:
+    """
+    sha1 of the relabelled op skeleton: the diversity and clustering unit.
+
+    Additive to ``trace_hash``, which still deduplicates; this one only counts
+    how many genuinely different skeletons a cell contains (and is stored as
+    ``structure_id``, the cluster for bootstrap/McNemar).
+    """
+    return hashlib.sha1(
+        json.dumps(_structure_trace(canonical_trace), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def query_entity_of(family: str, ops: Sequence[Operation], target_obj: str) -> str:
+    """
+    The object the rendered question is about.
+
+    For ``split_chain`` that is the Split child (D-004, D-020): the count
+    question names the child's end container. The trajectory's ``target_obj``
+    stays the source, because the target/distractor classification follows the
+    source's moves. Every other family queries ``target_obj`` itself. The first
+    Split is the one ``metadata.count_query_target`` reads.
+    """
+    if family == "split_chain":
+        for op in ops:
+            if isinstance(op, Split):
+                return op.new_obj_id
+    return target_obj
+
+
 # ============================================================
 # Answer leakage validator
 # ============================================================
@@ -368,6 +501,7 @@ def build_validated_instance(
     attempt: int = 0,
     min_v: Optional[int] = None,
     intended_v: Optional[int] = None,
+    registry: Optional[DedupRegistry] = None,
 ) -> InstanceResult:
     """
     Turn one generation request into a validated instance record.
@@ -383,6 +517,9 @@ def build_validated_instance(
         Separate display-name stream, so a name change cannot shift a trace.
     textual_distractor_count:
         Pure-text distractor sentences to splice in (factor $N$, SPEC §2).
+    registry:
+        Dedup scope (hard rule 10). ``None`` uses the process-wide default
+        registry, which ``reset_deduplication_registry`` clears.
 
     Returns
     -------
@@ -617,9 +754,9 @@ def build_validated_instance(
     # --------------------------------------------------------
 
     canonical_trace = _canonical_trace(trajectory.ops)
-    trace_hash = hashlib.sha1(
-        json.dumps(canonical_trace, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    trace_hash = trace_hash_of(canonical_trace)
+    structure_hash = structure_hash_of(canonical_trace)
+    dedup = registry if registry is not None else _DEFAULT_REGISTRY
 
     trace, _, _ = replay_trace(trajectory.ops, trajectory.containers)
     step_wise_gold = [
@@ -630,8 +767,10 @@ def build_validated_instance(
     step_wise_gold_answers = aligned_step_wise_gold_answers
 
     question = question_location(trajectory.target_obj, final_state, names)
-    target_container = final_state.location.get(trajectory.target_obj)
+    target_final_container = final_state.location.get(trajectory.target_obj)
+    target_container = target_final_container
     gold_answer = names.container(target_container) if target_container else None
+    query_entity = trajectory.target_obj
 
     # A count cell asks a counting question and answers with a number. Every
     # count family goes through this one branch; previously it was hard-coded to
@@ -652,6 +791,7 @@ def build_validated_instance(
         question = question_count(count_container, count_type, names)
         gold_answer = str(gold_count(final_state, count_container, count_type))
         target_container = count_container
+        query_entity = query_entity_of(spec.family, trajectory.ops, trajectory.target_obj)
 
     # --------------------------------------------------------
     # 4d. Answer leakage gate: reject if gold answer appears
@@ -674,12 +814,13 @@ def build_validated_instance(
     # --------------------------------------------------------
 
     try:
-        if trace_hash in _SEEN_TRACE_HASHES:
+        first = dedup.first_seen(trace_hash)
+        if first is not None:
             raise AssertionError(
                 f"duplicate trace_hash {trace_hash[:12]}... "
-                f"(first seen in {_SEEN_TRACE_HASHES[trace_hash]})"
+                f"(first seen in {first})"
             )
-        _SEEN_TRACE_HASHES[trace_hash] = instance_id
+        dedup.register(trace_hash, structure_hash, instance_id)
     except AssertionError as exc:
         return InstanceResult(
             failure=_failure(CHECK_DUPLICATE, spec, instance_id, exc, gate_requested, measured_view)
@@ -696,6 +837,10 @@ def build_validated_instance(
         "condition_id": condition_id,
         "seed": seed,
         "trace_hash": trace_hash,
+        # Relabelled op skeleton (structure_hash_of); structure_id is the same
+        # value under the name analysis clusters on.
+        "structure_hash": structure_hash,
+        "structure_id": structure_hash,
         "attempt": attempt,
 
         # Release metadata (hard rule 10): a regenerated grid must never be
@@ -727,8 +872,19 @@ def build_validated_instance(
         "sentences": sentences,
         "context": " ".join(sentences),
         "question": question,
-        "query_entity": trajectory.target_obj,
+        # The object the question is about: the Split child for split_chain
+        # (D-020), target_obj otherwise. target_entity is the trajectory's
+        # tracked object, which the T/D classification and the structural
+        # re-check use.
+        "query_entity": query_entity,
+        "target_entity": trajectory.target_obj,
+        # gold_container is kept for backward compatibility and always equals
+        # query_container: the container the question asks about (the gold
+        # location for a location query, the counted container for a count).
         "gold_container": target_container,
+        "query_container": target_container,
+        # Where target_entity ends, whatever the question asks.
+        "target_final_container": target_final_container,
         "gold_answer": gold_answer,
         "step_wise_gold": step_wise_gold,
         "step_wise_gold_answers": step_wise_gold_answers,
@@ -758,20 +914,28 @@ def build_validated_instance(
 # Bounded retry with reported reasons
 # ============================================================
 
+def _stream_seed(seed: int, attempt: int, stream: str) -> int:
+    """sha1-derived 63-bit seed for one named stream of one attempt."""
+    digest = hashlib.sha1(f"{seed}|{attempt}|{stream}".encode("utf-8")).hexdigest()
+    return int(digest, 16) % 2**63
+
+
 def attempt_seed(seed: int, attempt: int) -> int:
     """
-    Sub-seed for one attempt.
+    Trajectory-stream seed for one attempt: sha1(f"{seed}|{attempt}|traj").
 
-    Attempt 0 uses the caller's seed verbatim; every later attempt derives its
-    own stream from ``seed|attempt_<n>``, so a retry is a fresh trajectory
-    rather than a rerun of the same draw.
+    Both streams of an attempt are hashed from a stream label, so neither is
+    an affine function of the other. The previous scheme (trajectory=seed,
+    names=seed*2+1) let instance A's name stream equal instance B's trajectory
+    stream whenever seed_B = 2*seed_A + 1. Every attempt, including attempt 0,
+    is derived, so a retry is a fresh trajectory rather than a rerun.
     """
-    if attempt == 0:
-        return seed
-    return int(
-        hashlib.sha1(f"{seed}|attempt_{attempt}".encode("utf-8")).hexdigest()[:8],
-        16,
-    )
+    return _stream_seed(seed, attempt, "traj")
+
+
+def names_seed(seed: int, attempt: int) -> int:
+    """Display-name stream seed for one attempt: sha1(f"{seed}|{attempt}|names")."""
+    return _stream_seed(seed, attempt, "names")
 
 
 def _format_histogram(reasons: Mapping[str, int]) -> str:
@@ -793,6 +957,7 @@ def generate_instance_with_retry(
     intended_v: Optional[int] = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     rng: Optional[random.Random] = None,
+    registry: Optional[DedupRegistry] = None,
 ) -> Dict[str, Any]:
     """
     Run the gate up to ``max_attempts`` times and return the accepted record.
@@ -804,20 +969,23 @@ def generate_instance_with_retry(
     ``rng`` seeds attempt 0 verbatim when supplied; retries always fall back to
     the deterministic sub-seed schedule, so a retry never depends on how much of
     an injected stream the previous attempt happened to consume.
+
+    ``registry`` is the dedup scope; ``None`` uses the process-wide default.
     """
     reasons: Counter[str] = Counter()
     samples: List[InstanceGateFailure] = []
 
     for attempt in range(max_attempts):
-        sub_seed = attempt_seed(seed, attempt)
         traj_rng = (
-            rng if (attempt == 0 and rng is not None) else random.Random(sub_seed)
+            rng
+            if (attempt == 0 and rng is not None)
+            else random.Random(attempt_seed(seed, attempt))
         )
 
         result = build_validated_instance(
             traj_rng,
             spec,
-            random.Random(sub_seed * 2 + 1),
+            random.Random(names_seed(seed, attempt)),
             textual_distractor_count,
             instance_id=instance_id,
             experiment=experiment,
@@ -826,6 +994,7 @@ def generate_instance_with_retry(
             attempt=attempt,
             min_v=min_v,
             intended_v=intended_v,
+            registry=registry,
         )
 
         if result.ok and result.record is not None:

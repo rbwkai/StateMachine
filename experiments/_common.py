@@ -34,9 +34,14 @@ from generator import (
     DEFAULT_MAX_ATTEMPTS,
     TrajectorySpec,
     generate_instance_with_retry,
-    reset_deduplication_registry,
 )
-from generator.constants import L_MAX_WORDS, SPEC_VERSION
+from generator.constants import (
+    L_MAX_WORDS,
+    MFC_MARGIN,
+    MIN_DISTINCT_STRUCTURES,
+    SPEC_VERSION,
+)
+from generator.instance import DedupRegistry
 from world import GenerationError
 
 
@@ -70,6 +75,7 @@ def generate_instance(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     rng: Optional[random.Random] = None,
     query_type: str = "location",
+    registry: Optional[DedupRegistry] = None,
 ) -> Dict[str, Any]:
     """
     Generate one fully-verified DWS-Bench instance.
@@ -84,6 +90,10 @@ def generate_instance(
     ``max_attempts`` rejections have been spent. The error message carries the
     failure-reason histogram and the first concrete failures, so an unreachable
     condition is diagnosable instead of silently yielding ``None``.
+
+    ``registry`` is the dedup scope (one per condition in
+    ``generate_condition``); ``None`` falls back to the generator's
+    process-wide default registry.
     """
 
     total_updates = target_updates + distractor_updates
@@ -109,6 +119,7 @@ def generate_instance(
         intended_v=intended_v,
         max_attempts=max_attempts,
         rng=rng,
+        registry=registry,
     )
 
 
@@ -132,6 +143,7 @@ def generate_condition(
     textual_distractor_count: int = 0,
     query_type: str = "location",
     seed_group: str = "",
+    enforce_gates: bool = True,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Generate num_instances for one experimental condition.
@@ -144,10 +156,17 @@ def generate_condition(
     cells of one group build the same trace at the same instance index. That is
     what makes an RQ cell pair differ only in the factor under test, instead of
     also differing in the random draw (SPEC §5, RQ2 "same target trajectory").
+
+    After the loop the per-cell gates of ``check_condition_gates`` run on the
+    accepted records (gold balance, structural diversity) and raise
+    ``GenerationError`` when either fails. ``enforce_gates=False`` only skips
+    the raise, for tests that build deliberately tiny cells; experiments keep
+    the default.
     """
 
-    # Reset deduplication registry for each new condition batch
-    reset_deduplication_registry()
+    # One dedup scope per condition (hard rule 10). An explicit object, not a
+    # process-global reset, so a probe or another cell cannot share it.
+    registry = DedupRegistry()
 
     if not condition_id:
         condition_id = f"{family}_T{target_updates}_D{distractor_updates}_E{entity_count}"
@@ -187,6 +206,7 @@ def generate_condition(
                 intended_v=intended_v,
                 textual_distractor_count=textual_distractor_count,
                 query_type=query_type,
+                registry=registry,
             )
         except GenerationError as exc:
             # One unreachable instance must not abort the whole sweep: count it
@@ -210,7 +230,127 @@ def generate_condition(
         f"{failures} failed  ({elapsed:.1f}s)"
     )
 
+    if enforce_gates:
+        stats = check_condition_gates(
+            records, num_instances, condition_id=condition_id
+        )
+    else:
+        stats = condition_gate_stats(records)
+    print(
+        f"    Gates: {stats['n_distinct_structures']} distinct structures, "
+        f"modal gold share {stats['modal_share']:.2f} "
+        f"(chance {stats['chance']:.2f}, {stats['n_distinct_gold']} distinct gold)"
+    )
+
     return records, failures
+
+
+# ============================================================
+# Per-condition gates (G1 gold balance, G5 structural diversity)
+# ============================================================
+
+def _answer_key(record: Dict[str, Any]) -> Optional[str]:
+    """The gold value a constant guesser would have to match.
+
+    Location gold is compared on the container *id* (``query_container``):
+    display names are randomised per instance, so a cell that always ends in
+    ``c1`` would look balanced on names. Count gold is the decimal string.
+    """
+    if record.get("spec", {}).get("query_type", "location") == "count":
+        gold = record.get("gold_answer")
+        return None if gold in (None, "") else str(gold)
+    container = record.get("query_container", record.get("gold_container"))
+    return None if container is None else str(container)
+
+
+def _answer_space_size(record: Dict[str, Any]) -> int:
+    """|answer space| of one record, read from its own fields.
+
+    Location: the container count (``final_state.containers``). Count: the
+    number of objects sharing the queried type, plus one, i.e. the counts
+    0..k the question admits; types come from the serialised Puts, and a
+    Split child copies its source's type. This is computed here rather than
+    via ``eval.baselines.chance_level`` because generation must not import
+    eval (AGENTS.md §4).
+    """
+    if record.get("spec", {}).get("query_type", "location") != "count":
+        return max(1, len(record.get("final_state", {}).get("containers") or ()))
+    types: Dict[str, str] = {}
+    for step in record.get("canonical_trace") or ():
+        if step.get("op_type") == "PUT":
+            types[step["obj_id"]] = step.get("obj_type", "")
+        elif step.get("op_type") == "SPLIT" and step.get("source_obj_id") in types:
+            types[step["new_obj_id"]] = types[step["source_obj_id"]]
+    query_type = types.get(str(record.get("query_entity")))
+    same_type = sum(1 for t in types.values() if t == query_type)
+    return same_type + 1
+
+
+def condition_gate_stats(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Gold balance and structural diversity of one cell. Pure, no raise.
+
+    ``chance`` is uniform over the cell's answer space, taken as the largest
+    per-record answer space (the answer set a responder faces in the cell);
+    a larger space gives a lower chance and therefore a stricter gate.
+    """
+    golds = Counter(k for k in (_answer_key(r) for r in records) if k is not None)
+    n_gold = sum(golds.values())
+    modal_share = (golds.most_common(1)[0][1] / n_gold) if n_gold else 0.0
+    space = max((_answer_space_size(r) for r in records), default=1)
+    structures = {r.get("structure_hash") for r in records} - {None}
+    return {
+        "n_records": len(records),
+        "n_distinct_gold": len(golds),
+        "gold_distribution": dict(sorted(golds.items())),
+        "modal_share": modal_share,
+        "answer_space": space,
+        "chance": 1.0 / space,
+        "n_distinct_structures": len(structures),
+    }
+
+
+def check_condition_gates(
+    records: Sequence[Dict[str, Any]],
+    n_requested: int,
+    *,
+    condition_id: str = "",
+    mfc_margin: float = MFC_MARGIN,
+    min_distinct_structures: int = MIN_DISTINCT_STRUCTURES,
+) -> Dict[str, Any]:
+    """Raise ``GenerationError`` when a cell fails a per-cell gate.
+
+    (a) gold balance: fails with one distinct gold value, or when the modal
+        gold share exceeds uniform chance + ``mfc_margin``;
+    (b) structural diversity: fails when the cell has fewer than
+        ``min(n_requested, min_distinct_structures)`` distinct
+        ``structure_hash`` values.
+
+    Returns the ``condition_gate_stats`` dict when both gates pass.
+    """
+    stats = condition_gate_stats(records)
+    problems: List[str] = []
+    if stats["n_distinct_gold"] <= 1:
+        problems.append(
+            f"gold is constant ({stats['gold_distribution']})"
+        )
+    elif stats["modal_share"] > stats["chance"] + mfc_margin:
+        problems.append(
+            f"modal gold share {stats['modal_share']:.3f} > chance "
+            f"{stats['chance']:.3f} + margin {mfc_margin} "
+            f"({stats['gold_distribution']})"
+        )
+    floor = min(n_requested, min_distinct_structures)
+    if stats["n_distinct_structures"] < floor:
+        problems.append(
+            f"{stats['n_distinct_structures']} distinct structures < {floor} "
+            f"(min(n_requested={n_requested}, {min_distinct_structures}))"
+        )
+    if problems:
+        raise GenerationError(
+            f"{condition_id or 'condition'}: per-cell gate failed: "
+            + "; ".join(problems)
+        )
+    return stats
 
 
 # ============================================================
@@ -376,8 +516,14 @@ def build_manifest(
             condition: {
                 "family": condition_records[0].get("family", ""),
                 "instances": len(condition_records),
+                # Cluster count for bootstrap/McNemar (structure_id) and the
+                # gold balance the per-cell gate judged.
+                "n_distinct_structures": gate["n_distinct_structures"],
+                "gold_modal_share": round(gate["modal_share"], 6),
+                "gold_chance": round(gate["chance"], 6),
             }
             for condition, condition_records in sorted(by_condition.items())
+            for gate in (condition_gate_stats(condition_records),)
         },
         # A cell the reachability probe found unreachable is reported here, so a
         # reader of the dataset sees the gap instead of inferring a missing cell.
@@ -550,9 +696,8 @@ def probe_reachability(
     for i in range(n_seeds):
         seed_key = f"probe|{family}|T{target_updates}|D{distractor_updates}|{query_type}|{i}"
         seed = int(hashlib.sha1(seed_key.encode("utf-8")).hexdigest()[:8], 16)
-        # The dedup registry is process-global and rejects a repeat trace_hash;
-        # each probe seed must be judged on its own.
-        reset_deduplication_registry()
+        # Each probe seed is judged on its own: a fresh dedup scope, which also
+        # leaves every sweep's registry untouched.
         try:
             generate_instance(
                 seed=seed,
@@ -567,6 +712,7 @@ def probe_reachability(
                 textual_distractor_count=textual_distractor_count,
                 max_attempts=PROBE_MAX_ATTEMPTS,
                 query_type=query_type,
+                registry=DedupRegistry(),
             )
             successes += 1
         except GenerationError as exc:

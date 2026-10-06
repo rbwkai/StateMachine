@@ -115,7 +115,7 @@ def test_question_names_the_target_like_the_narrative(family, e, t, d):
         else:
             continue
         # Compare content words: the narrative says "A pen"/"The pen" and
-        # "letter" where the question says "the duplicate key"/"letters".
+        # "letter" where the question says "the second key"/"letters".
         content = re.sub(r"^(a|an|the)\s+", "", phrase.lower()).strip()
         candidates = {content}
         if content.endswith("es"):
@@ -140,7 +140,7 @@ def test_question_names_the_target_like_the_narrative(family, e, t, d):
 # ---------------------------------------------------------------------------
 
 def test_ordinals_run_through_the_twelfth_object():
-    """NameRegistry.obj() must produce original, duplicate and 3rd..12th."""
+    """NameRegistry.obj() must produce first, second, ..., twelfth."""
     from world import WorldState
 
     containers = {"c0"}
@@ -152,15 +152,15 @@ def test_ordinals_run_through_the_twelfth_object():
     names = NameRegistry(random.Random(0), containers)
     rendered = [names.obj(f"o{i}", state) for i in range(12)]
     assert len(set(rendered)) == 12, rendered
-    assert set(rendered) == {"the original key", "the duplicate key"} | {
-        f"the {n}{suffix} key"
-        for n, suffix in zip(range(3, 13), ["rd", "th", "th", "th", "th", "th", "th",
-                                             "th", "th", "th"])
-    }, sorted(rendered)
+    assert rendered == [
+        f"the {word} key"
+        for word in ("first", "second", "third", "fourth", "fifth", "sixth",
+                     "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth")
+    ], rendered
 
 
-def test_ordinal_suffixes_follow_the_english_rules():
-    """11th/12th/13th take 'th'; 21st/22nd/23rd do not."""
+def test_spelled_ordinals_follow_the_english_rules():
+    """eleventh/twelfth/thirteenth/twentieth, then hyphenated twenty-first."""
     from world import WorldState
 
     containers = {"c0"}
@@ -171,19 +171,19 @@ def test_ordinal_suffixes_follow_the_english_rules():
         containers=containers,
     )
     rendered = {names.obj(f"o{i}", state) for i in range(23)}
-    for expected in ("the 11th key", "the 12th key", "the 13th key", "the 20th key",
-                     "the 21st key", "the 22nd key", "the 23rd key"):
+    for expected in ("the eleventh key", "the twelfth key", "the thirteenth key",
+                     "the twentieth key", "the twenty-first key",
+                     "the twenty-second key", "the twenty-third key"):
         assert expected in rendered, sorted(rendered)
 
 
-def test_failsnow_ordinals_follow_creation_order_not_lexicographic_id_order():
+def test_ordinals_follow_creation_order_not_lexicographic_id_order():
     """Ordinals should follow the order the objects appear in the story.
 
-    Currently same-type objects are ranked with sorted(obj_id), so 'o10' and
-    'o11' are named 'the 5th key' and 'the 6th key' while 'o3' is 'the 3rd key'.
-    The reader sees 'the 12th key' before 'the 3rd key' and has no way to know
-    which object was introduced first. Not in the pre-freeze [fails now] list;
-    found by this suite.
+    Ranking same-type objects with sorted(obj_id) would name 'o10' and 'o11'
+    'the fifth key' and 'the sixth key' while 'o3' is 'the third key', so the
+    reader would meet 'the twelfth key' before 'the third key'. Formerly a
+    test_failsnow_*; closed by ranking on state.object_type insertion order.
     """
     from world import WorldState
 
@@ -194,18 +194,17 @@ def test_failsnow_ordinals_follow_creation_order_not_lexicographic_id_order():
         containers=containers,
     )
     names = NameRegistry(random.Random(0), containers)
-    assert names.obj("o2", state) == "the 3rd key"
-    assert names.obj("o11", state) == "the 12th key"
+    assert names.obj("o2", state) == "the third key"
+    assert names.obj("o11", state) == "the twelfth key"
 
 
-def test_failsnow_original_and_duplicate_are_explained_to_the_reader():
-    """[checklist 4] "'original' and 'duplicate' are defined to the reader
-    somewhere."
+def test_same_type_ordinal_names_are_introduced_to_the_reader():
+    """[checklist 4] same-type names are defined to the reader somewhere.
 
-    The renderer switches to 'the original key' / 'the duplicate key' as soon as
-    two objects share a type, but no sentence in the narrative explains which
-    object each word refers to, so a reader cannot resolve the reference from the
-    context alone. Not in the pre-freeze [fails now] list; found by this suite.
+    Formerly test_failsnow_original_and_duplicate_are_explained_to_the_reader:
+    the renderer said 'the original key' / 'the duplicate key' for independent
+    Puts. Same-type objects are now named by order of first appearance, and the
+    Put that introduces each one says which ordinal it is.
     """
     from render.narrative import render_narrative
 
@@ -213,15 +212,11 @@ def test_failsnow_original_and_duplicate_are_explained_to_the_reader():
     names = NameRegistry(random.Random(0), containers)
     ops = [Put("o0", "key", "c0"), Put("o1", "key", "c1"), Move("o0", "c2")]
     sentences, _state = render_narrative(ops, containers, names)
-    assert any("the original" in s or "the duplicate" in s for s in sentences)
     context = " ".join(sentences).lower()
-    explains = any(
-        word in context for word in ("first", "second", "copy", "copies", "split", "another")
-    )
-    assert explains, (
-        "narrative uses original/duplicate without telling the reader which "
-        f"object is which: {sentences}"
-    )
+    assert "original" not in context and "duplicate" not in context, sentences
+    assert sentences[0].endswith("as the first key."), sentences
+    assert sentences[1].endswith("as the second key."), sentences
+    assert sentences[2].startswith("The first key was moved"), sentences
 
 
 def test_all_object_types_get_a_correct_article_and_plural():
@@ -386,7 +381,7 @@ def test_make_distractor_sentences_avoids_used_types_and_containers():
     container_names = set(names.container_names.values())
     for seed in range(50):
         sentences = make_distractor_sentences(
-            random.Random(seed), 8, names, ["key", "gem"], exclude_container="c0"
+            random.Random(seed), 8, names, ["key", "gem"]
         )
         assert len(sentences) == 8
         for sentence in sentences:
