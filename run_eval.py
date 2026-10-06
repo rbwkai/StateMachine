@@ -46,7 +46,8 @@ from analysis.failure_onset import (
 )
 from analysis.first_error import analyze_first_error
 from analysis.solubility import run_solubility_audit
-from eval.baselines import query_type_of
+from eval.baselines import query_type_of, run_all_baselines
+from eval.post_run_sanity import sanity_checks, sanity_failures
 from eval.engine import HuggingFaceEngine, InferenceEngine, MockInferenceEngine
 from eval.scoring import (
     candidate_answers,
@@ -185,6 +186,29 @@ def robustness_path_for(results_file: Path) -> Path:
     )
 
 
+def sanity_path_for(results_file: Path) -> Path:
+    """``<results_stem>.sanity.json`` next to ``results_file`` (see
+    :func:`robustness_path_for`)."""
+    return results_file.with_name(
+        f"{_safe_file_stem(results_file.stem)}.sanity.json"
+    )
+
+
+def run_sanity_screen(
+    dataset_records: List[Dict[str, Any]],
+    instance_results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Checklist-12 screen of one run: per-cell stats against the weak
+    baselines, plus the list of checks the run did not pass."""
+    baselines = run_all_baselines(dataset_records)
+    stats = sanity_checks(
+        dataset_records,
+        {"instance_results": instance_results},
+        baseline_accuracy=baselines,
+    )
+    return {"per_condition": stats, "failures": sanity_failures(stats)}
+
+
 def run_robustness_checks(
     engine: InferenceEngine,
     dataset_records: List[Dict[str, Any]],
@@ -288,8 +312,9 @@ def run_evaluation(
 
     # "<dataset>.robustness.json": named after the dataset, not the metrics file.
     robustness_file = robustness_path_for(model_output_dir / f"{dataset_name}.jsonl")
+    sanity_file = sanity_path_for(model_output_dir / f"{dataset_name}.jsonl")
 
-    artifacts = [pred_file, csv_file, metrics_file, report_file]
+    artifacts = [pred_file, csv_file, metrics_file, report_file, sanity_file]
     if robustness:
         artifacts.append(robustness_file)
     if not overwrite:
@@ -415,6 +440,11 @@ def run_evaluation(
             # scored by the same rules, and would silently re-score mismatched data.
             "trace_hash": rec.get("trace_hash"),
             "scoring_version": SCORING_VERSION,
+            # Run condition per row, so re-scoring does not depend on the
+            # directory layout (and re-applies CoT protocol enforcement).
+            "model": model_config.name,
+            "chain_of_thought": chain_of_thought,
+            "max_new_tokens": effective_max_tokens,
             "requested_factors": rec.get("requested_factors", {}),
             "measured_factors": rec.get("measured_factors", {}),
             "question": rec.get("question"),
@@ -561,6 +591,13 @@ def run_evaluation(
 
     generate_markdown_report(metrics, report_file)
 
+    # Written separately so the metrics schema is unchanged.
+    sanity = run_sanity_screen(dataset_records, instance_results)
+    with open(sanity_file, "w", encoding="utf-8") as f:
+        json.dump(sanity, f, indent=2, ensure_ascii=False)
+    for failure in sanity["failures"]:
+        logger.warning(f"Sanity check: {failure}")
+
     if robustness:
         # Written separately so the metrics schema is identical with the flag off.
         robustness_summary = run_robustness_checks(
@@ -574,6 +611,7 @@ def run_evaluation(
     logger.info(f"Saved audit CSV   → {csv_file}")
     logger.info(f"Saved metrics     → {metrics_file}")
     logger.info(f"Saved report      → {report_file}")
+    logger.info(f"Saved sanity      → {sanity_file}")
 
     return metrics
 

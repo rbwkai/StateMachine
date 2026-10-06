@@ -188,7 +188,7 @@ eval_out = evaluate_predictions(mock_instances, mock_predictions)
 assert eval_out["overall_total"] == 2
 assert eval_out["overall_correct"] == 1
 assert eval_out["overall_accuracy"] == 0.5
-assert "basic_chain_T4_D0" in eval_out["condition_summaries"]
+assert "basic_chain_T4_D0_E1_N0" in eval_out["condition_summaries"]
 
 print("Evaluation harness test: PASS")
 

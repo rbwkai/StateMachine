@@ -99,7 +99,7 @@ def test_condition_summaries_include_extraction_rates() -> None:
     
     result = evaluate_predictions(instances, predictions)
     
-    cond_key = "basic_chain_T2_D0"
+    cond_key = "basic_chain_T2_D0_E1_N0"
     assert cond_key in result["condition_summaries"]
     cond = result["condition_summaries"][cond_key]
     

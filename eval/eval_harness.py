@@ -71,25 +71,28 @@ def normalize_answer(value: Any) -> str:
 # ============================================================
 
 def condition_key(instance: Dict[str, Any]) -> str:
-    """Bucket key for one condition: family + T + D, plus E and N when set.
+    """Bucket key for one condition: ``{family}_T{T}_D{D}_E{E}_N{N}``.
 
-    RQ1 forbids pooling two cells that differ only in E or N, so the key has to
-    carry them. The minimal cell (E=1, N=0) leaves them implicit, which keeps the
-    key equal to the `condition_id` prefix `generate.py` writes
-    (`family_T{T}_D{D}_E{E}`) for default cells. The record schema puts N in
-    ``measured_factors['N_actual']`` only, so fall back to it rather than pool
-    two cells that differ in textual distractors.
+    Single owner of the per-condition key for the eval layer (AGENTS.md §5):
+    ``eval.baselines.condition_key_of`` re-exports this function, so harness
+    summaries, baseline summaries and ``eval.post_run_sanity`` bucket a record
+    identically. RQ1 forbids pooling two cells that differ only in E or N, so
+    every key carries both, including the minimal cell (``_E1_N0``); a key that
+    left them implicit only coincided with the baseline key when E != 1 and
+    N != 0. This is not the experiments' ``condition_id``, which is a separate
+    label written by ``generate.py``.
+
+    The record schema puts N in ``measured_factors['N_actual']`` only, so fall
+    back to it rather than pool two cells that differ in textual distractors.
     """
     factors = instance.get("requested_factors") or {}
     measured = instance.get("measured_factors") or {}
-    key = f"{instance.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
     entity_count = factors.get("E", 1) or 1
     textual_distractors = factors.get("N", measured.get("N_actual", 0)) or 0
-    if entity_count != 1:
-        key += f"_E{entity_count}"
-    if textual_distractors:
-        key += f"_N{textual_distractors}"
-    return key
+    return (
+        f"{instance.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
+        f"_E{entity_count}_N{textual_distractors}"
+    )
 
 
 def parse_pred_trajectory(

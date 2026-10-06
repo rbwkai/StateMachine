@@ -9,9 +9,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if __name__ == "__main__":
+    # Run as a script, sys.path[0] is analysis/, whose statistics.py shadows
+    # the stdlib module.
+    _SCRIPT_DIR = Path(__file__).resolve().parent
+    sys.path[:] = [p for p in sys.path if not p or Path(p).resolve() != _SCRIPT_DIR]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# One resolver for the run_eval output layout (AGENTS.md §5); eval-free (§4).
+from analysis.run_layout import infer_condition  # noqa: E402
 
 
 def load_rows(input_path: Path) -> List[Dict[str, Any]]:
@@ -20,7 +33,12 @@ def load_rows(input_path: Path) -> List[Dict[str, Any]]:
     for path in files:
         with path.open(encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
-                row["model"] = path.parent.name
+                # The parent directory is "<cot|no_cot>_<tokens>", not the model.
+                condition = infer_condition(path, row)
+                row["model"] = condition["model"]
+                row["cot"] = condition["cot"]
+                row["max_new_tokens"] = condition["max_new_tokens"]
+                row["condition"] = condition["condition"]
                 row["requested"] = json.loads(row.get("requested_factors", "{}") or "{}")
                 row["measured"] = json.loads(row.get("measured_factors", "{}") or "{}")
                 row["correct"] = row.get("is_correct", "").lower() == "true"
@@ -63,9 +81,11 @@ def make_plots(rows: List[Dict[str, Any]], output_dir: Path) -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
     colors = ["#0F766E", "#E07A5F", "#3D405B", "#81B29A", "#F2CC8F", "#6D597A"]
 
+    # Series are run conditions (model, CoT mode, budget) so CoT and non-CoT
+    # runs of one model are not pooled into a single bar or curve.
     by_model: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        by_model[row["model"]].append(row)
+        by_model[row["condition"]].append(row)
 
     # Overall and step-wise accuracy by model.
     models = sorted(by_model)

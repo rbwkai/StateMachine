@@ -3,22 +3,20 @@
 Once a model run exists, four checks decide whether the numbers can be believed:
 accuracy below chance means a parsing bug, format compliance and truncation rate
 are reported per cell, the strict/semantic gap is visible, and models beat the
-baselines in cells where the baselines are weak. The checks run here against real
-`evaluate_predictions` output from the mock engine. The absence of a reusable
-helper in the analysis package is documented as a failing `test_failsnow_*` test.
+baselines in cells where the baselines are weak. The checks are the real
+`eval.post_run_sanity` functions, run against `evaluate_predictions` output from
+the mock engine.
 """
 from __future__ import annotations
 
 import pytest
 
-from eval.baselines import compute_mfc_baseline, compute_stateless_baseline
+from eval.baselines import compute_mfc_baseline, run_all_baselines
 from eval.engine import MockInferenceEngine
 from eval.eval_harness import evaluate_predictions, format_prompt
+from eval.post_run_sanity import sanity_checks, sanity_failures
 from test.conftest import build_record, quiet
 from test.test_baseline_solvers import chance_level
-
-
-WEAK_BASELINE = 0.10  # a baseline this weak should not be matched by a model
 
 
 @pytest.fixture(scope="module")
@@ -54,45 +52,9 @@ def _run(cells, builder):
     return instances, evaluate_predictions(instances, shaped)
 
 
-def _condition_key(record):
-    factors = record["requested_factors"]
-    return f"{record['family']}_T{factors['T']}_D{factors.get('D', 0)}"
-
-
-def _per_cell(instances, report):
-    by_id = {record["instance_id"]: record for record in instances}
-    cells = {}
-    for result in report["instance_results"]:
-        record = by_id[result["instance_id"]]
-        entry = cells.setdefault(_condition_key(record), {"n": 0, "strict": 0,
-                                                         "semantic": 0,
-                                                         "final_line": 0,
-                                                         "chance": 0.0})
-        entry["n"] += 1
-        entry["strict"] += bool(result["is_correct"])
-        entry["semantic"] += bool(result["semantic_correct"])
-        entry["final_line"] += bool(result["has_final_answer"])
-        entry["chance"] = chance_level(record)
-    return cells
-
-
-def sanity_checks(instances, report):
-    """The four checklist-12 checks, over harness output."""
-    per_cell = _per_cell(instances, report)
-    stats = {}
-    for key, entry in per_cell.items():
-        n = entry["n"]
-        strict = entry["strict"] / n
-        semantic = entry["semantic"] / n
-        stats[key] = {
-            "accuracy": strict,
-            "chance": entry["chance"],
-            "below_chance": strict < entry["chance"] - 1e-9,
-            "format_compliance": entry["final_line"] / n,
-            "truncation_rate": 1.0 - entry["final_line"] / n,
-            "strict_semantic_gap": semantic - strict,
-        }
-    return stats
+def _key(family, target_updates):
+    """The harness condition key (always carries E and N)."""
+    return f"{family}_T{target_updates}_D0_E1_N0"
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +66,9 @@ def test_below_chance_accuracy_is_flagged_as_a_parsing_bug(cells):
     stats = sanity_checks(instances, report)
     assert stats
     for key, cell in stats.items():
-        assert cell["accuracy"] <= cell["chance"], key
+        assert cell["accuracy"] < cell["chance"], key
         assert cell["below_chance"] is True, key
+    assert sanity_failures(stats)
 
 
 def test_accuracy_at_or_above_chance_is_not_flagged(cells):
@@ -127,8 +90,9 @@ def test_chance_level_used_here_matches_the_baseline_module():
 # Format compliance and truncation per cell.
 # ---------------------------------------------------------------------------
 
-def test_format_compliance_and_truncation_rate_are_reported_per_cell(cells):
-    """A response with no Final Answer line counts as truncated."""
+def test_format_compliance_and_missing_final_rate_are_reported_per_cell(cells):
+    """A response with no Final Answer line is missing its final line; it is
+    not truncation, which needs finish_reason == "length"."""
     instances = [record for records in cells.values() for record in records]
     gold_answers = {r["instance_id"]: r["gold_answer"] for r in instances}
     marked = _run(cells, lambda record, response: f"Final Answer: {gold_answers[record['instance_id']]}")
@@ -138,9 +102,22 @@ def test_format_compliance_and_truncation_rate_are_reported_per_cell(cells):
     truncated = sanity_checks(*unmarked)
     for key in compliant:
         assert compliant[key]["format_compliance"] == 1.0, key
-        assert compliant[key]["truncation_rate"] == 0.0, key
+        assert compliant[key]["missing_final_rate"] == 0.0, key
         assert truncated[key]["format_compliance"] == 0.0, key
-        assert truncated[key]["truncation_rate"] == 1.0, key
+        assert truncated[key]["missing_final_rate"] == 1.0, key
+        # No row recorded a finish_reason: truncation is unknown, not 0 or 1.
+        assert truncated[key]["truncation_rate"] is None, key
+
+
+def test_truncation_rate_comes_from_finish_reason(cells):
+    instances, report = _run(cells, lambda record, response: "Final Answer: x")
+    predictions = [{"instance_id": r["instance_id"],
+                    "finish_reason": "length" if i % 2 else "eos_token"}
+                   for i, r in enumerate(instances)]
+    stats = sanity_checks(instances, report, predictions=predictions)
+    for key, cell in stats.items():
+        assert 0.0 < cell["truncation_rate"] < 1.0, key
+    assert any("truncation rate" in msg for msg in sanity_failures(stats))
 
 
 def test_a_partially_compliant_run_shows_an_intermediate_rate(cells):
@@ -154,8 +131,8 @@ def test_a_partially_compliant_run_shows_an_intermediate_rate(cells):
                                   else "no marker in this reply"),
     )
     stats = sanity_checks(instances, report)
-    assert stats["basic_chain_T4_D0"]["format_compliance"] == 1.0
-    assert stats["undo_redo_chain_T8_D0"]["format_compliance"] == 0.0
+    assert stats[_key("basic_chain", 4)]["format_compliance"] == 1.0
+    assert stats[_key("undo_redo_chain", 8)]["format_compliance"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -190,23 +167,29 @@ def test_a_fully_compliant_run_has_no_gap(cells):
 # ---------------------------------------------------------------------------
 
 def test_a_model_that_only_matches_a_weak_baseline_is_flagged(cells):
-    per_cell_model = {}
-    for (family, target_updates), records in cells.items():
-        baseline = compute_mfc_baseline(records) + compute_stateless_baseline(records)
-        per_cell_model[f"{family}_T{target_updates}_D0"] = (
-            sum(1 for r in baseline if r.is_correct) / len(baseline)
-        )
+    """Flat map: a tie with a weak baseline is flagged; a strong one never is."""
+    instances, report = _run(cells, lambda record, response: "Final Answer: nowhere")
+    keys = [_key(family, t) for family, t in cells]
+    weak = sanity_checks(instances, report, baseline_accuracy={k: 0.0 for k in keys})
+    strong = sanity_checks(instances, report, baseline_accuracy={k: 0.9 for k in keys})
+    for key in keys:
+        assert weak[key]["beats_weak_baseline"] is False, key
+        assert strong[key]["beats_weak_baseline"] is True, key
+    assert any("does not beat a weak baseline" in m for m in sanity_failures(weak))
 
-    def beats_baseline(cell_key, model_accuracy, baseline_accuracy):
-        return baseline_accuracy >= WEAK_BASELINE or model_accuracy > baseline_accuracy
 
-    for key, baseline_accuracy in per_cell_model.items():
-        # A model that merely ties the baseline is flagged wherever the baseline
-        # is weak, and never flagged where the baseline is already strong.
-        assert beats_baseline(key, baseline_accuracy, baseline_accuracy) is (
-            baseline_accuracy >= WEAK_BASELINE
-        ), key
-        assert beats_baseline(key, 0.99, baseline_accuracy) is True, key
+def test_nested_run_all_baselines_output_is_matched_by_key(cells):
+    """The harness and baseline keys agree, so the check actually runs."""
+    instances = [record for records in cells.values() for record in records]
+    gold_answers = {r["instance_id"]: r["gold_answer"] for r in instances}
+    _, report = _run(cells, lambda record, response: f"Final Answer: {gold_answers[record['instance_id']]}")
+    with quiet():
+        baselines = run_all_baselines(instances)
+    stats = sanity_checks(instances, report, baseline_accuracy=baselines)
+    for family, t in cells:
+        cell = stats[_key(family, t)]
+        assert cell["baseline_name"] in ("stateless", "mfc")
+        assert cell["beats_weak_baseline"] is True
 
 
 def test_model_accuracy_from_the_harness_is_comparable_to_baseline_accuracy(cells):
@@ -214,7 +197,7 @@ def test_model_accuracy_from_the_harness_is_comparable_to_baseline_accuracy(cell
     gold_answers = {r["instance_id"]: r["gold_answer"] for r in instances}
     _, report = _run(cells, lambda record, response: f"Final Answer: {gold_answers[record['instance_id']]}")
     stats = sanity_checks(instances, report)
-    for key, records in ((f"{family}_T{t}_D0", rs)
+    for key, records in ((_key(family, t), rs)
                          for (family, t), rs in cells.items()):
         baseline = compute_mfc_baseline(records)
         baseline_accuracy = sum(1 for r in baseline if r.is_correct) / len(baseline)
@@ -225,13 +208,9 @@ def test_model_accuracy_from_the_harness_is_comparable_to_baseline_accuracy(cell
 # Reusability.
 # ---------------------------------------------------------------------------
 
-def test_failsnow_the_sanity_checks_are_available_as_a_helper():
-    """[checklist 12] post-run sanity checks.
-
-    [fails now] expected: the checks ship with the analysis layer so a real run
-    can be screened, not only a test. currently they exist nowhere in `analysis`
-    or `eval`; the logic below lives in this test module alone.
-    """
+def test_the_sanity_checks_are_available_as_a_helper():
+    """[checklist 12] the checks ship with the eval layer so a real run can be
+    screened, not only a test."""
     import analysis
     import eval
 

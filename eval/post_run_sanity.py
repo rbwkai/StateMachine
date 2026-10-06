@@ -21,7 +21,7 @@ so a real run can be screened with the same code the checklist tests use.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from eval.baselines import (
     best_heuristic_ceiling,
@@ -34,25 +34,68 @@ from eval.eval_harness import condition_key
 # A baseline this weak is not something a model should merely match.
 WEAK_BASELINE = 0.10
 
+# The weak baselines of ``run_all_baselines`` the model is compared against.
+# ``heuristic_ceiling`` is excluded on purpose: on several families the
+# "shortcut" is the tracking answer itself (``HEURISTIC_NOT_A_SHORTCUT``), so it
+# is a diagnostic, not a baseline a model must beat. Order breaks ties.
+WEAK_BASELINE_NAMES: Tuple[str, ...] = ("stateless", "mfc")
+
+
+def baseline_accuracy_by_condition(
+    baselines: Mapping[str, Any],
+) -> Dict[str, Tuple[Optional[str], float]]:
+    """Condition key -> ``(baseline name, accuracy)`` for the weak-baseline check.
+
+    Accepts either a flat ``condition key -> accuracy`` map (name ``None``) or
+    the nested output of :func:`eval.baselines.run_all_baselines`
+    (``[name]["per_condition"][key]["accuracy"]``). For the nested form each
+    cell takes the *strongest* of the :data:`WEAK_BASELINE_NAMES` baselines
+    (highest accuracy, first name on a tie), so a model is only required to
+    beat the best of them wherever that best one is still weak.
+    """
+    nested = any(
+        isinstance(value, Mapping) and "per_condition" in value
+        for value in baselines.values()
+    )
+    if not nested:
+        return {key: (None, float(acc)) for key, acc in baselines.items()}
+
+    best: Dict[str, Tuple[Optional[str], float]] = {}
+    for name in WEAK_BASELINE_NAMES:
+        per_condition = (baselines.get(name) or {}).get("per_condition") or {}
+        for key, summary in per_condition.items():
+            accuracy = float(summary["accuracy"])
+            if key not in best or accuracy > best[key][1]:
+                best[key] = (name, accuracy)
+    return best
+
 
 def sanity_checks(
     instances: Sequence[Dict[str, Any]],
     report: Dict[str, Any],
-    baseline_accuracy: Optional[Dict[str, float]] = None,
+    baseline_accuracy: Optional[Mapping[str, Any]] = None,
     weak_baseline: float = WEAK_BASELINE,
     predictions: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-condition screening statistics for a harness report.
 
-    ``baseline_accuracy`` is an optional condition-key -> accuracy map (from
-    ``run_all_baselines``); when supplied, the weak-baseline check is evaluated
-    for the conditions it covers.
+    ``baseline_accuracy`` is optional: either the nested output of
+    ``run_all_baselines`` or a flat condition-key -> accuracy map (see
+    :func:`baseline_accuracy_by_condition`). When supplied, the weak-baseline
+    check sets ``beats_weak_baseline`` for every condition it covers. Keys are
+    :func:`eval.eval_harness.condition_key`, the same function the baselines
+    bucket by, so they match.
 
     ``finish_reason`` is read from each instance result (the harness carries it
     through) or, failing that, from the matching row of ``predictions``.
     ``truncation_rate`` is ``None`` for a cell where no row records one.
     """
     by_id = {inst["instance_id"]: inst for inst in instances}
+    baselines = (
+        baseline_accuracy_by_condition(baseline_accuracy)
+        if baseline_accuracy is not None
+        else {}
+    )
     finish_by_id = {
         row["instance_id"]: row.get("finish_reason")
         for row in (predictions or [])
@@ -114,8 +157,9 @@ def sanity_checks(
             "truncation_rate": truncation,
             "strict_semantic_gap": semantic - strict,
         }
-        if baseline_accuracy is not None and key in baseline_accuracy:
-            baseline = baseline_accuracy[key]
+        if key in baselines:
+            baseline_name, baseline = baselines[key]
+            cell["baseline_name"] = baseline_name
             cell["baseline_accuracy"] = baseline
             cell["beats_weak_baseline"] = (
                 baseline >= weak_baseline or strict > baseline

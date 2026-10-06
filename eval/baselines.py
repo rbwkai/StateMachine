@@ -32,6 +32,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from eval.eval_harness import condition_key
 from eval.scoring import (
     candidate_answers,
     extract_instance_answer,
@@ -49,15 +50,10 @@ class BaselineResult:
     baseline_type: str
 
 
-def condition_key_of(instance: Dict[str, Any]) -> str:
-    """Per-condition bucket: family + T + D + E + N (D-020 follow-up)."""
-    factors = instance.get("requested_factors", {})
-    measured = instance.get("measured_factors", {})
-    n = factors.get("N", measured.get("N_actual", 0)) or 0
-    return (
-        f"{instance.get('family')}_T{factors.get('T')}"
-        f"_D{factors.get('D', 0)}_E{factors.get('E', 1)}_N{n}"
-    )
+# Per-condition bucket key: one definition, owned by eval.eval_harness
+# (AGENTS.md §5). Re-exported under the historical name so baseline, harness
+# and post-run-sanity keys can never drift apart again.
+condition_key_of = condition_key
 
 
 def query_type_of(instance: Dict[str, Any]) -> str:
@@ -567,17 +563,14 @@ def _summarize_per_condition(
 ) -> Dict[str, Dict[str, float]]:
     """Summarize baseline accuracy per condition."""
     from collections import defaultdict
-    
+
+    by_id = {r.instance_id: r for r in reversed(results)}  # first result wins
     cond_results: Dict[str, List[BaselineResult]] = defaultdict(list)
     for inst in instances:
-        iid = inst["instance_id"]
-        cond_key = condition_key_of(inst)
-        # Find matching result
-        for r in results:
-            if r.instance_id == iid:
-                cond_results[cond_key].append(r)
-                break
-    
+        result = by_id.get(inst["instance_id"])
+        if result is not None:
+            cond_results[condition_key_of(inst)].append(result)
+
     return {
         cond: {
             "total": len(rs),
