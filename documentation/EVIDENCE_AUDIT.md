@@ -154,7 +154,7 @@ Core, per `eval/models.py`:
 | `qwen2.5-3b` | `Qwen/Qwen2.5-3B-Instruct` | yes |
 | `qwen2.5-7b` | `Qwen/Qwen2.5-7B-Instruct` | yes |
 | `llama-3.2-3b` | `meta-llama/Llama-3.2-3B-Instruct` | yes |
-| `olmo-2-1b` | `allenai/OLMo-2-1B` | yes |
+| `olmo-2-1b-instruct` | `allenai/OLMo-2-0425-1B-Instruct` | yes |
 
 Optional: `phi-4-mini` (`microsoft/Phi-4-mini-instruct`), `olmo-2-7b`
 (`allenai/OLMo-2-1124-7B-Instruct`). Every entry pins a commit hash; no floating

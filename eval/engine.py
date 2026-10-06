@@ -27,6 +27,64 @@ except ImportError:
     HAS_TRANSFORMERS = False
 
 
+# ============================================================
+# Prompt tokenization (BOS handling)
+# ============================================================
+
+class ChatTemplatedPrompt(str):
+    """A prompt string rendered by ``tokenizer.apply_chat_template``.
+
+    The template already emits every special token it wants (Llama-3 and
+    OLMo-2 templates open with the BOS token), so tokenizing it again with
+    ``add_special_tokens=True`` would prepend a second BOS. The subclass marks
+    that provenance; it is otherwise an ordinary ``str``.
+    """
+
+    __slots__ = ()
+
+
+def is_chat_templated(tokenizer: Any, prompt: str) -> bool:
+    """True when ``prompt`` already carries the tokenizer's special tokens.
+
+    Provenance decides first (``ChatTemplatedPrompt``). An unmarked string that
+    already opens with the BOS token is treated the same way, since adding
+    special tokens to it can only duplicate that BOS.
+    """
+    if isinstance(prompt, ChatTemplatedPrompt):
+        return True
+    bos = getattr(tokenizer, "bos_token", None)
+    return isinstance(bos, str) and bool(bos) and prompt.startswith(bos)
+
+
+def tokenizer_call_kwargs(chat_templated: Sequence[bool]) -> Dict[str, Any]:
+    """Keyword arguments for one batched tokenizer call.
+
+    Chat-templated text is tokenized with ``add_special_tokens=False`` (the
+    template owns BOS); plain text keeps ``add_special_tokens=True`` because it
+    has no BOS of its own. One padded call takes one setting, so a batch that
+    mixes both kinds is refused rather than silently given 0 or 2 BOS tokens.
+    """
+    kinds = set(chat_templated)
+    if len(kinds) > 1:
+        raise ValueError(
+            "batch mixes chat-templated and plain-text prompts; "
+            "they need different add_special_tokens settings"
+        )
+    templated = kinds == {True}
+    return {
+        "return_tensors": "pt",
+        "padding": True,
+        "truncation": False,
+        "add_special_tokens": not templated,
+    }
+
+
+def tokenize_prompts(tokenizer: Any, text_prompts: Sequence[str]) -> Any:
+    """Tokenize a batch so each prompt carries exactly one BOS (if any)."""
+    flags = [is_chat_templated(tokenizer, text) for text in text_prompts]
+    return tokenizer(list(text_prompts), **tokenizer_call_kwargs(flags))
+
+
 class InferenceEngine:
     """Base interface for model generation engines."""
 
@@ -278,7 +336,7 @@ class HuggingFaceEngine(InferenceEngine):
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-                return str(formatted)
+                return ChatTemplatedPrompt(formatted)
             except Exception as e:
                 logger.debug(f"Chat template application failed ({e}), falling back to direct prompt.")
 
@@ -305,20 +363,17 @@ class HuggingFaceEngine(InferenceEngine):
         for p in prompts:
             if isinstance(p, list):
                 if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
-                    text_prompts.append(
+                    text_prompts.append(ChatTemplatedPrompt(
                         self.tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
-                    )
+                    ))
                 else:
                     text_prompts.append(" ".join([m.get("content", "") for m in p]))
             else:
-                text_prompts.append(str(p))
+                # Keep a ChatTemplatedPrompt from format_input intact: str(p)
+                # would drop the marker that suppresses a second BOS.
+                text_prompts.append(p if isinstance(p, str) else str(p))
 
-        inputs = self.tokenizer(
-            text_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-        )
+        inputs = tokenize_prompts(self.tokenizer, text_prompts)
 
         batch_max_prompt_len = inputs["input_ids"].shape[1]
         max_model_len = getattr(self.tokenizer, "model_max_length", None)

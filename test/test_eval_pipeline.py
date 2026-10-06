@@ -27,7 +27,7 @@ from run_eval import run_evaluation
 
 def test_model_registry() -> None:
     print("Testing Model Registry...")
-    expected_core = {"qwen2.5-0.5b", "qwen2.5-3b", "qwen2.5-7b", "llama-3.2-3b", "olmo-2-1b"}
+    expected_core = {"qwen2.5-0.5b", "qwen2.5-3b", "qwen2.5-7b", "llama-3.2-3b", "olmo-2-1b-instruct"}
     assert set(CORE_MODELS.keys()) == expected_core, f"Expected {expected_core}, got {set(CORE_MODELS.keys())}"
 
     assert "phi-4-mini" in OPTIONAL_MODELS

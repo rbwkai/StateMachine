@@ -764,7 +764,7 @@ hand. D-010 removed the old data and results and forbids treating them as eviden
 `eval/models.py::ModelConfig` is frozen with `hf_model_id`, a pinned commit-hash
 `revision`, and decoding fields `temperature=0.0`, `top_p=1.0`, `do_sample=False`,
 `max_new_tokens=256`. Core: `qwen2.5-0.5b`, `qwen2.5-3b`, `qwen2.5-7b`,
-`llama-3.2-3b`, `olmo-2-1b`. Optional: `phi-4-mini`, `olmo-2-7b`.
+`llama-3.2-3b`, `olmo-2-1b-instruct`. Optional: `phi-4-mini`, `olmo-2-7b`.
 
 `HuggingFaceEngine.generate_batch` defaults to the model config's
 `max_new_tokens` and enforces greedy decoding unless `enforce_greedy=False`. This

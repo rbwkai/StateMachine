@@ -9,7 +9,7 @@ Implements §13 (Model Selection) and §14 (Standardized Evaluation):
   2. Qwen/Qwen2.5-3B-Instruct   (Scaling anchor - medium)
   3. Qwen/Qwen2.5-7B-Instruct   (Scaling anchor - large)
   4. meta-llama/Llama-3.2-3B-Instruct (Cross-family comparison at ~3B)
-  5. allenai/OLMo-2-0425-1B (Open architecture & weights)
+  5. allenai/OLMo-2-0425-1B-Instruct (Open architecture & weights)
 - Optional Models:
   - microsoft/Phi-4-mini-instruct
 """
@@ -54,6 +54,23 @@ class ModelConfig:
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _PLACEHOLDER_REVISIONS = {"", "main", "master", "head", "latest", "none", "null"}
 _PLACEHOLDER_WORDS = re.compile(r"todo|tbd|fixme|placeholder|x{3,}", re.IGNORECASE)
+# A hand-typed fake hash ("a" * 40, "0123456789abcdef" repeated, "deadbeef" * 5)
+# is well-formed hex, so the shape check alone accepts it. A real sha is a
+# digest: it has many distinct digits and no short repeating period.
+_MIN_DISTINCT_HEX_DIGITS = 3
+_MAX_FAKE_PERIOD = 16
+
+
+def _looks_fabricated(revision: str) -> bool:
+    """True when ``revision`` is too regular to be a real commit digest."""
+    if len(set(revision)) < _MIN_DISTINCT_HEX_DIGITS:
+        return True
+    # Periodic: the string equals its own prefix of length ``period`` repeated
+    # (a trailing partial repeat included, e.g. "0123456789abcdef" * 2.5).
+    for period in range(1, _MAX_FAKE_PERIOD + 1):
+        if all(revision[i] == revision[i % period] for i in range(len(revision))):
+            return True
+    return False
 
 
 def validate_pinned_revision(config: ModelConfig) -> str:
@@ -73,6 +90,11 @@ def validate_pinned_revision(config: ModelConfig) -> str:
         raise ValueError(
             f"model {config.name!r} has an unpinned revision {config.revision!r}; "
             "expected a 40-character lowercase commit hash (AGENTS.md §9)"
+        )
+    if _looks_fabricated(revision):
+        raise ValueError(
+            f"model {config.name!r} has a fabricated-looking revision {config.revision!r}; "
+            "pin the real commit hash read from the Hub (AGENTS.md §9)"
         )
     return revision
 
@@ -124,12 +146,14 @@ CORE_MODELS: Dict[str, ModelConfig] = {
         parameter_count_b=3.2,
         revision="0cb88a4f764b7a12671c53f0838cd831a0843b95",
     ),
-    "olmo-2-1b": ModelConfig(
-        name="olmo-2-1b",
-        hf_model_id="allenai/OLMo-2-0425-1B",
+    "olmo-2-1b-instruct": ModelConfig(
+        name="olmo-2-1b-instruct",
+        # Instruct variant: the base OLMo-2-0425-1B ships no chat template, so
+        # it would be the only core model prompted without its chat format.
+        hf_model_id="allenai/OLMo-2-0425-1B-Instruct",
         family="olmo",
-        parameter_count_b=1.0,
-        revision="a1847dff35000b4271fa70afc5db10fd29fedbdf",
+        parameter_count_b=1.48,  # Hub safetensors total
+        revision="48d788eca847d4d7548f375ad03d3c9312f6139e",
     ),
 }
 

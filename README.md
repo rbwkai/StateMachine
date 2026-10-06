@@ -129,7 +129,7 @@ qwen2.5-0.5b    Qwen/Qwen2.5-0.5B-Instruct
 qwen2.5-3b      Qwen/Qwen2.5-3B-Instruct
 qwen2.5-7b      Qwen/Qwen2.5-7B-Instruct
 llama-3.2-3b    meta-llama/Llama-3.2-3B-Instruct
-olmo-2-1b       allenai/OLMo-2-1B
+olmo-2-1b-instruct allenai/OLMo-2-0425-1B-Instruct
 phi-4-mini      microsoft/Phi-4-mini-instruct   (optional)
 olmo-2-7b       allenai/OLMo-2-1124-7B-Instruct (optional)
 ```
