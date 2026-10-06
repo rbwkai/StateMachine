@@ -399,7 +399,7 @@ def test_make_distractor_sentences_avoids_used_types_and_containers():
 # paraphrase
 # ---------------------------------------------------------------------------
 
-def test_failsnow_every_sentence_type_has_a_paraphrase_rule():
+def test_every_sentence_type_has_a_paraphrase_rule():
     """[checklist 4] 'Paraphrase rules cover every sentence type (check split).'
 
     [fails now] expected: apply_paraphrase() changes every op sentence.

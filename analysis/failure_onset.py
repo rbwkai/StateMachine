@@ -17,8 +17,11 @@ Implements §10 (Curve Analysis) and §11 (Failure Onset) of the research plan:
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+from .statistics import wilson_interval
 
 
 # Free parameters per candidate model; AICc is only defined for n > k + 1, so
@@ -54,7 +57,11 @@ ACCURACY_BOUNDS: Tuple[float, float] = (0.0, 1.0)
 CHANCE_FLOOR: float = 1.0 / 3.0
 OFFSET_SOLVE_ROUNDS: int = 8
 
-# The sigmoid asymptote is the chance floor, so it is capped at CHANCE_FLOOR; the
+# CHANCE_FLOOR is only the default: callers fitting cells with a different
+# answer space (count queries with 0..E+splits, split_chain's {1, 2}, more
+# containers) pass `chance_floor` to fit_sigmoid / compare_curves /
+# best_fitting_curve, typically the cell's mean eval.baselines.chance_level.
+# The sigmoid asymptote is the chance floor, so it is capped at it; the
 # exponential asymptote is a fitted constant, not the chance level, so it only
 # has to stay inside [0, 1].
 EXP_FLOOR_BOUNDS: Tuple[float, float] = (0.0, ACCURACY_BOUNDS[1])
@@ -63,6 +70,17 @@ SIGMOID_FLOOR_BOUNDS: Tuple[float, float] = (0.0, CHANCE_FLOOR)
 # ss_res is floored before the log so a perfect fit yields a finite AIC
 # instead of -inf (test_failsnow-adjacent: "a perfect fit produces a finite AIC").
 SS_RES_FLOOR: float = 1e-12
+
+# Fewer distinct difficulty levels than this cannot discriminate the three
+# candidate shapes (the sigmoid alone has 4 parameters), so `best_fitting_curve`
+# declines to select when called with min_levels=MIN_CURVE_LEVELS.
+MIN_CURVE_LEVELS: int = 6
+
+# Logistic-slope estimation: IRLS iteration cap and convergence tolerance, and a
+# ridge term that keeps the Hessian invertible on separable bootstrap resamples.
+LOGIT_MAX_ITER: int = 50
+LOGIT_TOL: float = 1e-8
+LOGIT_RIDGE: float = 1e-6
 
 
 @dataclass
@@ -96,25 +114,90 @@ class FailureProfile:
         }
 
 
+def _per_point(
+    value: Union[None, float, int, Sequence[Any]],
+    n: int,
+    name: str,
+) -> List[Any]:
+    """Broadcast a scalar (or None) to n points, or check a per-point sequence."""
+    if value is None or isinstance(value, (int, float)):
+        return [value] * n
+    values = list(value)
+    if len(values) != n:
+        raise ValueError(f"{name} must be a scalar or have one entry per x value")
+    return values
+
+
 def compute_failure_onset(
-    x_values: List[Union[int, float]],
-    accuracies: List[float],
+    x_values: Sequence[Union[int, float]],
+    accuracies: Sequence[float],
     tau: float = 0.70,
+    *,
+    sustained: bool = False,
+    n_trials: Union[None, int, Sequence[int]] = None,
+    chance: Union[None, float, Sequence[float]] = None,
 ) -> Optional[Union[int, float]]:
     """
-    Compute failure onset L_f = min { x : A(x) < tau }.
+    Compute failure onset L_f = min { x : A(x) < tau } (SPEC §7).
 
-    Assumes x_values and accuracies are sorted in increasing order of difficulty x.
-    Returns the first x where accuracy drops below tau (per SPEC §7).
+    Points are sorted by x internally, so callers need not pre-sort. The
+    comparison is strict: A(x) == tau is not a failure.
+
+    sustained: when True, return the smallest x such that x and every larger
+        x are below tau (a dip followed by recovery is not an onset).
+    n_trials: number of trials behind each accuracy (scalar or per point).
+        When given, a point counts as below tau only if the upper bound of its
+        two-sided 95% Wilson interval is below tau, i.e. the drop is not
+        explained by sampling noise. successes = round(acc * n_trials).
+    chance: chance accuracy (scalar or per point, each < 1). When given,
+        accuracy is chance-normalised as (acc - c) / (1 - c) before the
+        comparison, so tau is read as a fraction of the above-chance range;
+        with n_trials the same transform is applied to the Wilson upper bound
+        (the transform is monotone, so the order of the two steps is immaterial).
+
+    Returns None when no point qualifies or the input is empty.
     """
     if len(x_values) != len(accuracies):
         raise ValueError("x_values and accuracies must have identical length")
+    n = len(x_values)
+    if n < 1:
+        return None
 
-    for x, acc in zip(x_values, accuracies):
-        if acc < tau:
-            return x
-    
-    return None
+    trials = _per_point(n_trials, n, "n_trials")
+    chances = _per_point(chance, n, "chance")
+
+    points = sorted(
+        zip(x_values, accuracies, trials, chances), key=lambda point: point[0]
+    )
+
+    def is_below(acc: float, n_t: Optional[int], c: Optional[float]) -> bool:
+        value = float(acc)
+        if n_t is not None:
+            n_t = int(n_t)
+            if n_t <= 0:
+                raise ValueError("n_trials must be positive")
+            successes = min(n_t, max(0, int(round(value * n_t))))
+            value = wilson_interval(successes, n_t)[1]
+        if c is not None:
+            if not c < 1.0:
+                raise ValueError("chance must be below 1")
+            value = (value - c) / (1.0 - c)
+        return value < tau
+
+    below = [is_below(acc, n_t, c) for _, acc, n_t, c in points]
+
+    if not sustained:
+        for (x, _, _, _), flag in zip(points, below):
+            if flag:
+                return x
+        return None
+
+    onset: Optional[Union[int, float]] = None
+    for (x, _, _, _), flag in zip(reversed(points), reversed(below)):
+        if not flag:
+            break
+        onset = x
+    return onset
 
 
 def _ss_total(y_values: Sequence[float]) -> float:
@@ -243,13 +326,15 @@ def _pattern_search(
 def fit_linear(
     x_values: List[float],
     y_values: List[float],
-) -> CurveFitResult:
+) -> Optional[CurveFitResult]:
     """
     Fit linear model: A(x) = a + b * x
     """
     n = len(x_values)
     if n < 2:
-        return CurveFitResult("linear", {"a": 0.0, "b": 0.0}, 0.0, float("inf"), y_values)
+        # A line through fewer than two points is undefined and its AIC would
+        # be infinite; report no fit rather than a non-finite result.
+        return None
 
     x_mean = sum(x_values) / n
     y_mean = sum(y_values) / n
@@ -276,7 +361,7 @@ def fit_linear(
 def fit_exponential(
     x_values: List[float],
     y_values: List[float],
-) -> CurveFitResult:
+) -> Optional[CurveFitResult]:
     """
     Fit exponential decay: A(x) = a * exp(-b*x) + c.
 
@@ -343,15 +428,20 @@ def fit_exponential(
 def fit_sigmoid(
     x_values: List[float],
     y_values: List[float],
-) -> CurveFitResult:
+    chance_floor: float = CHANCE_FLOOR,
+) -> Optional[CurveFitResult]:
     """
     Fit sigmoid: A(x) = c + (a - c) / (1 + exp(b * (x - x_0)))
 
     Rewriting as a * s + c * (1 - s) with s = 1/(1 + exp(b*(x - x_0))) shows the
     model is linear in (a, c) once (b, x_0) are fixed, so only the shape
-    parameters are searched. c reaches 1/3, the chance floor for the 3-choice
-    answer space.
+    parameters are searched. c is capped at `chance_floor` (default 1/3, the
+    3-choice location answer space); pass the cell's uniform chance level when
+    its answer space differs.
     """
+    if not 0.0 <= chance_floor <= ACCURACY_BOUNDS[1]:
+        raise ValueError("chance_floor must lie in [0, 1]")
+    floor_bounds = (SIGMOID_FLOOR_BOUNDS[0], chance_floor)
     n = len(x_values)
     if n < 4:
         return fit_linear(x_values, y_values)
@@ -369,7 +459,7 @@ def fit_sigmoid(
             basis,
             [1.0 - s for s in basis],
             y_values,
-            SIGMOID_FLOOR_BOUNDS,
+            floor_bounds,
         )
         if solved is None:
             return float("inf")
@@ -403,7 +493,7 @@ def fit_sigmoid(
         basis,
         [1.0 - s for s in basis],
         y_values,
-        SIGMOID_FLOOR_BOUNDS,
+        floor_bounds,
     ) or (1.0, 0.0)
     best_preds = [a_val * s + c_val * (1.0 - s) for s in basis]
 
@@ -419,29 +509,49 @@ def fit_sigmoid(
 def compare_curves(
     x_values: List[float],
     y_values: List[float],
+    chance_floor: float = CHANCE_FLOOR,
 ) -> Dict[str, CurveFitResult]:
-    """Fit linear, exponential, and sigmoid models and return all results."""
-    return {
+    """
+    Fit linear, exponential, and sigmoid models and return all results.
+
+    A model with no defined fit (fewer than two points) is omitted, so the
+    result is empty for n < 2.
+    """
+    fits = {
         "linear": fit_linear(x_values, y_values),
         "exponential": fit_exponential(x_values, y_values),
-        "sigmoid": fit_sigmoid(x_values, y_values),
+        "sigmoid": fit_sigmoid(x_values, y_values, chance_floor=chance_floor),
     }
+    return {name: fit for name, fit in fits.items() if fit is not None}
 
 
 def best_fitting_curve(
     x_values: List[float],
     y_values: List[float],
-) -> Tuple[str, CurveFitResult]:
+    min_levels: Optional[int] = None,
+    chance_floor: float = CHANCE_FLOOR,
+) -> Optional[Tuple[str, CurveFitResult]]:
     """
     Select the best curve model by AICc (lower is better).
 
     Models whose AICc is undefined (n <= k + 1, no spare degrees of freedom) are
     excluded: with n = 5 the 4-parameter sigmoid can interpolate any series,
     including noise, so it would otherwise win on residual sum of squares alone.
-    When every model is excluded the lowest raw AIC still decides, so a
-    selection is always returned.
+    When every model is excluded the lowest raw AIC still decides.
+
+    min_levels: when given (normally MIN_CURVE_LEVELS), return None if the data
+        has fewer distinct x levels than this, because shape selection on so few
+        levels defaults to "linear" regardless of the true shape. It is opt-in
+        so existing callers that index the result keep working.
+
+    Returns None when no model can be fitted (n < 2) or min_levels is not met.
     """
-    fits = compare_curves(x_values, y_values)
+    if min_levels is not None and len(set(x_values)) < min_levels:
+        return None
+
+    fits = compare_curves(x_values, y_values, chance_floor=chance_floor)
+    if not fits:
+        return None
     n = len(x_values)
 
     eligible = {
@@ -454,3 +564,193 @@ def best_fitting_curve(
 
     best_name = min(eligible, key=lambda name: eligible[name].aic)
     return best_name, eligible[best_name]
+
+
+# ==== Logistic slope with cluster bootstrap ====
+
+
+@dataclass
+class LogitSlopeResult:
+    """Slope of logit P(correct) on x, with a cluster-bootstrap percentile CI."""
+    slope: float
+    intercept: float
+    ci_low: float
+    ci_high: float
+    n_boot: int
+    n_boot_failed: int
+    n_clusters: int
+    # Resamples dropped because the classes were (quasi-)completely separated
+    # in x; also counted in n_boot_failed.
+    n_boot_separated: int = 0
+    # The full-data fit is (quasi-)separable: the MLE does not exist and
+    # `slope` is set by the eta clamp and ridge, not by the data.
+    separable: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "slope": self.slope,
+            "intercept": self.intercept,
+            "ci_low": self.ci_low,
+            "ci_high": self.ci_high,
+            "n_boot": self.n_boot,
+            "n_boot_failed": self.n_boot_failed,
+            "n_clusters": self.n_clusters,
+            "n_boot_separated": self.n_boot_separated,
+            "separable": self.separable,
+        }
+
+
+def _is_separable(x: Sequence[float], y: Sequence[float]) -> bool:
+    """
+    True when the logistic MLE does not exist because x separates the classes.
+
+    Complete or quasi-complete separation: max x of one class <= min x of the
+    other (sharing only the boundary value is quasi-complete). A single-class
+    sample is also separated (the intercept diverges). On such data IRLS walks
+    until the eta clamp and ridge stop it, e.g. ([1,1,2,2], [1,1,0,0]) gave a
+    slope of -20.7, which is an artefact, not an estimate.
+    """
+    ones = [xi for xi, yi in zip(x, y) if yi >= 0.5]
+    zeros = [xi for xi, yi in zip(x, y) if yi < 0.5]
+    if not ones or not zeros:
+        return True
+    return max(ones) <= min(zeros) or max(zeros) <= min(ones)
+
+
+def _logit_irls(
+    x: Sequence[float],
+    y: Sequence[float],
+) -> Optional[Tuple[float, float]]:
+    """
+    Fit logit P(y=1) = b0 + b1 * x by iteratively reweighted least squares.
+
+    Pure Python (the system is 2x2) so `analysis` keeps importing without numpy;
+    generator.probes imports this package. A tiny ridge term keeps the step
+    defined on (quasi-)separable data, where the estimate grows large but stays
+    finite. Returns None if x has no spread.
+    """
+    if not x or max(x) == min(x):
+        return None
+    b0 = b1 = 0.0
+    for _ in range(LOGIT_MAX_ITER):
+        # Ridge on the diagonal only (penalised log-likelihood).
+        h00, h01, h11 = LOGIT_RIDGE, 0.0, LOGIT_RIDGE
+        g0 = -LOGIT_RIDGE * b0
+        g1 = -LOGIT_RIDGE * b1
+        for xi, yi in zip(x, y):
+            eta = max(-30.0, min(30.0, b0 + b1 * xi))
+            p = 1.0 / (1.0 + math.exp(-eta))
+            w = p * (1.0 - p)
+            h00 += w
+            h01 += w * xi
+            h11 += w * xi * xi
+            r = yi - p
+            g0 += r
+            g1 += r * xi
+        det = h00 * h11 - h01 * h01
+        if det <= 0.0:
+            return None
+        step0 = (h11 * g0 - h01 * g1) / det
+        step1 = (h00 * g1 - h01 * g0) / det
+        b0 += step0
+        b1 += step1
+        if max(abs(step0), abs(step1)) < LOGIT_TOL:
+            break
+    return b0, b1
+
+
+def _quantile(sorted_values: Sequence[float], q: float) -> float:
+    """Linear-interpolation quantile (numpy's default method) on sorted data."""
+    position = q * (len(sorted_values) - 1)
+    lower = int(math.floor(position))
+    upper = min(lower + 1, len(sorted_values) - 1)
+    frac = position - lower
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * frac
+
+
+def slope_logit(
+    xs: Sequence[float],
+    ys_binary: Sequence[Union[bool, int]],
+    clusters: Optional[Sequence[Any]] = None,
+    n_boot: int = 1000,
+    rng: Optional[random.Random] = None,
+    confidence: float = 0.95,
+) -> Optional[LogitSlopeResult]:
+    """
+    Logistic-regression slope of correctness on x with a cluster-bootstrap CI.
+
+    clusters: one label per observation (e.g. instance template or seed group);
+        the bootstrap resamples whole clusters with replacement, so correlated
+        items sharing a cluster are not treated as independent. None means each
+        observation is its own cluster.
+    rng: explicit random.Random (AGENTS.md §6 rule 5); defaults to
+        random.Random(0) so the CI is byte-for-byte reproducible.
+
+    Resamples whose x has no spread cannot identify a slope and are counted in
+    n_boot_failed. Resamples that are (quasi-)completely separated have no
+    finite MLE; their clamp-driven slopes are excluded from the CI and counted
+    in both n_boot_failed and n_boot_separated. The CI is the percentile
+    interval of the successful resamples (NaN if none succeed). When the
+    full-data fit is itself separable, `separable` is True and the reported
+    slope is not a usable estimate. Returns None if the full-data fit is
+    undefined (fewer than two distinct x values).
+    """
+    if len(xs) != len(ys_binary):
+        raise ValueError("xs and ys_binary must have identical length")
+    if clusters is not None and len(clusters) != len(xs):
+        raise ValueError("clusters must have one label per observation")
+    if rng is None:
+        rng = random.Random(0)
+
+    x = [float(v) for v in xs]
+    y = [1.0 if bool(v) else 0.0 for v in ys_binary]
+    point = _logit_irls(x, y)
+    if point is None:
+        return None
+
+    labels = list(range(len(xs))) if clusters is None else list(clusters)
+    # First-appearance order, not set order, so resampling is deterministic.
+    members: Dict[Any, List[int]] = {}
+    for index, label in enumerate(labels):
+        members.setdefault(label, []).append(index)
+    groups = list(members.values())
+
+    slopes: List[float] = []
+    failed = 0
+    separated = 0
+    for _ in range(n_boot):
+        picked: List[int] = []
+        for _ in range(len(groups)):
+            picked.extend(groups[rng.randrange(len(groups))])
+        bx = [x[i] for i in picked]
+        by = [y[i] for i in picked]
+        # Spread is checked first so a no-spread resample is not double-booked
+        # as separated; the RNG draws above are unchanged either way.
+        fit = _logit_irls(bx, by)
+        if fit is None:
+            failed += 1
+        elif _is_separable(bx, by):
+            failed += 1
+            separated += 1
+        else:
+            slopes.append(fit[1])
+
+    if slopes:
+        alpha = (1.0 - confidence) / 2.0
+        slopes.sort()
+        ci_low = _quantile(slopes, alpha)
+        ci_high = _quantile(slopes, 1.0 - alpha)
+    else:
+        ci_low = ci_high = float("nan")
+
+    return LogitSlopeResult(
+        slope=point[1],
+        intercept=point[0],
+        ci_low=ci_low,
+        ci_high=ci_high,
+        n_boot=n_boot,
+        n_boot_failed=failed,
+        n_clusters=len(groups),
+        n_boot_separated=separated,
+        separable=_is_separable(x, y),
+    )

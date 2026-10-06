@@ -230,24 +230,22 @@ def test_harness_runs_first_error_analysis_when_a_trajectory_is_supplied(records
     assert result["error_analysis"]["error_type"] in {t.name for t in ErrorType}
 
 
-def test_failsnow_harness_fills_pred_trajectory_from_the_response(records):
-    """[checklist 8] 'nothing fills `pred_trajectory`.'
-
-    [fails now] expected: a CoT response with parseable Step lines populates
-    `pred_trajectory` so the trajectory analysis has input. currently the
-    harness forwards whatever the caller passed and never parses the response,
-    so a chain-of-thought run contributes no trajectory data at all.
-    """
+def test_harness_fills_pred_trajectory_from_the_response(records):
+    """[checklist 8] a CoT response with parseable Step lines populates
+    `pred_trajectory`. Step k is the state after narrated sentence k, so a
+    perfect response is `step_wise_gold_answers` with no offset and yields
+    no step error."""
     record = records[0]
     golds = record["step_wise_gold_answers"]
-    steps = "\n".join(f"Step {i + 1}. {value}" for i, value in enumerate(golds[1:]))
+    steps = "\n".join(f"Step {i + 1}. {value}" for i, value in enumerate(golds))
     report = evaluate_predictions([record], [{
         "instance_id": record["instance_id"],
         "raw_prediction": f"{steps}\nFinal Answer: {record['gold_answer']}",
     }], chain_of_thought=True)
     result = report["instance_results"][0]
-    assert result["pred_trajectory"] == golds[1:]
+    assert result["pred_trajectory"] == golds
     assert result["error_analysis"] is not None
+    assert result["error_analysis"]["error_type"] == "NO_ERROR"
 
 
 # ---------------------------------------------------------------------------

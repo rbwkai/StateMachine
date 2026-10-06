@@ -122,7 +122,7 @@ def _manifest_candidates():
     return [name for name in dir(common) if "manifest" in name.lower()]
 
 
-def test_failsnow_a_dataset_manifest_builder_exists():
+def test_a_dataset_manifest_builder_exists():
     """[checklist 11] 'Dataset manifest with generator, evaluator and model
     commits plus per-RQ dataset hashes.'
 
@@ -139,11 +139,11 @@ def test_failsnow_a_dataset_manifest_builder_exists():
 def test_failsnow_a_manifest_file_exists_next_to_the_data():
     """[checklist 11] dataset manifest."""
     data_dir = REPO_ROOT / "data"
-    manifests = sorted(data_dir.glob("*/manifest*.json")) if data_dir.exists() else []
+    manifests = sorted(data_dir.glob("*/*manifest*.json")) if data_dir.exists() else []
     assert manifests, f"no manifest under {data_dir}"
 
 
-def test_failsnow_manifest_records_code_and_dataset_provenance():
+def test_manifest_records_code_and_dataset_provenance():
     """[checklist 11] 'generator, evaluator and model commits plus per-RQ
     dataset hashes.'"""
     sys.path.insert(0, str(REPO_ROOT))

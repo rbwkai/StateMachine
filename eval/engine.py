@@ -36,13 +36,20 @@ class InferenceEngine:
         question: str,
         chain_of_thought: bool = False,
         prompt_version: str = "v2",
+        query_type: str = "location",
     ) -> str:
-        """Format input narrative and question into model prompt."""
+        """Format input narrative and question into model prompt.
+
+        ``query_type`` is a resolved string, not a record: this method receives
+        already-extracted text. Callers holding a record resolve it once with
+        ``eval.baselines.query_type_of`` and pass it here.
+        """
         return build_user_prompt(
             context=context,
             question=question,
             chain_of_thought=chain_of_thought,
             prompt_version=prompt_version,
+            query_type=query_type,
         )
 
     def generate_batch(
@@ -247,6 +254,7 @@ class HuggingFaceEngine(InferenceEngine):
         question: str,
         chain_of_thought: bool = False,
         prompt_version: str = "v2",
+        query_type: str = "location",
     ) -> str:
         """Apply model-specific chat template if available, else standard text."""
         system_content = self.config.system_prompt or "You are a precise state reasoning assistant."
@@ -255,6 +263,7 @@ class HuggingFaceEngine(InferenceEngine):
             question=question,
             chain_of_thought=chain_of_thought,
             prompt_version=prompt_version,
+            query_type=query_type,
         )
 
         messages = [

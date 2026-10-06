@@ -61,7 +61,9 @@ def _construct_split(rng: random.Random, state: WorldState, next_obj_idx: int) -
 
 
 def _construct_merge(rng: random.Random, state: WorldState) -> Optional[Merge]:
-    nonempty = [c for c in state.containers if contents(state, c)]
+    # sorted(): state.containers is a set; its iteration order depends on
+    # PYTHONHASHSEED and would leak into rng.choice (AGENTS.md §6.5).
+    nonempty = [c for c in sorted(state.containers) if contents(state, c)]
     if not nonempty:
         return None
     src = rng.choice(nonempty)

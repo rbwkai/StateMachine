@@ -317,14 +317,16 @@ def main():
 
     # The manifest travels with the dataset so a release can be traced back to
     # the code, the pinned models and the hashes that produced it.
+    # It is named after the data file (<stem>.manifest.json) so experiments
+    # sharing an output directory do not overwrite each other's provenance.
     write_manifest(
+        output_path,
         build_manifest(
             all_records,
             experiment_tag=EXPERIMENT_TAG,
             dataset_path=output_path,
             excluded_conditions=unreachable,
         ),
-        output_path.parent / "manifest.json",
     )
 
 

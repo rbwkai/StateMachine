@@ -13,6 +13,7 @@ from collections import Counter
 import pytest
 
 from eval.baselines import (
+    initial_count,
     BaselineResult,
     compute_mfc_baseline,
     compute_stateless_baseline,
@@ -130,20 +131,18 @@ def test_stateless_matches_a_hand_solved_reference(cell):
         assert result.is_correct is (expected == record["gold_answer"])
 
 
-def test_failsnow_stateless_predicts_zero_for_count_cells():
+def test_stateless_predicts_initial_count_for_count_cells():
     """[checklist 7] the stateless baseline predicts the initial count for a
-    count cell.
-
-    [fails now] expected: pred_answer is the string "0". currently it is the
-    empty string: "0" is not in the candidate set (only the gold value is), so
-    the numeric extraction defect in checklist 6 swallows the baseline's guess.
-    """
+    count cell: the number of the target's type in the query container after
+    the setup Puts, never a hard-coded "0"."""
     records = _records(("split_chain", 2, 6, 0, 0))
     assert records
-    for result in compute_stateless_baseline(records):
-        assert result.pred_answer == "0", (
-            f"{result.instance_id}: stateless count prediction extracted as "
-            f"{result.pred_answer!r}"
+    for record, result in zip(records, compute_stateless_baseline(records)):
+        expected = initial_count(record)
+        assert expected is not None and expected.isdigit()
+        assert result.pred_answer == expected, (
+            f"{result.instance_id}: stateless count prediction "
+            f"{result.pred_answer!r}, initial count {expected!r}"
         )
 
 

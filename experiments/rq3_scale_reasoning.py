@@ -54,10 +54,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Import eval modules
+from eval.baselines import query_type_of
 from eval.engine import create_engine
 from eval.eval_harness import evaluate_predictions, format_prompt
 from eval.models import ModelConfig, CORE_MODELS, validate_pinned_revision
 from eval.scoring import score_prediction
+from experiments._common import write_manifest
 
 
 # ============================================================
@@ -187,12 +189,14 @@ def run_evaluation(
         instance_ids = []
         for rec in records:
             chain_of_thought = (prompt_mode == "structured")
+            query_type = query_type_of(rec)
             prompt = format_prompt(
                 context=rec["context"],
                 question=rec["question"],
                 system_prompt=model_cfg.system_prompt,
                 chain_of_thought=chain_of_thought,
                 prompt_version="v2",
+                query_type=query_type,
             )
             prompts.append(prompt)
             instance_ids.append(rec["instance_id"])
@@ -264,7 +268,7 @@ def analyze_results(
             for r in instance_results:
                 if not r.get("is_correct", False):
                     # Extract error type if available
-                    etype = r.get("error_type", "UNKNOWN")
+                    etype = (r.get("error_analysis") or {}).get("error_type") or "UNKNOWN"
                     error_cats[etype] += 1
 
             dominant = error_cats.most_common(1)
@@ -425,7 +429,7 @@ def main():
                         k: {
                             "overall_total": v.get("overall_total"),
                             "overall_correct": v.get("overall_correct"),
-                            "accuracy": v.get("accuracy"),
+                            "accuracy": v.get("overall_accuracy"),
                             "instance_results": v.get("instance_results", []),
                         }
                         for k, v in res["conditions"].items()
@@ -433,6 +437,19 @@ def main():
                     "elapsed": elapsed,
                 }
                 json.dump(serializable, f, ensure_ascii=False, indent=2)
+            write_manifest(
+                result_file,
+                {
+                    "experiment": "rq3",
+                    "model": model_key,
+                    "hf_model_id": CORE_MODELS[model_key].hf_model_id,
+                    "revision": CORE_MODELS[model_key].revision,
+                    "prompt_mode": prompt_mode,
+                    "conditions": sorted(res["conditions"]),
+                },
+                seed_scheme="evaluation only; decoding from eval.models.ModelConfig, "
+                            "inputs are RQ1/RQ2 records (see their manifests)",
+            )
 
             print(f"  Completed in {elapsed:.1f}s → {result_file}")
             all_results.append(res)

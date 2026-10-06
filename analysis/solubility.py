@@ -10,6 +10,7 @@ unanswerable or ambiguous even if the symbolic trace is correct.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -146,14 +147,16 @@ def run_solubility_audit(
     instances: Sequence[Dict[str, Any]],
     judge_fn: Optional[callable] = None,
     sample_size: Optional[int] = None,
+    rng: Optional[random.Random] = None,
 ) -> Dict[str, Any]:
     """
     Run solubility audit on a sample of instances.
     
     Returns aggregate statistics and per-instance results.
     """
-    import random
-    
+    # AGENTS.md §6.5: sampling flows through an explicit Random; default seed 0.
+    rng = rng if rng is not None else random.Random(0)
+
     if sample_size and len(instances) > sample_size:
         # Stratified sample by family
         from collections import defaultdict
@@ -163,8 +166,9 @@ def run_solubility_audit(
         
         sampled = []
         per_family = max(1, sample_size // len(by_family))
-        for fam, fam_insts in by_family.items():
-            sampled.extend(random.sample(fam_insts, min(per_family, len(fam_insts))))
+        for fam in sorted(by_family):
+            fam_insts = by_family[fam]
+            sampled.extend(rng.sample(fam_insts, min(per_family, len(fam_insts))))
         
         # Trim if over
         if len(sampled) > sample_size:

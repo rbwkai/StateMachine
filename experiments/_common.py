@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import random
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from generator import (
     generate_instance_with_retry,
     reset_deduplication_registry,
 )
+from generator.constants import L_MAX_WORDS, SPEC_VERSION
 from world import GenerationError
 
 
@@ -236,11 +238,12 @@ def write_jsonl(
 _UNKNOWN_COMMIT = "unknown"
 
 
-def _git(*args: str) -> str:
+def _git_or_none(*args: str) -> Optional[str]:
     """Run one read-only git command in the repo, returning trimmed stdout.
 
-    Returns an empty string outside a git checkout instead of raising, so the
-    manifest is still writable from an unpacked source tree.
+    Returns None when git is missing, the tree is not a checkout, or the
+    command fails, so callers can tell "no answer" from "empty answer" (an
+    empty ``status --porcelain`` means clean, a failed one means unknown).
     """
     try:
         result = subprocess.run(
@@ -248,8 +251,13 @@ def _git(*args: str) -> str:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout.strip() if result.returncode == 0 else ""
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _git(*args: str) -> str:
+    """``_git_or_none`` with failure collapsed to an empty string."""
+    return _git_or_none(*args) or ""
 
 
 def _last_commit_touching(*paths: str) -> str:
@@ -345,9 +353,6 @@ def build_manifest(
         "records": len(records),
         "generator_commit": _last_commit_touching("generator", "world", "render"),
         "evaluator_commit": _last_commit_touching("eval"),
-        "repo_commit": _git("rev-parse", "HEAD") or _UNKNOWN_COMMIT,
-        # A dirty tree means the commit alone does not reproduce the dataset.
-        "repo_clean": not _git("status", "--porcelain"),
         "model_commits": model_commits,
         "dataset_hashes": {
             dataset_name: {
@@ -380,16 +385,102 @@ def build_manifest(
     }
 
 
+# How generate_condition() derives instance seeds. Recorded verbatim so a reader
+# of the manifest can regenerate one instance without reading the code.
+GENERATION_SEED_SCHEME = (
+    "seed = int(sha1(f'{experiment_tag}|{seed_group or condition_id}|{i}')"
+    "[:8], 16); one random.Random(seed) per instance; conditions sharing a "
+    "seed_group (RQ2 D x N design) share seeds by design"
+)
+
+# Packages whose versions can change generated or scored bytes. Missing ones
+# are recorded as None rather than skipped, so absence is visible.
+_MANIFEST_PACKAGES = ("numpy", "scipy", "torch", "transformers")
+
+
+def manifest_path_for(data_path: Path) -> Path:
+    """``<dir>/<stem>.manifest.json`` next to ``data_path``.
+
+    One manifest per data file: several experiments may write into the same
+    directory, and a shared ``manifest.json`` let the last writer silently
+    overwrite the others' provenance.
+    """
+    return data_path.with_name(f"{data_path.stem}.manifest.json")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _jsonl_record_count(path: Path) -> Optional[int]:
+    """Non-blank lines of a JSONL file; None for any other format."""
+    if path.suffix != ".jsonl":
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
+def _package_versions() -> Dict[str, Optional[str]]:
+    from importlib import metadata
+
+    versions: Dict[str, Optional[str]] = {}
+    for name in _MANIFEST_PACKAGES:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
 def write_manifest(
-    manifest: Dict[str, Any],
-    path: Path,
-) -> None:
-    """Write a dataset manifest as JSON next to the dataset it describes."""
+    data_path: Path,
+    extra: Dict[str, Any],
+    seed_scheme: str = GENERATION_SEED_SCHEME,
+) -> Path:
+    """Write ``<stem>.manifest.json`` describing the file at ``data_path``.
+
+    ``extra`` carries the caller's own provenance (``build_manifest`` output
+    for generation, model/prompt for evaluation). The file-level fields below
+    are computed here from the bytes on disk and take precedence over ``extra``.
+
+    Only the repo-relative path or the basename of ``data_path`` is recorded,
+    and no hostname, user or environment variable is read (AGENTS.md §9).
+    """
+    data_path = Path(data_path)
+    commit = _git_or_none("rev-parse", "HEAD")
+    status = _git_or_none("status", "--porcelain") if commit else None
+
+    manifest: Dict[str, Any] = dict(extra)
+    manifest.update({
+        "data_file": {
+            "name": _safe_dataset_name(data_path),
+            "sha256": _file_sha256(data_path),
+            "records": _jsonl_record_count(data_path),
+        },
+        "seed_scheme": seed_scheme,
+        "spec_version": SPEC_VERSION,
+        # A dirty tree means the commit alone does not reproduce the data.
+        "git": {
+            "commit": commit or None,
+            "dirty": None if status is None else bool(status),
+        },
+        "environment": {
+            "python": platform.python_version(),
+            "packages": _package_versions(),
+        },
+    })
+
+    path = manifest_path_for(data_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
-    print(f"  Wrote manifest → {path}")
+    print(f"  Wrote manifest → {path.name}")
+    return path
 
 
 # ============================================================
@@ -521,10 +612,11 @@ def verify_generated_records(
     Checks:
     1. Requested E/T/D match measured E_actual/T_actual/D_actual exactly
     2. If min_v specified, V_actual >= min_v
-    3. Rendered L_word <= L_MAX (600)
+    3. Rendered L_word <= L_MAX_WORDS (generator.constants)
     4. Structural causality for structural families
     5. Trace hash uniqueness per condition (>= 80% distinct)
-    6. Seed uniqueness across all records
+    6. Seed uniqueness per (condition_id, seed); RQ2 shares seeds across
+       conditions by design (seed_group)
     7. Answer leakage: gold answer not in final distractor sentences
     8. Step-wise gold consistency with final gold
 
@@ -535,27 +627,28 @@ def verify_generated_records(
         return False
 
     all_ok = True
-    L_MAX = 600  # from generator/constants.py
+    L_MAX = L_MAX_WORDS
 
-    # 1. Seed uniqueness (per condition)
-    condition_seeds: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    # 1. Seed uniqueness, keyed on (condition_id, seed). Uniqueness is per
+    # condition, not global: RQ2's D x N cells share one seed_group, so the same
+    # seed appearing in different conditions is the paired design, not a bug
+    # (generate_condition, SPEC §5). A repeat within one condition is a bug.
+    seed_keys: Counter = Counter()
     for r in records:
         exp = r.get("experiment", experiment_tag)
         cond_id = r.get("condition_id", str(r.get("requested_factors")))
-        condition_seeds[(exp, cond_id)].append(r["seed"])
-    
+        seed_keys[(exp, cond_id, r["seed"])] += 1
+
     seed_dup_failures = 0
-    for (exp, cond_id), seeds in condition_seeds.items():
-        unique_seeds = set(seeds)
-        if len(unique_seeds) != len(seeds):
-            dup_count = len(seeds) - len(unique_seeds)
-            print(f"  [FAIL] {dup_count} duplicate seeds in {exp}/{cond_id}")
+    for (exp, cond_id, seed), count in sorted(seed_keys.items(), key=repr):
+        if count > 1:
+            print(f"  [FAIL] seed {seed} used {count}x in {exp}/{cond_id}")
             seed_dup_failures += 1
             all_ok = False
-    
+
     if seed_dup_failures == 0:
-        total_seeds = sum(len(s) for s in condition_seeds.values())
-        print(f"  [✓] All {total_seeds} seeds unique per condition")
+        print(f"  [✓] All {sum(seed_keys.values())} seeds unique per "
+              f"(condition_id, seed)")
 
     # 2. Per-condition trace hash distinctness
     condition_hashes: Dict[Tuple[str, str], List[str]] = defaultdict(list)

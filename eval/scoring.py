@@ -32,6 +32,13 @@ class AnswerExtraction:
     strict_correct: bool
 
 
+# One "Step k: ..." line of a chain-of-thought response.
+_STEP_LINE = re.compile(
+    r"^[ \t]*step[ \t]*([0-9]+)[ \t]*[:.)-][ \t]*(.*)$",
+    re.IGNORECASE | re.MULTILINE | re.ASCII,
+)
+
+
 def _is_placeholder(segment: str) -> bool:
     cleaned = segment.strip()
     if not cleaned:
@@ -82,9 +89,9 @@ def _unique_candidate_match(text: str, candidates: Sequence[str]) -> Optional[st
     return None
 
 
-# Number words a count answer may be written with, plus the filler a model puts
-# in front of it. Bounded table, not a general parser: the input is untrusted
-# text and must never reach eval/exec (AGENTS.md §6.13).
+# Number words a count answer may be written with. Bounded table, not a general
+# parser: the input is untrusted text and must never reach eval/exec
+# (AGENTS.md §6.13).
 _COUNT_NUMBER_WORDS: Dict[str, str] = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
@@ -92,18 +99,86 @@ _COUNT_NUMBER_WORDS: Dict[str, str] = {
     "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
     "eighteen": "18", "nineteen": "19", "twenty": "20",
 }
-_COUNT_FILLER = re.compile(
-    r"^(?:there (?:are|is)|number of|total of|count of|about|around|roughly)\s+",
-    re.IGNORECASE,
+
+# ------------------------------------------------------------
+# Count-answer grammar (one rule for digits and number words).
+#
+#   [neutral prefix] NUMBER [unit noun] [neutral suffix]
+#
+#   neutral prefix : "there are" | "there is" | "total of"  ("a total of"
+#                    reaches here as "total of": normalize_text drops the article)
+#   NUMBER         : ASCII digits [0-9]+ (leading zeros dropped, "007" -> "7")
+#                    or a word from _COUNT_NUMBER_WORDS
+#   unit noun      : a generic count noun (_GENERIC_COUNT_NOUNS) or the object
+#                    noun of the instance's question, singular or plural
+#   neutral suffix : "in total" | "total" | "of them" | "altogether"
+#
+# Anything else is not credited. In particular hedges and qualifiers
+# ("about 2", "around two", "approximately 2", "exactly 1", "1 or 2", "2 maybe",
+# "3 not", "2 each") are rejected for digits and number words alike: a hedged
+# count must never be scored as the gold integer. Non-ASCII digits ("١٢",
+# "１２") are rejected rather than converted.
+#
+# The reader tokenizes on single spaces after normalize_text has collapsed
+# whitespace, so there is no backtracking regex over untrusted input.
+# ------------------------------------------------------------
+_COUNT_PREFIXES: Tuple[Tuple[str, ...], ...] = (
+    ("there", "are"), ("there", "is"), ("total", "of"),
 )
-_COUNT_UNIT = re.compile(
-    r"\s*\b(?:tokens?|items?|objects?|entities?|of them|in total)\b\.?$",
-    re.IGNORECASE,
+_COUNT_SUFFIXES: Tuple[Tuple[str, ...], ...] = (
+    ("in", "total"), ("of", "them"), ("total",), ("altogether",),
 )
-_INTEGER = re.compile(r"\d+")
+# "token(s)" stays generic because checklist 6 names "2 tokens" as a numeric
+# answer form that must be read (it was the original unit word).
+_GENERIC_COUNT_NOUNS = frozenset({
+    "object", "objects", "item", "items", "thing", "things", "ones",
+    "token", "tokens",
+})
+_ASCII_DIGITS = re.compile(r"[0-9]+", re.ASCII)
+# "How many <plural noun> are in ...": render/narrative.py::question_count.
+_QUESTION_NOUN = re.compile(r"how many ([a-z-]+) (?:are|is) ", re.ASCII)
 
 
-def _numeric_answer_space(gold_answer: Optional[str]) -> bool:
+def _question_nouns(question: Optional[str]) -> frozenset:
+    """Singular and plural forms of the object noun a count question asks about."""
+    if not question:
+        return frozenset()
+    m = _QUESTION_NOUN.search(normalize_text(question))
+    if not m:
+        return frozenset()
+    plural = m.group(1)
+    forms = {plural}
+    # Inverse of render.names.pluralize_object for the endings it produces.
+    if plural.endswith("ies"):
+        forms.add(plural[:-3] + "y")
+    if plural.endswith("es"):
+        forms.add(plural[:-2])
+    if plural.endswith("s"):
+        forms.add(plural[:-1])
+    return frozenset(f for f in forms if f)
+
+
+def _strip_prefix(tokens: List[str], options: Sequence[Tuple[str, ...]]) -> List[str]:
+    for opt in options:
+        if tuple(tokens[: len(opt)]) == opt:
+            return tokens[len(opt):]
+    return tokens
+
+
+def _strip_suffix(tokens: List[str], options: Sequence[Tuple[str, ...]]) -> List[str]:
+    for opt in options:
+        if len(tokens) > len(opt) and tuple(tokens[-len(opt):]) == opt:
+            return tokens[: -len(opt)]
+    return tokens
+
+
+def _count_token(token: str) -> Optional[str]:
+    if _ASCII_DIGITS.fullmatch(token):
+        return token.lstrip("0") or "0"
+    return _COUNT_NUMBER_WORDS.get(token)
+
+
+def _numeric_answer_space(gold_answer: Optional[object]) -> bool:
     """True when this instance is answered with a bare number (a count cell).
 
     A location cell's gold is a container display name, so this stays false for
@@ -111,24 +186,37 @@ def _numeric_answer_space(gold_answer: Optional[str]) -> bool:
     """
     if gold_answer is None:
         return False
-    return bool(_INTEGER.fullmatch(normalize_text(gold_answer)))
+    return bool(_ASCII_DIGITS.fullmatch(normalize_text(gold_answer)))
 
 
-def read_count_answer(segment: str) -> Optional[str]:
-    """Read a bare count answer such as ``"2"``, ``"two"`` or ``"12 tokens"``.
+def read_count_answer(segment: str, question: Optional[str] = None) -> Optional[str]:
+    """Read a bare count answer such as ``"2"``, ``"two"`` or ``"12 phones"``.
 
-    Returns the answer as a digit string, or ``None`` when ``segment`` is not a
-    number. Used so a wrong count is recorded as a wrong guess instead of being
-    dropped for not matching a candidate (checklist 6).
+    Returns the answer as a canonical digit string, or ``None`` when ``segment``
+    does not follow the count grammar above. A wrong count is still returned
+    (as that count) so it is recorded as a wrong guess instead of being dropped
+    for not matching a candidate (checklist 6).
+
+    ``question`` is the instance's question text; its object noun is the only
+    non-generic unit word accepted ("2 keys" for "How many keys ...?"). Without
+    a question only the generic nouns are accepted.
     """
     text = normalize_text(segment)
-    text = _COUNT_FILLER.sub("", text)
-    text = _COUNT_UNIT.sub("", text).strip()
     if not text:
         return None
-    if _INTEGER.fullmatch(text):
-        return text
-    return _COUNT_NUMBER_WORDS.get(text)
+    tokens = text.split(" ")
+    tokens = _strip_prefix(tokens, _COUNT_PREFIXES)
+    tokens = _strip_suffix(tokens, _COUNT_SUFFIXES)
+    if not tokens or len(tokens) > 2:
+        return None
+    value = _count_token(tokens[0])
+    if value is None:
+        return None
+    if len(tokens) == 2:
+        unit = tokens[1]
+        if unit not in _GENERIC_COUNT_NOUNS and unit not in _question_nouns(question):
+            return None
+    return value
 
 
 def _collect_object_nouns(
@@ -186,7 +274,11 @@ def extract_instance_answer(
 ) -> AnswerExtraction:
     """
     Extract one unique candidate from final answer line or fallback segments.
+
+    ``instance`` (when given) supplies the question text, whose object noun is
+    the only non-generic unit word a count answer may carry.
     """
+    question = str(instance.get("question") or "") if instance else None
     final_matches = list(
         re.finditer(
             r"final\s+answer\s*:\s*(.+?)(?:\n|$)",
@@ -195,7 +287,7 @@ def extract_instance_answer(
         )
     )
     has_final_answer = len(final_matches) > 0
-    has_step = bool(re.search(r"(?:^|\n)\s*step\s*\d+\s*[:.)-]", raw_response, re.IGNORECASE))
+    has_step = _STEP_LINE.search(raw_response) is not None
 
     if has_final_answer:
         # The single scoring contract uses the first marker. Later markers may
@@ -207,17 +299,21 @@ def extract_instance_answer(
         if _is_placeholder(final_segment):
             answer = ""
             method = "final_answer"
+        elif _numeric_answer_space(gold_answer):
+            # Numeric answer space: skip candidate matching entirely. Parse the
+            # segment as a bare count. A wrong integer is recorded as that
+            # integer; ambiguous/unparseable segments get method="ambiguous".
+            guess = read_count_answer(final_segment, question=question)
+            if guess is not None:
+                answer = guess
+                method = "final_answer"
+            else:
+                answer = ""
+                method = "ambiguous"
         else:
             cand_match = _unique_candidate_match(final_segment, candidates)
             if cand_match is not None:
                 answer = cand_match
-                method = "final_answer"
-            elif _numeric_answer_space(gold_answer):
-                # A count cell's candidates hold only the gold value, so a
-                # non-gold number matches nothing. Record the guess instead of
-                # dropping it: "" is indistinguishable from no answer at all.
-                guess = read_count_answer(final_segment)
-                answer = guess or ""
                 method = "final_answer"
             else:
                 answer = ""
@@ -240,27 +336,47 @@ def extract_instance_answer(
     # NO Final Answer line exists -> fall back to answer_sentence / last_line
     protocol_compliant = False
 
+    numeric = _numeric_answer_space(gold_answer)
+    saw_segment = False
     for method, segment in _fallback_answer_segments(raw_response, instance=instance, object_types=object_types):
-        cand_match = _unique_candidate_match(segment, candidates)
-        if cand_match is None and _numeric_answer_space(gold_answer):
-            cand_match = read_count_answer(segment)
-        if cand_match is not None:
-            gold_norm = normalize_text(gold_answer) if gold_answer is not None else ""
-            ans_norm = normalize_text(cand_match)
-            semantic_correct = bool(gold_norm and ans_norm and ans_norm == gold_norm)
-            return AnswerExtraction(
-                answer=cand_match,
-                method=method,
-                has_final_answer=False,
-                protocol_compliant=False,
-                semantic_correct=semantic_correct,
-                strict_correct=False,
-            )
+        saw_segment = True
+        if numeric:
+            # Numeric answer space: skip candidate matching. Parse as bare count.
+            # An unparseable segment (e.g. a location sentence) does not end
+            # the search: a later segment such as the last line may still
+            # hold the count. "ambiguous" is decided after the loop.
+            guess = read_count_answer(segment, question=question)
+            if guess is not None:
+                gold_norm = normalize_text(gold_answer) if gold_answer is not None else ""
+                ans_norm = normalize_text(guess)
+                semantic_correct = bool(gold_norm and ans_norm and ans_norm == gold_norm)
+                return AnswerExtraction(
+                    answer=guess,
+                    method=method,
+                    has_final_answer=False,
+                    protocol_compliant=False,
+                    semantic_correct=semantic_correct,
+                    strict_correct=False,
+                )
+        else:
+            cand_match = _unique_candidate_match(segment, candidates)
+            if cand_match is not None:
+                gold_norm = normalize_text(gold_answer) if gold_answer is not None else ""
+                ans_norm = normalize_text(cand_match)
+                semantic_correct = bool(gold_norm and ans_norm and ans_norm == gold_norm)
+                return AnswerExtraction(
+                    answer=cand_match,
+                    method=method,
+                    has_final_answer=False,
+                    protocol_compliant=False,
+                    semantic_correct=semantic_correct,
+                    strict_correct=False,
+                )
 
-    gold_norm = normalize_text(gold_answer) if gold_answer is not None else ""
     return AnswerExtraction(
         answer="",
-        method="none",
+        # Numeric space with text but no readable count: ambiguous, not absent.
+        method="ambiguous" if numeric and saw_segment else "none",
         has_final_answer=False,
         protocol_compliant=False,
         semantic_correct=False,
@@ -310,31 +426,68 @@ def candidate_answers(
     return list(unique.values())
 
 
+def _numeric_step_space(
+    candidate_answers: Sequence[str],
+    gold_answer: Optional[str],
+    instance: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when step answers are counts.
+
+    Decided, in order, from the instance's query type, from ``gold_answer``,
+    or from the candidates being all bare integers. The candidate rule alone is
+    not enough for a real record: ``candidate_answers(instance)`` also carries
+    the final-state container names, so a count record never looks all-numeric.
+    """
+    if instance is not None:
+        # Function-local: eval.baselines imports this module, and
+        # query_type_of is the single owner of the query-type lookup.
+        from eval.baselines import query_type_of
+
+        return query_type_of(instance) == "count"
+    if gold_answer is not None:
+        return _numeric_answer_space(gold_answer)
+    cands = [c for c in candidate_answers if normalize_text(c)]
+    return bool(cands) and all(_numeric_answer_space(c) for c in cands)
+
+
+def count_step_lines(raw_response: str) -> int:
+    """Number of "Step k" lines in a response, before any alignment."""
+    return sum(1 for _ in _STEP_LINE.finditer(raw_response))
+
+
 def extract_step_answers(
     raw_response: str,
     candidate_answers: Sequence[str],
     num_steps: Optional[int] = None,
+    gold_answer: Optional[str] = None,
+    instance: Optional[Dict[str, Any]] = None,
 ) -> List[Optional[str]]:
     r"""
-    Extract step-wise container predictions from model responses.
+    Extract step-wise predictions (containers or counts) from model responses.
 
-    Gold step 1 is the initial Put location (state after op 0).
+    Step k is the state after the k-th narrated sentence, i.e. it pairs with
+    ``step_wise_gold_answers[k-1]`` (no initial-state offset).
 
     Parses only lines matching ^\s*step\s*\d+\s*[:.)-]\s*(.*)$ (case-insensitive, 'step' keyword required).
-    Matches article-insensitively with word boundaries, returning None for unparseable steps.
-    Returns the list aligned by step number.
+    Location steps match a unique candidate article-insensitively with word
+    boundaries. Count steps are parsed whole-segment with
+    :func:`read_count_answer`, so hedges like "1 or 2" or "1.5" are not credited
+    as a substring match of the gold integer. Unparseable steps are None.
+    Returns the list aligned by step number. ``instance`` decides the answer
+    space (query type) and supplies the question for count unit words.
     """
-    step_pattern = re.compile(
-        r"^\s*step\s*(\d+)\s*[:.)-]\s*(.*)$",
-        re.IGNORECASE | re.MULTILINE,
-    )
+    numeric = _numeric_step_space(candidate_answers, gold_answer, instance)
+    question = str(instance.get("question") or "") if instance else None
 
     parsed_steps: Dict[int, Optional[str]] = {}
 
-    for match in step_pattern.finditer(raw_response):
+    for match in _STEP_LINE.finditer(raw_response):
         step_num = int(match.group(1))
         step_text = match.group(2).strip()
-        matched = _unique_candidate_match(step_text, candidate_answers)
+        if numeric:
+            matched = read_count_answer(step_text, question=question) if step_text else None
+        else:
+            matched = _unique_candidate_match(step_text, candidate_answers)
         parsed_steps[step_num] = matched
 
     if not parsed_steps and num_steps is None:
@@ -344,6 +497,17 @@ def extract_step_answers(
     total = num_steps if num_steps is not None else max_step
 
     return [parsed_steps.get(i + 1) for i in range(total)]
+
+
+def step_coverage_of(
+    parsed_steps: Optional[Sequence[Optional[str]]],
+    num_gold_steps: int,
+) -> Optional[float]:
+    """Fraction of gold step events with a parsed (non-None) step answer."""
+    if parsed_steps is None or num_gold_steps <= 0:
+        return None
+    parsed = sum(1 for step in parsed_steps[:num_gold_steps] if step is not None)
+    return parsed / num_gold_steps
 
 
 def score_prediction(
@@ -368,6 +532,18 @@ def score_prediction(
         first_final_answer=True,
     )
 
+    # Step coverage: parsed (non-None) steps over gold step events. Reported
+    # beside protocol_compliant, which keeps its own meaning. Step lines are
+    # only requested under CoT, so a non-CoT run has no coverage to report.
+    gold_steps = instance.get("step_wise_gold_answers") or []
+    step_coverage: Optional[float] = None
+    if chain_of_thought and gold_steps:
+        parsed_steps = extract_step_answers(
+            raw_pred, cands, num_steps=len(gold_steps), gold_answer=gold_answer,
+            instance=instance,
+        )
+        step_coverage = step_coverage_of(parsed_steps, len(gold_steps))
+
     result = dict(prediction)
     result.update({
         "model": prediction.get("model") or instance.get("model"),
@@ -377,6 +553,7 @@ def score_prediction(
         "semantic_correct": extraction.semantic_correct,
         "strict_correct": extraction.strict_correct,
         "protocol_compliant": extraction.protocol_compliant,
+        "step_coverage": step_coverage,
         "answer_extracted": extraction.answer,
         "extraction_method": extraction.method,
         "has_final_answer": extraction.has_final_answer,

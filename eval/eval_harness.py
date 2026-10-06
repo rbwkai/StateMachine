@@ -16,6 +16,7 @@ from eval.prompts import build_user_prompt
 from eval.scoring import (
     AnswerExtraction,
     candidate_answers,
+    count_step_lines,
     extract_answer,
     extract_instance_answer,
     extract_step_answers,
@@ -34,6 +35,7 @@ def format_prompt(
     system_prompt: Optional[str] = None,
     chain_of_thought: bool = False,
     prompt_version: str = "v2",
+    query_type: str = "location",
 ) -> str:
     """Format an instance into a standardized evaluation prompt."""
     user_prompt = build_user_prompt(
@@ -41,6 +43,7 @@ def format_prompt(
         question=question,
         chain_of_thought=chain_of_thought,
         prompt_version=prompt_version,
+        query_type=query_type,
     )
     if system_prompt:
         return f"Instructions: {system_prompt}\n\n{user_prompt}"
@@ -95,22 +98,44 @@ def parse_pred_trajectory(
 ) -> Optional[List[Optional[str]]]:
     """Step-wise answers parsed out of a chain-of-thought response.
 
-    ``gold_states[0]`` is the initial state, so ``step_wise_gold`` carries one
-    more entry than the number of predicted steps; the response is parsed over
-    the steps after the initial one. Returns ``None`` when the response has no
-    usable Step line, so a markerless reply contributes no trajectory data.
+    The prompt asks for one ``Step k`` line per narrated sentence, distractor
+    sentences included, so Step k pairs with ``step_wise_gold_answers[k-1]``:
+    display names for a location cell, counts for a count cell, one entry per
+    sentence. ``step_wise_gold`` is not used here: it holds container ids (and
+    locations even for count cells) with an extra initial state, so comparing a
+    parsed response against it marks a perfect response as all-wrong.
+
+    The query type and gold answer are passed to the parser so a count cell is
+    read in the numeric answer space. Returns ``None`` when the response has
+    no usable Step line, so a markerless reply contributes no trajectory data.
     """
-    gold_states = instance.get("step_wise_gold") or []
-    if len(gold_states) < 2:
+    gold_answers = instance.get("step_wise_gold_answers") or []
+    if not gold_answers:
         return None
+    gold_answer = instance.get("gold_answer")
     parsed = extract_step_answers(
         raw_prediction,
         candidate_answers(instance),
-        num_steps=len(gold_states) - 1,
+        num_steps=len(gold_answers),
+        gold_answer=None if gold_answer is None else str(gold_answer),
+        instance=instance,
     )
     if not any(step is not None for step in parsed):
         return None
     return parsed
+
+
+def _step_alignment(n_steps: int, expected: int) -> str:
+    if n_steps == expected:
+        return "exact"
+    return "under_stepped" if n_steps < expected else "over_stepped"
+
+
+# analysis.first_error.analyze_first_error expects gold with a leading initial
+# state (it compares pred[i] against gold[i + 1] and never reads gold[0]).
+# step_wise_gold_answers has no initial entry, so a placeholder is prepended to
+# align Step k with gold answer k. It is never compared and never reported.
+_INITIAL_STATE_SENTINEL: Optional[str] = None
 
 
 # AGENTS.md §5: eval/scoring.py owns extraction. Re-exported here so harness
@@ -140,6 +165,12 @@ class InstanceEvalResult:
     extraction_method: str = ""
     protocol_compliant: bool = False
     semantic_correct: bool = False
+
+    # "exact" | "under_stepped" | "over_stepped", or None without a trajectory.
+    step_alignment: Optional[str] = None
+    # Engine stop reason ("length" = hit the token limit), when the prediction
+    # row carries one; post_run_sanity derives truncation from it.
+    finish_reason: Optional[str] = None
 
 
 @dataclass
@@ -172,6 +203,7 @@ def evaluate_predictions(
       - "instance_id": matching record in instances
       - "pred_answer": model's predicted final answer
       - "pred_trajectory" (optional): step-by-step state predictions
+      - "finish_reason" (optional): engine stop reason, carried through
     """
     prediction_ids = [p["instance_id"] for p in predictions]
     duplicate_ids = sorted({
@@ -203,18 +235,56 @@ def evaluate_predictions(
         )
         is_correct = scored["strict_correct"]
 
-        # Trajectory error analysis if step-wise predictions are present. A
-        # caller-supplied trajectory wins; otherwise parse one out of the
-        # response so a chain-of-thought run feeds the taxonomy.
-        gold_traj = inst.get("step_wise_gold")
+        # Trajectory error analysis if step-wise predictions are present.
+        #
+        # Two input contracts:
+        # - caller-supplied ``pred_trajectory``: the state space of
+        #   ``step_wise_gold`` (container ids, initial state at index 0, so a
+        #   full trajectory has len(gold) - 1 steps);
+        # - otherwise the response is parsed: one answer per narrated sentence
+        #   in the space of ``step_wise_gold_answers``, compared with no offset.
+        # A missing step stays None, which first_error reports as MISSING (not
+        # as wrong); extra steps are dropped. step_alignment records which.
+        # gold_trajectory reports the list the prediction was compared with
+        # (step_wise_gold unless a response trajectory was parsed).
         pred_traj = pred_info.get("pred_trajectory")
-        if pred_traj is None:
-            pred_traj = parse_pred_trajectory(raw_pred, inst)
+        gold_traj: Optional[List[Any]] = inst.get("step_wise_gold")
         error_analysis_dict = None
+        step_alignment: Optional[str] = None
 
-        if gold_traj and pred_traj and len(gold_traj) == len(pred_traj) + 1:
-            analysis = analyze_first_error(gold_traj, pred_traj)
-            error_analysis_dict = analysis.to_dict()
+        if pred_traj is not None:
+            if gold_traj and pred_traj:
+                expected = len(gold_traj) - 1
+                pred_traj = list(pred_traj)
+                step_alignment = _step_alignment(len(pred_traj), expected)
+                if len(pred_traj) < expected:
+                    pred_traj = pred_traj + [None] * (expected - len(pred_traj))
+                else:
+                    pred_traj = pred_traj[:expected]
+                analysis = analyze_first_error(gold_traj, pred_traj)
+                error_analysis_dict = analysis.to_dict()
+        else:
+            pred_traj = parse_pred_trajectory(raw_pred, inst)
+            if pred_traj is not None:
+                gold_traj = list(inst.get("step_wise_gold_answers") or [])
+                # Alignment is judged on the raw Step-line count: the parser
+                # always returns exactly len(gold_traj) entries.
+                step_alignment = _step_alignment(
+                    count_step_lines(raw_pred), len(gold_traj)
+                )
+                gold_cmp = [_INITIAL_STATE_SENTINEL] + [
+                    normalize_text(g) for g in gold_traj
+                ]
+                pred_cmp = [
+                    None if p is None else normalize_text(p) for p in pred_traj
+                ]
+                analysis = analyze_first_error(gold_cmp, pred_cmp)
+                error_analysis_dict = analysis.to_dict()
+                # Report the gold/pred finals as the record spells them.
+                error_analysis_dict["gold_final"] = gold_traj[-1]
+                error_analysis_dict["pred_final"] = pred_traj[-1]
+        if error_analysis_dict is not None:
+            error_analysis_dict["step_alignment"] = step_alignment
 
         res = InstanceEvalResult(
             instance_id=iid,
@@ -233,6 +303,8 @@ def evaluate_predictions(
             extraction_method=scored.get("extraction_method", ""),
             protocol_compliant=scored.get("protocol_compliant", False),
             semantic_correct=scored.get("semantic_correct", False),
+            step_alignment=step_alignment,
+            finish_reason=pred_info.get("finish_reason"),
         )
         results.append(res)
 

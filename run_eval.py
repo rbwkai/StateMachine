@@ -29,6 +29,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -40,20 +41,24 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from analysis.failure_onset import (
-    best_fitting_curve,
     compare_curves,
     compute_failure_onset,
 )
 from analysis.first_error import analyze_first_error
-from eval.engine import HuggingFaceEngine, MockInferenceEngine
+from analysis.solubility import run_solubility_audit
+from eval.baselines import query_type_of
+from eval.engine import HuggingFaceEngine, InferenceEngine, MockInferenceEngine
 from eval.scoring import (
     candidate_answers,
     extract_instance_answer,
     extract_step_answers,
     normalize_text,
+    step_coverage_of,
 )
 from eval.models import CORE_MODELS, OPTIONAL_MODELS, ModelConfig
-from generator.constants import SCORING_VERSION
+from eval.robustness import run_robustness_suite
+from eval.prompts import QUERY_TYPES
+from generator.constants import FAILURE_THRESHOLD_TAU, SCORING_VERSION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -109,6 +114,113 @@ def load_dataset(dataset_path: Path, limit: Optional[int] = None) -> List[Dict[s
     return records
 
 
+def check_promptable_query_types(dataset_records: List[Dict[str, Any]]) -> None:
+    """Fail fast on records whose query type has no prompt answer contract.
+
+    ``eval.prompts`` only defines answer slots for QUERY_TYPES ("location",
+    "count"). A record such as ``redo_validity`` would otherwise raise deep in
+    prompt formatting, after the model has been loaded, or be silently
+    dropped; refusing the dataset up front keeps the accounting honest.
+    """
+    bad = [
+        (str(rec.get("instance_id")), query_type_of(rec))
+        for rec in dataset_records
+        if query_type_of(rec) not in QUERY_TYPES
+    ]
+    if bad:
+        shown = ", ".join(f"{iid} ({qt})" for iid, qt in bad[:20])
+        more = f" and {len(bad) - 20} more" if len(bad) > 20 else ""
+        raise ValueError(
+            f"{len(bad)} record(s) have a query type with no prompt contract "
+            f"(supported: {list(QUERY_TYPES)}): {shown}{more}. "
+            "Filter them out of the dataset before running run_eval."
+        )
+
+
+def build_prompts(
+    engine: InferenceEngine,
+    dataset_records: List[Dict[str, Any]],
+    chain_of_thought: bool,
+    prompt_version: str,
+) -> List[Any]:
+    """Format one prompt per record with that record's answer contract.
+
+    ``query_type`` is resolved per record so a count record gets the
+    integer answer slot, not the location one.
+    """
+    check_promptable_query_types(dataset_records)
+    return [
+        engine.format_input(
+            context=rec["context"],
+            question=rec["question"],
+            chain_of_thought=chain_of_thought,
+            prompt_version=prompt_version,
+            query_type=query_type_of(rec),
+        )
+        for rec in dataset_records
+    ]
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_file_stem(stem: str) -> str:
+    """Filesystem-safe single path component (AGENTS.md §9).
+
+    Collapses anything outside [A-Za-z0-9._-] (separators included) to "_" and
+    strips leading dots so the result can neither traverse nor hide.
+    """
+    safe = _UNSAFE_FILENAME_CHARS.sub("_", stem).lstrip(".")
+    return safe or "results"
+
+
+def robustness_path_for(results_file: Path) -> Path:
+    """``<results_stem>.robustness.json`` next to ``results_file``.
+
+    run_evaluation passes ``<dataset>.jsonl`` so the file is
+    ``<dataset>.robustness.json``.
+    """
+    return results_file.with_name(
+        f"{_safe_file_stem(results_file.stem)}.robustness.json"
+    )
+
+
+def run_robustness_checks(
+    engine: InferenceEngine,
+    dataset_records: List[Dict[str, Any]],
+    chain_of_thought: bool,
+    max_new_tokens: int,
+) -> Dict[str, Any]:
+    """Prompt-sensitivity/paraphrase (eval.robustness) and solubility checks.
+
+    Opt-in diagnostic: it re-queries the engine with variant prompts, so it
+    never feeds back into the headline metrics. Variant prompts are sent as a
+    single user message so chat-templated engines see the same role layout
+    for every variant; greedy decoding is enforced as in the main run.
+    """
+    def predict(prompt: str) -> str:
+        responses = engine.generate_batch(
+            [[{"role": "user", "content": prompt}]],
+            max_new_tokens=max_new_tokens,
+            enforce_greedy=True,
+        )
+        return responses[0] if responses else ""
+
+    robustness = run_robustness_suite(
+        dataset_records, predict, chain_of_thought=chain_of_thought
+    )
+    # sample_size=None: audit every record. The sampled branch draws from the
+    # module-level RNG, which AGENTS.md §6.5 forbids for reproducible output.
+    solubility = run_solubility_audit(dataset_records, sample_size=None)
+    return {
+        "chain_of_thought": chain_of_thought,
+        "max_new_tokens": max_new_tokens,
+        "total_instances": len(dataset_records),
+        "robustness": robustness,
+        "solubility": solubility,
+    }
+
+
 def run_evaluation(
     model_config: ModelConfig,
     dataset_records: List[Dict[str, Any]],
@@ -124,8 +236,11 @@ def run_evaluation(
     skip_redundant_no_cot: bool = False,
     mock: bool = False,
     hf_token: Optional[str] = None,
+    robustness: bool = False,
 ) -> Dict[str, Any]:
     effective_max_tokens = max_new_tokens or model_config.max_new_tokens
+    # Before any engine/model load (L5).
+    check_promptable_query_types(dataset_records)
 
     # Checks on non-CoT and CoT token budgets
     if not chain_of_thought and effective_max_tokens > 32:
@@ -171,7 +286,12 @@ def run_evaluation(
     metrics_file = model_output_dir / f"{dataset_name}_metrics.json"
     report_file = model_output_dir / f"{dataset_name}_report.md"
 
+    # "<dataset>.robustness.json": named after the dataset, not the metrics file.
+    robustness_file = robustness_path_for(model_output_dir / f"{dataset_name}.jsonl")
+
     artifacts = [pred_file, csv_file, metrics_file, report_file]
+    if robustness:
+        artifacts.append(robustness_file)
     if not overwrite:
         existing = [str(p) for p in artifacts if p.exists()]
         if existing:
@@ -202,14 +322,9 @@ def run_evaluation(
     raw_predictions: List[str] = []
     prompts: List[str] = []
 
-    for rec in dataset_records:
-        prompt = engine.format_input(
-            context=rec["context"],
-            question=rec["question"],
-            chain_of_thought=chain_of_thought,
-            prompt_version=prompt_version,
-        )
-        prompts.append(prompt)
+    prompts.extend(
+        build_prompts(engine, dataset_records, chain_of_thought, prompt_version)
+    )
 
     for i in range(0, total_samples, batch_size):
         batch_prompts = prompts[i : i + batch_size]
@@ -264,15 +379,29 @@ def run_evaluation(
         generation_info = all_generation_metadata[index] if index < len(all_generation_metadata) else {}
 
         gold_step_answers = rec.get("step_wise_gold_answers", [])
-        parsed_steps = extract_step_answers(raw_pred, cands, num_steps=len(gold_step_answers))
-        step_correct = [
-            normalize_text(pred) == normalize_text(gold) if pred is not None else False
-            for pred, gold in zip(parsed_steps, gold_step_answers)
-        ]
-        step_first_error = next(
-            (idx + 1 for idx, correct in enumerate(step_correct) if not correct),
-            None,
-        )
+        # Step lines are only requested under CoT. Parsing a non-CoT response
+        # yields all-None steps, which would report step_first_error=1 for
+        # every instance, so step analysis is skipped there.
+        parsed_steps: Optional[List[Optional[str]]] = None
+        step_correct: Optional[List[bool]] = None
+        step_first_error: Optional[int] = None
+        step_accuracy: Optional[float] = None
+        step_coverage: Optional[float] = None
+        if chain_of_thought:
+            parsed_steps = extract_step_answers(
+                raw_pred, cands, num_steps=len(gold_step_answers), gold_answer=gold_answer,
+                instance=rec,
+            )
+            step_correct = [
+                normalize_text(pred) == normalize_text(gold) if pred is not None else False
+                for pred, gold in zip(parsed_steps, gold_step_answers)
+            ]
+            step_first_error = next(
+                (idx + 1 for idx, correct in enumerate(step_correct) if not correct),
+                None,
+            )
+            step_accuracy = sum(step_correct) / len(step_correct) if step_correct else None
+            step_coverage = step_coverage_of(parsed_steps, len(gold_step_answers))
 
         if is_correct:
             correct_count += 1
@@ -305,9 +434,8 @@ def run_evaluation(
             "predicted_step_answers": parsed_steps,
             "step_correct": step_correct,
             "step_first_error": step_first_error,
-            "step_accuracy": (
-                sum(step_correct) / len(step_correct) if step_correct else None
-            ),
+            "step_accuracy": step_accuracy,
+            "step_coverage": step_coverage,
             "generated_tokens": generation_info.get("generated_tokens"),
             "prompt_tokens": generation_info.get("prompt_tokens"),
             "finish_reason": generation_info.get("finish_reason"),
@@ -339,10 +467,15 @@ def run_evaluation(
                 rq3_by_d.setdefault(d_val, []).append(is_correct)
 
     overall_accuracy = correct_count / total_samples if total_samples > 0 else 0.0
-    step_rows = [item for item in instance_results if item["step_correct"]]
+    # Instances with at least one parsed step; step lines are only requested
+    # under CoT, so a non-CoT run has no step coverage to report (None, not 0).
+    step_rows = [
+        item for item in instance_results
+        if any(step is not None for step in (item["predicted_step_answers"] or ()))
+    ]
     step_values = [
         value for item in instance_results
-        for value in item["step_correct"]
+        for value in (item["step_correct"] or ())
     ]
     missing_predictions = sum(
         1 for item in instance_results if not item["raw_prediction"].strip()
@@ -368,7 +501,7 @@ def run_evaluation(
     if rq1_curve:
         sorted_t = sorted(rq1_curve.keys())
         sorted_acc = [rq1_curve[t] for t in sorted_t]
-        l_t_onset = compute_failure_onset(sorted_t, sorted_acc, tau=0.70)
+        l_t_onset = compute_failure_onset(sorted_t, sorted_acc, tau=FAILURE_THRESHOLD_TAU)
 
     # RQ2 Revision Curve
     rq2_curve = {}
@@ -386,7 +519,7 @@ def run_evaluation(
     if rq3_curve:
         sorted_d = sorted(rq3_curve.keys())
         sorted_d_acc = [rq3_curve[d] for d in sorted_d]
-        l_d_onset = compute_failure_onset(sorted_d, sorted_d_acc, tau=0.70)
+        l_d_onset = compute_failure_onset(sorted_d, sorted_d_acc, tau=FAILURE_THRESHOLD_TAU)
 
     metrics = {
         "model_name": model_config.name,
@@ -397,7 +530,10 @@ def run_evaluation(
         "overall_accuracy": overall_accuracy,
         "missing_predictions": missing_predictions,
         "stepwise_parseable_instances": len(step_rows),
-        "stepwise_coverage": len(step_rows) / total_samples if total_samples else 0.0,
+        "stepwise_coverage": (
+            len(step_rows) / total_samples
+            if chain_of_thought and total_samples else None
+        ),
         "stepwise_accuracy": sum(step_values) / len(step_values) if step_values else None,
         "elapsed_seconds": elapsed,
         "chain_of_thought": chain_of_thought,
@@ -425,6 +561,15 @@ def run_evaluation(
 
     generate_markdown_report(metrics, report_file)
 
+    if robustness:
+        # Written separately so the metrics schema is identical with the flag off.
+        robustness_summary = run_robustness_checks(
+            engine, dataset_records, chain_of_thought, effective_max_tokens
+        )
+        with open(robustness_file, "w", encoding="utf-8") as f:
+            json.dump(robustness_summary, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved robustness  → {robustness_file}")
+
     logger.info(f"Saved predictions → {pred_file}")
     logger.info(f"Saved audit CSV   → {csv_file}")
     logger.info(f"Saved metrics     → {metrics_file}")
@@ -439,7 +584,7 @@ def write_audit_csv(rows: List[Dict[str, Any]], path: Path) -> None:
         "instance_id", "family", "experiment", "question", "gold_answer",
         "gold_container", "raw_prediction", "extracted_answer", "is_correct",
         "is_correct_semantic", "semantic_correct", "strict_correct",
-        "extraction_method", "protocol_compliant", "prompt_version",
+        "extraction_method", "protocol_compliant", "step_coverage", "prompt_version",
         "trace_hash", "scoring_version",
         "step_accuracy", "step_first_error", "requested_factors", "measured_factors",
         "gold_step_answers", "predicted_step_answers", "step_correct", "prompt",
@@ -480,7 +625,7 @@ def generate_markdown_report(metrics: Dict[str, Any], report_path: Path) -> None
         lines.extend([
             "",
             "## RQ1 Temporal Depth Degradation Curve",
-            f"**Failure Onset (L_T @ τ=0.70)**: `{metrics.get('rq1_failure_onset_L_T')}`",
+            f"**Failure Onset (L_T @ τ={FAILURE_THRESHOLD_TAU:.2f})**: `{metrics.get('rq1_failure_onset_L_T')}`",
             "",
             "| Depth (T) | Accuracy |",
             "|---|---|",
@@ -503,7 +648,7 @@ def generate_markdown_report(metrics: Dict[str, Any], report_path: Path) -> None
         lines.extend([
             "",
             "## RQ3 Distractor Interference Curve",
-            f"**Failure Onset (L_D @ τ=0.70)**: `{metrics.get('rq3_failure_onset_L_D')}`",
+            f"**Failure Onset (L_D @ τ={FAILURE_THRESHOLD_TAU:.2f})**: `{metrics.get('rq3_failure_onset_L_D')}`",
             "",
             "| Distractors (D) | Accuracy |",
             "|---|---|",
@@ -551,6 +696,11 @@ def main():
     parser.add_argument("--mock", action="store_true", help="Run mock evaluation (dry-run without model weights)")
     parser.add_argument("--limit", type=int, default=None, help="Limit to first N dataset records")
     parser.add_argument("--output-dir", type=str, default="results", help="Directory to save evaluation artifacts")
+    parser.add_argument(
+        "--robustness",
+        action="store_true",
+        help="Also run prompt/paraphrase robustness and solubility checks; writes <dataset>.robustness.json",
+    )
     parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN"), help="Hugging Face access token")
 
     args = parser.parse_args()
@@ -589,6 +739,7 @@ def main():
         skip_redundant_no_cot=args.skip_redundant_no_cot,
         mock=args.mock,
         hf_token=args.hf_token,
+        robustness=args.robustness,
     )
 
     print("\n" + "=" * 75)

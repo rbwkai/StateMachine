@@ -4,8 +4,13 @@ eval/post_run_sanity.py
 Post-run screening checks for a scored model run (checklist 12).
 
 Four checks decide whether a run's numbers can be believed:
-1. accuracy below the instance's own chance level means a parsing bug;
-2. format compliance and truncation rate are reported per cell;
+1. accuracy below the cell's uniform chance (mean 1/|answer space|) flags a
+   parsing bug or a model that is not tracking. The heuristic ceiling,
+   effective chance and a degenerate-gold flag are reported per cell as
+   diagnostics but do not gate: on basic_chain, revision and constant-gold
+   cells they reach 1.0 by construction, which flagged nearly every cell;
+2. format compliance, missing-final-line rate and truncation rate (generation
+   stopped on ``finish_reason == "length"``) are reported per cell;
 3. the strict/semantic gap is visible, so extraction losses are not read as
    reasoning losses;
 4. a model beats a baseline in every cell where that baseline is weak.
@@ -18,7 +23,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from eval.baselines import chance_level
+from eval.baselines import (
+    best_heuristic_ceiling,
+    degenerate_gold,
+    effective_chance,
+    uniform_chance,
+)
 from eval.eval_harness import condition_key
 
 # A baseline this weak is not something a model should merely match.
@@ -30,14 +40,24 @@ def sanity_checks(
     report: Dict[str, Any],
     baseline_accuracy: Optional[Dict[str, float]] = None,
     weak_baseline: float = WEAK_BASELINE,
+    predictions: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-condition screening statistics for a harness report.
 
     ``baseline_accuracy`` is an optional condition-key -> accuracy map (from
     ``run_all_baselines``); when supplied, the weak-baseline check is evaluated
     for the conditions it covers.
+
+    ``finish_reason`` is read from each instance result (the harness carries it
+    through) or, failing that, from the matching row of ``predictions``.
+    ``truncation_rate`` is ``None`` for a cell where no row records one.
     """
     by_id = {inst["instance_id"]: inst for inst in instances}
+    finish_by_id = {
+        row["instance_id"]: row.get("finish_reason")
+        for row in (predictions or [])
+        if "instance_id" in row
+    }
     totals: Dict[str, Dict[str, Any]] = {}
 
     for result in report.get("instance_results", []):
@@ -46,26 +66,52 @@ def sanity_checks(
             continue
         entry = totals.setdefault(
             condition_key(instance),
-            {"n": 0, "strict": 0, "semantic": 0, "final_line": 0, "chance": 0.0},
+            {"n": 0, "strict": 0, "semantic": 0, "final_line": 0,
+             "length_stops": 0, "finish_known": 0, "records": []},
         )
         entry["n"] += 1
         entry["strict"] += bool(result["is_correct"])
         entry["semantic"] += bool(result["semantic_correct"])
         entry["final_line"] += bool(result["has_final_answer"])
-        entry["chance"] = chance_level(instance)
+        entry["records"].append(instance)
+        # finish_reason is written per row by run_eval.py; a row without it
+        # tells us nothing about truncation, so it is not counted as "not
+        # truncated".
+        finish_reason = result.get("finish_reason")
+        if finish_reason is None:
+            finish_reason = finish_by_id.get(result["instance_id"])
+        if finish_reason is not None:
+            entry["finish_known"] += 1
+            entry["length_stops"] += finish_reason == "length"
 
     stats: Dict[str, Dict[str, Any]] = {}
     for key, entry in totals.items():
         n = entry["n"]
         strict = entry["strict"] / n
         semantic = entry["semantic"] / n
+        # One chance per cell, over the scored records only (previously the
+        # last instance's chance_level silently stood for the whole cell).
+        # Gate on the uniform floor only; shortcut ceilings are diagnostics.
+        records = entry["records"]
+        chance = uniform_chance(records)
+        ceiling_name, ceiling_acc = best_heuristic_ceiling(records)
+        truncation: Optional[float] = (
+            entry["length_stops"] / entry["finish_known"]
+            if entry["finish_known"]
+            else None
+        )
         cell: Dict[str, Any] = {
             "n": n,
             "accuracy": strict,
-            "chance": entry["chance"],
-            "below_chance": strict < entry["chance"] - 1e-9,
+            "chance": chance,
+            "below_chance": strict < chance - 1e-9,
+            "heuristic_ceiling_name": ceiling_name,
+            "heuristic_ceiling_acc": ceiling_acc,
+            "effective_chance": effective_chance(records),
+            "degenerate_gold": degenerate_gold(records),
             "format_compliance": entry["final_line"] / n,
-            "truncation_rate": 1.0 - entry["final_line"] / n,
+            "missing_final_rate": 1.0 - entry["final_line"] / n,
+            "truncation_rate": truncation,
             "strict_semantic_gap": semantic - strict,
         }
         if baseline_accuracy is not None and key in baseline_accuracy:
@@ -85,12 +131,16 @@ def sanity_failures(stats: Dict[str, Dict[str, Any]]) -> List[str]:
         cell = stats[key]
         if cell["below_chance"]:
             failures.append(
-                f"{key}: accuracy {cell['accuracy']:.3f} is below chance "
-                f"{cell['chance']:.3f}, which signals a parsing bug"
+                f"{key}: accuracy {cell['accuracy']:.3f} is below uniform "
+                f"chance {cell['chance']:.3f} (1/|answer space|), which "
+                f"signals a parsing bug or no tracking"
             )
-        if cell["truncation_rate"] > 0.0:
+        # None means no finish_reason was recorded: unknown, not a failure.
+        truncation = cell.get("truncation_rate")
+        if truncation is not None and truncation > 0.0:
             failures.append(
-                f"{key}: truncation rate {cell['truncation_rate']:.3f}"
+                f"{key}: truncation rate {truncation:.3f} "
+                f"(generation stopped on the token limit)"
             )
         if cell.get("beats_weak_baseline") is False:
             failures.append(

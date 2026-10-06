@@ -13,56 +13,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from eval.prompts import build_user_prompt
+from eval.baselines import query_type_of
+# Prompt text and the variant builder live in eval/prompts.py (AGENTS.md §5);
+# re-exported here for existing callers.
+from eval.prompts import (  # noqa: F401  (re-export)
+    MINIMAL_INSTRUCTIONS,
+    PROMPT_TEMPLATES,
+    build_prompt_variants,
+    build_user_prompt,
+)
 from eval.scoring import candidate_answers, extract_instance_answer
-
-
-# ============================================================
-# Prompt template variants (E4)
-# ============================================================
-
-PROMPT_TEMPLATES: Dict[str, Dict[str, str]] = {
-    "v1_original": {
-        "system": "You are a helpful assistant that answers questions about object locations.",
-        "instruction": "Read the following narrative and answer the question.",
-    },
-    "v2_standard": {
-        "system": "You are an expert dynamic state reasoning assistant. Answer the question based only on the given narrative state changes. Give your final answer clearly.",
-        "instruction": "Track the object locations through the narrative and answer the question.",
-    },
-    "v3_minimal": {
-        "system": "Answer the question based on the narrative.",
-        "instruction": "Where is the object?",
-    },
-}
-
-
-def build_prompt_variants(
-    context: str,
-    question: str,
-    chain_of_thought: bool = False,
-) -> Dict[str, str]:
-    """Build all prompt template variants for a given instance.
-    
-    Returns a dict mapping variant name to the full prompt text including
-    the system prompt variant. The system prompt is prepended in a way
-    that both mock and real engines can use it.
-    """
-    variants = {}
-    for name, template in PROMPT_TEMPLATES.items():
-        # Build the full prompt with the variant's system prompt
-        system_prompt = template["system"]
-        instruction = template["instruction"]
-        full_context = f"{instruction}\n\n{context}"
-        user_prompt = build_user_prompt(
-            context=full_context,
-            question=question,
-            chain_of_thought=chain_of_thought,
-            prompt_version="v2",
-        )
-        # Embed system prompt in a way both mock and real engines can use
-        variants[name] = f"[SYSTEM_PROMPT: {system_prompt}]\n{user_prompt}"
-    return variants
 
 
 # ============================================================
@@ -70,19 +30,23 @@ def build_prompt_variants(
 # ============================================================
 
 # Paraphrase rules for template shifting (Yang et al., 2023)
+#
+# Sentence shapes are owned by render/narrative.py (render_put .. render_swap).
+# Names may contain hyphens, so subjects use _WORD and container phrases use
+# _PHRASE; a bare \w / [\w\s] class leaves "the red-bag" sentences unchanged.
+_WORD = r"[\w-]+"
+_PHRASE = r"[\w\s-]+"
+
 PARAPHRASE_RULES = [
     # (pattern, replacement) - applied to rendered sentences
-    (r"(\w+) was placed in ([\w\s]+)\.", r"\1 is put into \2."),
-    (r"(\w+) was moved from ([\w\s]+) to ([\w\s]+)\.", r"\1 goes from \2 to \3."),
-    (r"(\w+) was moved to ([\w\s]+)\.", r"\1 is moved to \2."),  # include_source=False
-    (r"(\w+) was taken out of ([\w\s]+)\.", r"\1 is removed from \2."),
+    (rf"({_WORD}) was placed in ({_PHRASE})\.", r"\1 is put into \2."),
+    (rf"({_WORD}) was moved from ({_PHRASE}) to ({_PHRASE})\.", r"\1 goes from \2 to \3."),
+    (rf"({_WORD}) was moved to ({_PHRASE})\.", r"\1 is moved to \2."),  # include_source=False
+    (rf"({_WORD}) was taken out of ({_PHRASE})\.", r"\1 is removed from \2."),
     (r"That last action was undone\.", r"The previous action is reversed."),
     (r"The undone action was redone\.", r"The reversed action is reapplied."),
-    (r"Everything in ([\w\s]+) was moved into ([\w\s]+)\.", r"All items in \1 are transferred to \2."),
-    (r"The contents of ([\w\s]+) and ([\w\s]+) were swapped\.", r"\1 and \2 exchange their contents."),
-    # Undo/Redo
-    (r"That last action was undone\.", r"The previous action is reversed."),
-    (r"The undone action was redone\.", r"The reversed action is reapplied."),
+    (rf"Everything in ({_PHRASE}) was moved into ({_PHRASE})\.", r"All items in \1 are transferred to \2."),
+    (rf"The contents of ({_PHRASE}) and ({_PHRASE}) were swapped\.", r"\1 and \2 exchange their contents."),
 ]
 
 
@@ -106,6 +70,7 @@ def build_paraphrase_prompt(
     paraphrased_sentences: List[str],
     chain_of_thought: bool = False,
     prompt_version: str = "v2",
+    query_type: str = "location",
 ) -> str:
     """Build prompt with paraphrased narrative."""
     paraphrased_context = " ".join(paraphrased_sentences)
@@ -114,6 +79,7 @@ def build_paraphrase_prompt(
         question=question,
         chain_of_thought=chain_of_thought,
         prompt_version=prompt_version,
+        query_type=query_type,
     )
 
 
@@ -149,15 +115,17 @@ def evaluate_prompt_sensitivity(
     context = instance["context"]
     question = instance["question"]
     gold = instance.get("gold_answer", "")
-    
-    variants = build_prompt_variants(context, question, chain_of_thought)
+    query_type = query_type_of(instance)
+
+    variants = build_prompt_variants(context, question, chain_of_thought, query_type)
     accuracies = {}
     
     for name, prompt in variants.items():
         pred = predict_fn(prompt)
         cands = candidate_answers(instance)
         extraction = extract_instance_answer(
-            pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold
+            pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold,
+            instance=instance,
         )
         accuracies[name] = 1.0 if extraction.strict_correct else 0.0
     
@@ -193,27 +161,31 @@ def evaluate_paraphrase_robustness(
     question = instance["question"]
     gold = instance.get("gold_answer", "")
     sentences = instance.get("sentences", [])
-    
+    query_type = query_type_of(instance)
+
     # Original
     orig_prompt = build_user_prompt(
         context=context,
         question=question,
         chain_of_thought=chain_of_thought,
         prompt_version="v2",
+        query_type=query_type,
     )
     orig_pred = predict_fn(orig_prompt)
     cands = candidate_answers(instance)
     orig_extraction = extract_instance_answer(
-        orig_pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold
+        orig_pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold,
+        instance=instance,
     )
     orig_acc = 1.0 if orig_extraction.strict_correct else 0.0
     
     # Paraphrased
     paraphrased = paraphrase_narrative(sentences)
-    para_prompt = build_paraphrase_prompt(context, question, paraphrased, chain_of_thought)
+    para_prompt = build_paraphrase_prompt(context, question, paraphrased, chain_of_thought, query_type=query_type)
     para_pred = predict_fn(para_prompt)
     para_extraction = extract_instance_answer(
-        para_pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold
+        para_pred, cands, chain_of_thought=chain_of_thought, gold_answer=gold,
+        instance=instance,
     )
     para_acc = 1.0 if para_extraction.strict_correct else 0.0
     

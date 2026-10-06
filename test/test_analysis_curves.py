@@ -217,8 +217,15 @@ def test_failsnow_mcnemar_test_is_available_for_direct_versus_cot():
 
 
 def test_failsnow_cells_with_fewer_than_fifty_successes_are_flagged():
-    """[checklist 10] 'Report cells with fewer than 50 successes.'"""
+    """[checklist 10] small-cell reporting.
+
+    The literal "fewer than 50 successes" rule flagged every cell below 100% at
+    n=50; the rule is now minority count < 10 or Wilson half-width > 0.12.
+    """
     reporter = _helper("flag_low_success_cells")
     assert reporter is not None, "analysis exposes no low-success reporter"
-    flagged = reporter([{"condition": "basic_chain_T4", "correct": 12, "total": 50}])
-    assert flagged and flagged[0]["condition"] == "basic_chain_T4"
+    flagged = reporter([
+        {"condition": "basic_chain_T4", "correct": 45, "total": 50},
+        {"condition": "basic_chain_T8", "correct": 12, "total": 50},
+    ])
+    assert [cell["condition"] for cell in flagged] == ["basic_chain_T4"]
