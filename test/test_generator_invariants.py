@@ -369,14 +369,12 @@ def test_failsnow_count_grid_cell_at_t4_is_generatable(family):
     assert built >= 45, f"{family} count cell T=4 produced {built}/50 instances"
 
 
-def test_failsnow_v_actual_never_exceeds_t_actual():
-    """[checklist 2] V_actual <= T_actual: the number of distinct target
-    locations cannot exceed the number of target updates.
+def test_v_actual_never_exceeds_t_actual():
+    """[checklist 2] V_actual <= T_actual over 200 seeds of undo_redo_chain T=8.
 
-    [fails now] expected: 0 violations over 200 seeds of undo_redo_chain T=8.
-    currently: V_actual=T_actual+1 on roughly 8% of seeds, because an Undo is
-    counted as a transition (U_actual) while V counts distinct locations, so the
-    two factors are measured over different event sets.
+    Gap closed: the instance gate rejects V>T so build_record retries to a
+    passing attempt; verify_factors keeps its diagnostic warning for direct
+    calls. V double-count (SPEC OPEN-4, F8) is preserved until SPEC redefines V.
     """
     violations = []
     with quiet():
@@ -586,23 +584,32 @@ def test_failsnow_every_rq1_grid_cell_generates_instances():
     assert not empty, f"grid cells that produced no instance at all: {empty}"
 
 
-def test_failsnow_experiment_query_type_map_matches_the_builders():
-    """[checklist 2] 'spec.query_type is accepted by exactly the families that
-    support it, and the builder and the experiment mapping agree.'
+def test_experiment_query_type_map_matches_the_builders():
+    """[checklist 2] spec.query_type accepted by exactly the families that
+    support it; builder and experiment mapping agree.
 
-    [fails now] expected: FAMILY_QUERY_TYPES in every experiment script maps each
-    family to the query type its builder accepts. currently the mapping is
-    duplicated in three scripts and disagrees for undo_chain, whose builder
-    requires 'count' but whose renderer emits a location question and a
-    container display name as gold.
+    Gap closed: renderer handles count for all families via count_query_target,
+    and this test uses SPEC/RQ1 entity counts (not STRUCTURAL_FAMILIES).
     """
     from experiments import rq1_mutation_depth as rq1
     from generator.trajectories import available_families
 
-    two_entity = set(STRUCTURAL_FAMILIES) | {"interleaved_chain"}
+    # Entity counts per SPEC §families and RQ1_FAMILIES (E=1: basic, revision,
+    # undo, undo_redo; E=2: split, merge, swap, interleaved). STRUCTURAL_FAMILIES
+    # mixes both, so it cannot drive E selection.
+    entity_for = {
+        "basic_chain": 1,
+        "revision": 1,
+        "undo_chain": 1,
+        "undo_redo_chain": 1,
+        "split_chain": 2,
+        "merge_chain": 2,
+        "swap_chain": 2,
+        "interleaved_chain": 2,
+    }
     for family in available_families():
         declared = rq1.FAMILY_QUERY_TYPES.get(family, "location")
-        entity_count = 2 if family in two_entity else 1
+        entity_count = entity_for[family]
         t = {"revision": 4, "split_chain": 4, "undo_chain": 4, "undo_redo_chain": 8}.get(family, 4)
         kwargs = {}
         if family == "interleaved_chain":

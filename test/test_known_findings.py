@@ -83,12 +83,10 @@ def test_f7_sampler_update_count_excludes_puts():
 
 
 def test_f8_characterize_V_counts_undo_twice():
-    """OPEN-4: one target-affecting Undo contributes to BOTH the revisit count and
-    history_reversal_count. Pins current behaviour; replace with the intended value
-    once SPEC.md defines V unambiguously."""
+    """D-022 resolves OPEN-4: V-once counts a target-affecting Undo once."""
     ops = [Put("o0", "key", "c0"), Move("o0", "c1"), Move("o0", "c2"), Undo()]
     m = measure_factors(ops, C3, "o0")
-    assert (m.T_actual, m.V_actual) == (3, 2)
+    assert (m.T_actual, m.V_actual) == (3, 1)
 
 
 @pytest.mark.parametrize("family,kw", [

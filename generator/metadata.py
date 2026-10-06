@@ -37,17 +37,20 @@ U
     SPEC symbol is materialised in the record rather than left implicit.
 
 V
-    Target-location revisits plus target-affecting history reversals.
-    NOT gated on exact equality by default — a caller that cares passes
-    ``min_v``/``intended_v`` to :func:`verify_factors`.
+    Post-setup ops putting the target at a previously occupied location,
+    counted once (D-022 resolves SPEC OPEN-4; SPEC §2 V-once). A MOVE back
+    counts once; a target-affecting UNDO/REDO counts once. V<=T holds by
+    construction (subset of T ops). NOT gated on exact equality by default
+    — a caller that cares passes ``min_v``/``intended_v`` to
+    :func:`verify_factors`.
 
-    IMPORTANT (SPEC OPEN-4): V is structurally nested inside T.
-    - Every target-location revisit is by definition a target-affecting update,
+    IMPORTANT: V is structurally nested inside T.
+    - Every counted revisit is by definition a target-affecting update,
       so V >= 1 implies T >= 2. V cannot be varied independently of T.
     - UNDO/Redo-based revision also consumes a target update slot.
     - Analysis of "revision effects" must condition on fixed T (e.g., compare
       accuracy at same T with/without revisits) rather than treating V as an
-      independent factor. See SPEC §8 for resolution.
+      independent factor.
 
 N
     Pure-text distractor sentences (zero state transitions).
@@ -289,30 +292,11 @@ def measure_factors(
     # Validate exhaustive T/D classification for every post-Put operation
     validate_t_d_classification_complete(ops, target_obj)
 
-    # PINNED DOUBLE-COUNT (SPEC OPEN-4, finding F8): a single target-affecting
-    # Undo/Redo lands in target_locations *and* in history_reversal_count, so it
-    # contributes 2 to V. The value is deliberately left as-is because changing
-    # it would move every V-derived result; SPEC §8 has not decided which of the
-    # two terms is wrong. test_f8_characterize_V_counts_undo_twice pins it.
-    V_actual = _count_revisits(target_locations) + history_reversal_count
-
-    # UNDO+REDO pair correction: when Redo immediately follows Undo on the
-    # same target, the Redo undoes the Undo's location change, creating a
-    # synthetic revisit. We subtract 1 per adjacent (Undo, Redo) pair where
-    # both affect the target, to maintain V <= T invariant.
-    # We detect this by checking if the target's location is the same before
-    # Undo and after Redo (the Redo restores what Undo changed).
-    _undo_redo_pairs = 0
-    for i in range(len(ops) - 1):
-        if isinstance(ops[i], Undo) and isinstance(ops[i + 1], Redo):
-            # Replay just these two operations to check if they affect target
-            # and if Redo restores the location Undo changed.
-            # Simpler: check if both are target-affecting via classify_op logic.
-            # Since we don't have state here, use a heuristic: if both are
-            # target-affecting in the full replay (which they are for
-            # undo_redo_chain), count the pair.
-            _undo_redo_pairs += 1
-    V_actual -= _undo_redo_pairs
+    # V-once (D-022 resolves SPEC OPEN-4): number of post-setup ops that put
+    # the target at a previously occupied location, counted once. A MOVE back
+    # counts once; a target-affecting UNDO/REDO counts once. V<=T holds by
+    # construction (subset of T ops). Replaces double-count + pair heuristic.
+    V_actual = _count_single_revisits(ops, containers, target_obj)
 
     L_word, N_actual = _measure_narrative(
         ops, sentences, textual_distractor_count
@@ -437,6 +421,42 @@ def _count_revisits(locations: List[str]) -> int:
     return revisit_count
 
 
+def _count_single_revisits(
+    ops: Sequence[Operation],
+    containers: Set[str],
+    target_obj: str,
+) -> int:
+    """V-once: post-setup ops landing target on a previously occupied location.
+
+    One replay pass; each target-affecting op with an actual location change
+    contributes at most 1. Split with no location change never counts.
+    """
+    from world import WorldState as _WS
+    from world import History as _H
+    from world import Put as _Put
+
+    state = _WS(object_type={}, location={}, containers=containers, step_index=0)
+    history = _H()
+    visited: Set[str] = set()
+    count = 0
+    for op in ops:
+        if isinstance(op, _Put):
+            state = apply_op(op, state, history)
+            if op.obj_id == target_obj:
+                visited.add(op.container)
+            continue
+        before = state.location.get(target_obj)
+        state = apply_op(op, state, history)
+        after = state.location.get(target_obj)
+        # Count once: target existed, actually moved, landed on prior location.
+        # Split source (before==after) and Split child (before None) never count.
+        if before is not None and before != after and after in visited:
+            count += 1
+        if before != after and after is not None:
+            visited.add(after)
+    return count
+
+
 # ============================================================
 # Count-query target (SPEC §2; single source of truth)
 # ============================================================
@@ -444,7 +464,9 @@ def _count_revisits(locations: List[str]) -> int:
 # Families whose count question is anchored on the Merge destination. For these,
 # a trace with no Merge cannot answer a count question, so the container is
 # reported as undetermined rather than silently guessed from the target.
-MERGE_ANCHORED_COUNT_FAMILIES = frozenset({"split_chain", "merge_chain"})
+# split_chain asks for the Split child's end container (D-020: child presence
+# depends on SPLIT by construction), not the Merge destination.
+MERGE_ANCHORED_COUNT_FAMILIES = frozenset({"merge_chain"})
 
 
 def count_query_target(
@@ -462,10 +484,19 @@ def count_query_target(
     of the rule, so a ``count`` cell could be rendered as a location question.
 
     Returns ``None`` when the container cannot be determined: a merge-anchored
-    family whose trace contains no ``Merge``. Callers decide what that means --
-    the renderer rejects the instance, the necessity check falls back to
-    comparing locations.
+    family whose trace contains no ``Merge``, or a split_chain trace with no
+    Split child. Callers decide what that means -- the renderer rejects the
+    instance, the necessity check falls back to comparing locations.
     """
+    if family == "split_chain":
+        for op in ops:
+            if isinstance(op, Split):
+                child = op.new_obj_id
+                container = final_state.location.get(child)
+                if container is None:
+                    return None
+                return container, final_state.object_type[target_obj]
+        return None
     for op in ops:
         if isinstance(op, Merge):
             return op.dst_container, final_state.object_type[target_obj]

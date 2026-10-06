@@ -594,11 +594,52 @@ directly:
 
 ---
 
+## D-020 — Split asks for the Split child's end container
+
+**Date:** 2026-10-06
+**Status:** in force
+**Cites:** SPEC §2, OPEN-19; user decision 2026-10-06
+
+`split_chain` count question asks for the container holding the Split child at
+the end (`query_container`), stored on the record. The child exists iff SPLIT
+ran, so necessity holds by construction: counts differ by exactly the child.
+Answer is 2 when target ends co-located, 1 when apart; builder varies pre/post
+moves at fixed T for ~50/50. E=2 means one PUT plus one Split child (SPEC P=1);
+E=3 traces rejected. `validate_structural_causality` takes `query_container`
+and reads the same `CountQuery` as the renderer. `count_query_target` returns
+child end for split_chain (merge-anchored set now merge_chain only).
+
+## D-021 — Undo variation without trailing MOVE; final==start rejected
+
+**Date:** 2026-10-06
+**Status:** in force
+**Cites:** user decision 2026-10-06
+
+No target MOVE after the UNDO block: absolute dst would erase Undo answer
+dependence, leaving only unplayable-counterfactual necessity (validity
+artifact). undo_chain samples k uniform {1,2,3} with k<=T-1, ending on Undo.
+Instance gate rejects final==start (stateless fix). UNDO-counting solvers
+reported as trivial-reader ceiling, as basic_chain last_move.
+
+## D-022 — V counts once; resolves OPEN-4
+
+**Date:** 2026-10-06
+**Status:** in force
+**Cites:** SPEC OPEN-4, F8; user decision 2026-10-06
+
+V = number of post-setup ops putting target at a previously occupied location,
+counted once. MOVE back counts once; target-affecting UNDO/REDO counts once;
+Split with no location change never counts. V<=T by construction; V>T warnings
+disappear. F8 pin recomputed (T=3,V=1). SPEC bumped 0.3.0->0.4.0 and
+`SPEC_VERSION` aligned so old records cannot mix. Unlocks 3U variants for
+undo_redo_chain.
+
+---
+
 ## Open items carried forward, not yet decided
 
 | Item | Question | Blocks |
 |---|---|---|
-| `SPEC.md` OPEN-4 / finding F8 | $V$ double-counts: one target-affecting `Undo` contributes to both the revisit count and the history-reversal count. Which term is wrong? | any $V$-derived result; `revision` factor sweep |
 | `SPEC.md` OPEN-5 | Two definitions of "target-relevant": state-change (`measure_factors`) vs syntactic (`query_analysis`) | query selection |
 | `SPEC.md` OPEN-3 / F7 | The sampler counts `Put` inside `update_count`; $U$ excludes `Put` | sampler vs factor contract |
 | `SPEC.md` OPEN-6 | Family registry lives in four places (`trajectories._CONSTRUCTORS`, `sampler._CONSTRUCTORS`, `FAMILY_TO_CAPABILITY_GROUP`, spec validation sets); currently equal, not enforced | family list consistency |
@@ -606,11 +647,11 @@ directly:
 | `SPEC.md` OPEN-12 | No independent factor/gold checker. `analysis/evaluate_existing_predictions.py` re-scores offline but never recomputes gold from the trace | release verification |
 | `SPEC.md` OPEN-15 (was OPEN-10 in this log) | `TrajectorySpec.revision_count` is never enforced nor checked against measured $V$ | `revision` factor sweep; the only non-`failsnow` test failure |
 | `SPEC.md` PARTIAL-10 | The leakage gate inspects only distractor-sentence tails, so it never fires on any RQ1 condition where $N=0$; suffix length is a code default, not a SPEC constant | answer-leakage gate |
-| `SPEC.md` OPEN-16 | `SPEC.md` declares `version: 0.3.0`; `generator/constants.py::SPEC_VERSION` is `"0.2.0-v2"` and stamps every record | data provenance |
+| `SPEC.md` OPEN-16 | Aligned at 0.4.0 by D-022; IMPLEMENTATION/EVIDENCE_AUDIT prose still cites the old pair | data provenance |
 | `SPEC.md` OPEN-17 | `T_min` means the requested target-update floor ($T$ = `target_updates`), and three families disagree with the validator: `split_chain` 2 vs 3, `merge_chain` 2 vs 1, `undo_redo_chain` 3 vs 6. `swap_chain` also asks for two containers here and three in `requirements.md` §4; only two are enforced | contract/code agreement |
 | `SPEC.md` OPEN-18 | `generator/structural.py:165-196` reads `counterfactual` after the loop that binds it, so every deletion of a required op being invalid turns into `UnboundLocalError`. Measured: `split_chain` accepted at `D=0`, rejected on all attempts at `D>=1` | structural gate for `split_chain`; `test/test_invariants.py` |
-| `SPEC.md` OPEN-19 | Count-query gold is implemented only for `split_chain`. `merge_chain`, `swap_chain`, `undo_chain` accept `query_type="count"` and emit a location question with location gold, and the record has no `query_type` field | RQ1 count cells; the red `test_questions_and_records.py` markers |
-| `SPEC.md` OPEN-20 | `merge_chain` cannot pass the gate: `verify_factors:T` fails on all 50 attempts at every `$T$` tested. The dry-run probe cannot detect it because `probe_reachability` stops at `build_trajectory` | RQ1 release grid — zero `merge_chain` records |
+| `SPEC.md` OPEN-19 | Count branch now generic via `count_query_target` and serialises `query_type`; merge/swap/undo count cells render count gold (D-020) | RQ1 count cells |
+| `SPEC.md` OPEN-20 | Stale as written: merge/swap pass at SPEC E=2; test grid used E=1. Probe already calls the full gate; dry-run test now forces E=1 FAIL | RQ1 release grid |
 | `SPEC.md` §2 wording | $T$ is specified as ops that "change the target's **location**"; the code and D-005 say "state **or** location". A `Remove` is $T$ in code but reads as no-change under the literal SPEC wording | SPEC text needs one word changed |
 | `run_eval.py` dataset map | The help text advertises an `rq3` shortcut with no entry in the dataset map | CLI surface |
 | `generate_all.py` bookkeeping | Expected RQ2 record count is 700; the RQ2 script plans 350, and the declared count is never read | reported totals only |

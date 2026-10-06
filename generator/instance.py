@@ -238,12 +238,13 @@ def _failure(
     )
 
 
-def _requested_factors(spec: TrajectorySpec) -> Dict[str, int]:
+def _requested_factors(spec: TrajectorySpec, n: int = 0) -> Dict[str, int]:
     """The designed factors, read off the spec and therefore never trusted."""
     return {
         "E": spec.entity_count,
         "T": spec.target_updates,
         "D": spec.distractor_updates,
+        "N": n,
     }
 
 
@@ -389,7 +390,7 @@ def build_validated_instance(
         ``record`` on success, ``failure`` on rejection. Neither a bare
         ``ValueError`` nor a silent skip.
     """
-    requested = _requested_factors(spec)
+    requested = _requested_factors(spec, textual_distractor_count)
     gate_requested = _gate_request(requested, min_v, intended_v)
 
     # --------------------------------------------------------
@@ -513,11 +514,21 @@ def build_validated_instance(
     # --------------------------------------------------------
 
     try:
+        _qc: str | None = None
+        if spec.query_type == "count":
+            _ct = count_query_target(
+                spec.family,
+                trajectory.ops,
+                trajectory.final_state,
+                trajectory.target_obj,
+            )
+            _qc = _ct[0] if _ct is not None else None
         validate_structural_causality(
             trajectory.ops,
             trajectory.containers,
             trajectory.target_obj,
             spec,
+            query_container=_qc,
         )
     except Exception as exc:
         return InstanceResult(
@@ -544,6 +555,49 @@ def build_validated_instance(
         return InstanceResult(
             failure=_failure(CHECK_FACTORS, spec, instance_id, exc, gate_requested, measured_view)
         )
+
+    # Structural invariant V <= T (checklist 2 failsnow): V counts revisits
+    # plus target-affecting reversals, so 2-container oscillation plus
+    # Undo/Redo can yield V=T+1 (e.g. undo_redo_chain T=8 seed 41). Reject
+    # here so build_record retries; verify_factors keeps its diagnostic
+    # warning for direct calls (see test_verify_factors_warns_on_V_exceeds_T).
+    if measured.V_actual > measured.T_actual:
+        return InstanceResult(
+            failure=_failure(
+                CHECK_FACTORS,
+                spec,
+                instance_id,
+                AssertionError(
+                    f"[{instance_id}] measured V_actual={measured.V_actual} "
+                    f"> T_actual={measured.T_actual} (family={spec.family!r})",
+                ),
+                gate_requested,
+                measured_view,
+            )
+        )
+
+    # Undo families: reject final==start (D-021 stateless fix), except at the
+    # T minimum where no alternative shape exists (undo_chain T=2 is one move
+    # plus one undo and always returns to start; documented ceiling).
+    if spec.family in ("undo_chain", "undo_redo_chain") and spec.target_updates > 2:
+        start_c = next(
+            (op.container for op in trajectory.ops if isinstance(op, Put)),
+            None,
+        )
+        final_c = trajectory.final_state.location.get(trajectory.target_obj)
+        if start_c is not None and final_c == start_c:
+            return InstanceResult(
+                failure=_failure(
+                    CHECK_FACTORS,
+                    spec,
+                    instance_id,
+                    AssertionError(
+                        f"[{instance_id}] final {final_c!r} == start (family={spec.family!r})",
+                    ),
+                    gate_requested,
+                    measured_view,
+                )
+            )
 
     # --------------------------------------------------------
     # 4c. Rendered $L_{word}$ ceiling $L_{max}$ (RESOLVED-1).

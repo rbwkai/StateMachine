@@ -97,11 +97,23 @@ def validate_structural_causality(
     containers: Set[str],
     target_obj: str,
     spec: TrajectorySpec,
+    query_container: str | None = None,
 ) -> None:
     family = spec.family
     if family not in REQUIRED_STRUCTURAL_OPS:
         return
     required = REQUIRED_STRUCTURAL_OPS[family]
+
+    # D-020: E=2 means one PUT plus one Split child for split_chain; reject
+    # E=3 crafted variants (extra companion PUT) as invalid spec.
+    from .metadata import _count_entity_ids
+
+    if _count_entity_ids(ops) != spec.entity_count:
+        raise ValueError(
+            f"structural causality failure: family={family!r}, "
+            f"check=entity_count mismatch "
+            f"(got {_count_entity_ids(ops)}, expected {spec.entity_count})"
+        )
 
     trace, final_state, _ = replay_trace(ops, containers)
     index_from = _first_post_setup_index(trace, target_obj)
@@ -143,11 +155,18 @@ def validate_structural_causality(
             # the rendered gold can never drift apart. A merge-anchored family
             # whose trace has no Merge leaves the container undetermined, and a
             # trace that cannot answer its own question has nothing to compare.
-            count_target = (
-                count_query_target(family, ops, final_state, target_obj)
-                if spec.query_type == "count"
-                else None
-            )
+            if spec.query_type == "count":
+                if query_container is not None:
+                    count_target = (
+                        query_container,
+                        final_state.object_type[target_obj],
+                    )
+                else:
+                    count_target = count_query_target(
+                        family, ops, final_state, target_obj
+                    )
+            else:
+                count_target = None
             if count_target is not None:
                 count_container, count_type = count_target
                 gold_final = gold_count(final_state, count_container, count_type)

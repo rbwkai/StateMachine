@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import random
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -499,17 +499,10 @@ def build_interleaved_chain(
     # Controlled interleaving - generate target trajectory FIRST
     # --------------------------------------------------------
 
-    # Derive a deterministic target seed from FIXED parameters only
-    # (family, target_updates, entity_count, num_containers) so that
-    # the target trajectory is identical across matched conditions
-    # with different distractor_updates or textual_distractor_count.
-    target_seed = int(
-        hashlib.sha256(
-            f"{spec.family}|T{spec.target_updates}|E{spec.entity_count}|C{spec.num_containers}|target"
-            .encode()
-        ).hexdigest()[:8],
-        16,
-    )
+    # Derive a deterministic target seed mixing instance RNG so paths vary
+    # across seeds but remain invariant to distractor/text changes when the
+    # same RNG seed is used with different spec params (excluding those params).
+    target_seed = rng.getrandbits(32)
     target_rng = random.Random(target_seed)
 
     # Generate target trajectory independently using target_rng
@@ -597,6 +590,43 @@ def build_interleaved_chain(
 # Revision
 # ============================================================
 
+def _revision_walk(rng: random.Random, containers: list, start: str, T: int, tries: int = 200) -> list:
+    """Random walk with at least one revisit, final != start, final not most-mentioned.
+
+    Falls back to revisit-only when containers==2 makes strict impossible
+    (alternation forces final==start on even T).
+    """
+    def genuine(path: list) -> bool:
+        return any(
+            path[i] == path[j]
+            for i in range(len(path))
+            for j in range(i + 2, len(path))
+        )
+
+    fallback = None
+    for _ in range(tries):
+        cur, path = start, []
+        for _ in range(T):
+            cur = rng.choice([c for c in containers if c != cur])
+            path.append(cur)
+        if not genuine(path):
+            continue
+        if fallback is None:
+            fallback = list(path)
+        visited = [start] + path
+        counts = Counter(visited)
+        # most-mentioned constraint only when satisfiable (T>=4 with 3+
+        # containers; at T=3 any genuine [a,b,a] ends on its own max).
+        need_balance = not (T < 4 or len(containers) < 3)
+        if path[-1] != start and (
+            not need_balance or counts[path[-1]] < max(counts.values())
+        ):
+            return path
+    if fallback is not None:
+        return fallback
+    raise ValueError("no valid revision walk")
+
+
 def build_revision(
     rng: random.Random,
     spec: TrajectorySpec,
@@ -660,38 +690,11 @@ def build_revision(
         start_container,
     )
 
-    # --------------------------------------------------------
-    # Explicit revision pattern over permuted containers
-    # --------------------------------------------------------
+    # Random walk with rejection: at least one revisit, final != start,
+    # final not most-mentioned. Breaks stateless/last-move shortcuts.
+    path = _revision_walk(rng, container_list, start_container, spec.target_updates)
 
-    revision_pattern = [
-        perm[1],
-        perm[2 % len(perm)],
-        perm[1],
-        perm[0],
-        perm[2 % len(perm)],
-        perm[0],
-    ]
-
-    current = start_container
-
-    for i in range(spec.target_updates):
-
-        destination = revision_pattern[
-            i % len(revision_pattern)
-        ]
-
-        # Defensive no-op prevention.
-        if destination == current:
-
-            candidates = [
-                c
-                for c in container_list
-                if c != current
-            ]
-
-            destination = rng.choice(candidates)
-
+    for destination in path:
         state = _move(
             state,
             history,
@@ -699,8 +702,6 @@ def build_revision(
             target,
             destination,
         )
-
-        current = destination
 
     return ConstructedTrajectory(
         ops=ops,
@@ -783,24 +784,21 @@ def build_split_chain(
     )
 
     # --------------------------------------------------------
-    # Pre-split: move target to c1
+    # Pre-split moves: random count so post-merge count varies 50/50.
+    # T = pre + Split + Merge + post; pre uniform in [0, T-2] gives
+    # co-located (post even/return) vs apart variety at fixed T.
     # --------------------------------------------------------
 
-    pre_split_candidates = [
-        c for c in container_list if c != start_c
-    ]
-    c1 = rng.choice(pre_split_candidates)
-
-    state = _move(
-        state,
-        history,
-        ops,
-        target,
-        c1,
-    )
-
-    target_current = c1
-    target_updates_done = 1
+    pre_count = rng.randrange(0, spec.target_updates - 1)
+    target_current = start_c
+    target_updates_done = 0
+    for _ in range(pre_count):
+        candidates = [c for c in container_list if c != target_current]
+        dst = rng.choice(candidates)
+        state = _move(state, history, ops, target, dst)
+        target_current = dst
+        target_updates_done += 1
+    c1 = target_current
 
     # --------------------------------------------------------
     # Split: child spawns at the same container as target (c1)
@@ -837,26 +835,40 @@ def build_split_chain(
     target_updates_done += 1
 
     # --------------------------------------------------------
-    # Additional target moves if needed (after merge)
+    # Additional target moves: 50/50 co-located vs apart at fixed T.
+    # post==0 forces co-located, post==1 forces apart; otherwise sample
+    # flag first then rejection-sample a walk ending as flagged.
     # --------------------------------------------------------
 
-    while target_updates_done < spec.target_updates:
-        candidates = [
-            c for c in container_list if c != target_current
-        ]
-
-        dst = rng.choice(candidates)
-
-        state = _move(
-            state,
-            history,
-            ops,
-            target,
-            dst,
-        )
-
-        target_current = dst
-        target_updates_done += 1
+    post_needed = spec.target_updates - target_updates_done
+    if post_needed > 0:
+        if post_needed == 1:
+            want_together = False
+        elif target_current == child_current:
+            # post==0 handled (loop skipped); here post>=2 from same spot:
+            # either ending reachable; sample 50/50.
+            want_together = rng.choice([True, False])
+        else:
+            want_together = rng.choice([True, False])
+        chosen = None
+        for _ in range(50):
+            cur, path = target_current, []
+            for _ in range(post_needed):
+                cur = rng.choice([c for c in container_list if c != cur])
+                path.append(cur)
+            if (path[-1] == child_current) == want_together:
+                chosen = path
+                break
+        if chosen is None:
+            # Fallback: pure random walk (keeps T exact deterministically).
+            cur, chosen = target_current, []
+            for _ in range(post_needed):
+                cur = rng.choice([c for c in container_list if c != cur])
+                chosen.append(cur)
+        for dst in chosen:
+            state = _move(state, history, ops, target, dst)
+            target_current = dst
+            target_updates_done += 1
 
     # --------------------------------------------------------
     # Distractor: move child
@@ -1348,13 +1360,17 @@ def build_undo_chain(
     target_current = target_start
     updates_done = 0
 
-    # All target Moves precede the Undo, so the trace ends on the Undo. A
-    # trailing ordinary Move after the Undo trips check 5 ("no trailing
-    # ordinary move"), which made every generated chain get rejected and forced
-    # the generator to retry until a short chain happened to fit -- mean 12.9
-    # attempts at T=16. Reaching the requested T before the Undo also keeps T
-    # exact: target_updates - 1 Moves plus the Undo.
-    for _ in range(spec.target_updates - 1):
+    # Uniform k in {1,2,3} with k<=T-1 and k<moves (strict: k==moves
+    # always returns to start and trips the final==start gate, collapsing
+    # variation to k=1). T=4 admits k=1 only: penultimate ceiling documented.
+    allowed = [
+        x for x in (1, 2, 3)
+        if x <= spec.target_updates - 1 and x < spec.target_updates - x
+    ]
+    if not allowed:
+        allowed = [1]
+    k = rng.choice(allowed)
+    for _ in range(spec.target_updates - k):
         candidates = [c for c in container_list if c != target_current]
         if not candidates:
             break
@@ -1363,11 +1379,10 @@ def build_undo_chain(
         target_current = dst
         updates_done += 1
 
-    # Undo operation: the final, and only acceptable, last target-affecting op.
-    state = _undo(state, history, ops)
-    # Read actual target location from state after Undo (not assumed target_start)
-    target_current = state.location.get(target, target_start)
-    updates_done += 1
+    for _ in range(k):
+        state = _undo(state, history, ops)
+        target_current = state.location.get(target, target_start)
+        updates_done += 1
 
     return ConstructedTrajectory(
         ops=ops,
@@ -1450,7 +1465,9 @@ def build_undo_redo_chain(
     target_current = target_start
     updates_done = 0
 
-    # Extra moves before the causal 3-move sequence
+    # 2U2R breaks every-required-op necessity (extra Redo goes invalid when
+    # an Undo is removed), so keep 2U1R only; penultimate reported as ceiling.
+    variant = "2U1R"
     extra_moves = spec.target_updates - 6
     for _ in range(extra_moves):
         candidates = [c for c in container_list if c != target_current]

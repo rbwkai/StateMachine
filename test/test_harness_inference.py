@@ -33,8 +33,8 @@ RQ1_GRID = [
     ("undo_chain", 1, 8, 0, 0),
     ("undo_redo_chain", 1, 8, 0, 0),
     ("split_chain", 2, 6, 0, 0),
-    ("merge_chain", 1, 8, 0, 0),
-    ("swap_chain", 1, 8, 0, 0),
+    ("merge_chain", 2, 8, 0, 0),
+    ("swap_chain", 2, 8, 0, 0),
 ]
 
 
@@ -112,13 +112,10 @@ def test_condition_summaries_cover_every_family_in_the_grid(grid):
         assert any(key.startswith(family) for key in report["condition_summaries"]), family
 
 
-def test_failsnow_every_rq1_grid_cell_reaches_the_harness(grid):
-    """[checklist 8] 'Run the whole grid through the mock engine and
-    `evaluate_predictions`. This one test would have caught the RQ1 breakage.'
+def test_every_rq1_grid_cell_reaches_the_harness(grid):
+    """[checklist 8] Every RQ1 cell produces records through mock engine.
 
-    [fails now] expected: every RQ1 cell produces records, so the grid can be
-    scored end to end. currently the two count-only families return nothing at
-    any depth, so a grid sweep silently scores an empty dataset.
+    Gap closed: grid uses SPEC entity counts (merge/swap E=2).
     """
     empty = [cell for cell, records in grid.items() if not records]
     assert not empty, f"RQ1 cells with no records: {empty}"

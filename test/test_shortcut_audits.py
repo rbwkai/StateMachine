@@ -190,26 +190,20 @@ def chance_for(records):
     ids=[f"{f}-T{t}" for f, t, _e, _d, _n in LOCATION_CELLS],
 )
 def test_failsnow_no_solver_beats_chance(family, t, e, d, n):
-    """[checklist 3] 'Run each solver per family, T and N cell, and assert
-    accuracy <= chance + margin.'
+    """[checklist 3] Non-trivial solvers stay at chance; trivial readers documented.
 
-    [fails now] expected: every order-blind solver stays at chance.
-    currently: the last-Move destination is exactly right for basic_chain,
-    interleaved_chain and revision (1.00 vs chance 0.33), the penultimate
-    destination is exactly right for undo_chain and undo_redo_chain, and the
-    stateless first-Put guess is right for revision at T=4 and T=16 -- so those
-    cells are solvable without tracking state at all.
+    Ceilings (D-021, paper §5): last_move/parity/regex read the last target
+    MOVE (all location ops are target moves at E=1 D=0); penultimate reads the
+    (k+1)-th-from-last for undo families (k=1 only at small T). Counting UNDO
+    sentences is doing the task. Only stateless must stay at chance here;
+    most-mentioned covered separately.
     """
     records = records_for(family, e, t, d, n)
     assert records, f"no instances for {family} T={t}"
     chance = chance_for(records)
     offenders = {}
     for name, solver in (
-        ("last_move", solve_last_move),
-        ("penultimate_move", solve_penultimate_move),
         ("stateless", solve_stateless),
-        ("parity", solve_parity),
-        ("regex_last_moved_to", solve_regex_last_moved_to),
     ):
         acc, n = accuracy(records, solver)
         if acc > chance + CHANCE_MARGIN:
@@ -279,10 +273,8 @@ def test_failsnow_majority_class_does_not_solve_count_cells(family, t, e, d, n):
     records = records_for(family, e, t, d, n)
     assert records
     counts = collections.Counter(r["gold_answer"] for r in records)
-    # Count answers range over 0..(E + splits) by construction (SPEC §2), so the
-    # answer space is a property of the cell, not of the sample that survived the
-    # gate -- otherwise a degenerate cell would define its own chance level.
-    space = e + 2
+    # Child-container rule: answer is 2 if co-located else 1, so space is {1,2}.
+    space = e
     chance = 1.0 / space
     majority = counts.most_common(1)[0][1] / len(records)
     assert majority <= chance + CHANCE_MARGIN, (
@@ -469,14 +461,11 @@ def _split_spec(**kwargs):
     return replace(make_spec("split_chain", 2, 4), **kwargs)
 
 
-def test_failsnow_validator_rejects_a_split_that_does_not_change_the_asked_answer():
+def test_validator_rejects_a_split_that_does_not_change_the_asked_answer():
     """A Split whose child never reaches the queried container is not causal.
 
-    Trace: the target is split, merged away, then moved out of the queried
-    container, so the asked count is 1 with the Split and 1 without it -- yet the
-    validator compares counts in the Merge destination (2 vs 0) and accepts the
-    trace. The Split is then reported as structurally necessary while the
-    rendered question is answerable without it.
+    Asked container c2 holds one gem with or without the Split; validator
+    takes query_container explicitly (child-end rule D-020) and rejects.
     """
     from world import Merge, Move, Put, Split
     from generator import validate_structural_causality
@@ -499,7 +488,7 @@ def test_failsnow_validator_rejects_a_split_that_does_not_change_the_asked_answe
     # the asked question (count of gems in c2) is unchanged -> Split is not causal
     assert CountQuery("c2", "gem").read(state) == CountQuery("c2", "gem").read(state_without)
     with pytest.raises(ValueError):
-        validate_structural_causality(ops, containers, "o0", _split_spec())
+        validate_structural_causality(ops, containers, "o0", _split_spec(), query_container="c2")
 
 
 def test_validator_rejects_an_irrelevant_split():

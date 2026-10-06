@@ -34,6 +34,17 @@ class BaselineResult:
     baseline_type: str
 
 
+def condition_key_of(instance: Dict[str, Any]) -> str:
+    """Per-condition bucket: family + T + D + E + N (D-020 follow-up)."""
+    factors = instance.get("requested_factors", {})
+    measured = instance.get("measured_factors", {})
+    n = factors.get("N", measured.get("N_actual", 0)) or 0
+    return (
+        f"{instance.get('family')}_T{factors.get('T')}"
+        f"_D{factors.get('D', 0)}_E{factors.get('E', 1)}_N{n}"
+    )
+
+
 def query_type_of(instance: Dict[str, Any]) -> str:
     """Resolve the query type of an instance record.
 
@@ -59,6 +70,8 @@ def chance_level(instance: Dict[str, Any]) -> float:
     hard-coded 1/3.
     """
     if query_type_of(instance) == "count":
+        if instance.get("family") == "split_chain":
+            return 1.0 / 2  # D-020 child-container rule: answer in {1, 2}
         splits = sum(
             1
             for op in (instance.get("canonical_trace") or [])
@@ -158,36 +171,57 @@ def compute_mfc_baseline(instances: Sequence[Dict[str, Any]]) -> List[BaselineRe
     """
     Most-Frequent-Class (MFC) baseline: always predict the most common gold answer.
 
-    Computed per condition (family + T + D) to avoid leakage across conditions.
-    Uses normalized gold answers (container IDs) to avoid per-instance display name randomization.
+    Computed per condition (family + T + D + E + N) to avoid leakage across
+    conditions. Groups on display-mapped answers so extraction accepts them.
     """
     # Group by condition
     from collections import defaultdict
     cond_instances: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    
+
+    def _cond_key(inst: Dict[str, Any]) -> str:
+        return condition_key_of(inst)
+
     for inst in instances:
-        factors = inst.get("requested_factors", {})
-        cond_key = f"{inst.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
-        cond_instances[cond_key].append(inst)
+        cond_instances[_cond_key(inst)].append(inst)
     
-    # Find MFC per condition using normalized gold answers
+    # Find MFC per condition on container IDs (display names are randomized
+    # per instance, so voting on raw gold would never agree). Reverse each
+    # instance's ID->display map to ballot the ID; digits pass through.
+    def _ballot(inst: Dict[str, Any]) -> str:
+        gold = str(inst.get("gold_answer", "")).strip()
+        if gold.isdigit():
+            return gold
+        names = (inst.get("final_state", {}) or {}).get(
+            "container_display_names"
+        ) or (inst.get("final_state", {}) or {}).get("container_names") or {}
+        rev = {v: k for k, v in names.items()} if isinstance(names, dict) else {}
+        return rev.get(gold, normalize_text(gold))
+
     cond_mfc: Dict[str, str] = {}
     for cond_key, cond_insts in cond_instances.items():
-        answers = [normalize_text(inst.get("gold_answer", "")) for inst in cond_insts if inst.get("gold_answer")]
+        answers = [_ballot(i) for i in cond_insts if i.get("gold_answer")]
+        answers = [a for a in answers if a]
         if answers:
             cond_mfc[cond_key] = Counter(answers).most_common(1)[0][0]
         else:
             cond_mfc[cond_key] = ""
     
-    # Apply MFC prediction
+    # Apply MFC prediction, mapped to display names like stateless does so
+    # extraction accepts the prediction against the candidate list.
     results: List[BaselineResult] = []
     for inst in instances:
         iid = inst["instance_id"]
         gold = str(inst.get("gold_answer", "")).strip()
-        
-        factors = inst.get("requested_factors", {})
-        cond_key = f"{inst.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
+
+        cond_key = _cond_key(inst)
         pred = cond_mfc.get(cond_key, "")
+        if pred and not pred.isdigit():
+            final_state = inst.get("final_state", {})
+            names = final_state.get("container_names") or final_state.get(
+                "container_display_names"
+            )
+            if isinstance(names, dict):
+                pred = names.get(pred, pred)
         
         cands = candidate_answers(inst, dataset_context=list(instances))
         formatted_pred = f"Final Answer: {pred}" if pred else ""
@@ -255,8 +289,7 @@ def _summarize_per_condition(
     cond_results: Dict[str, List[BaselineResult]] = defaultdict(list)
     for inst in instances:
         iid = inst["instance_id"]
-        factors = inst.get("requested_factors", {})
-        cond_key = f"{inst.get('family')}_T{factors.get('T')}_D{factors.get('D', 0)}"
+        cond_key = condition_key_of(inst)
         # Find matching result
         for r in results:
             if r.instance_id == iid:

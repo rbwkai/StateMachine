@@ -26,7 +26,7 @@ from typing import Tuple
 # SPEC.md frontmatter `version:`; bump them with the SPEC version.
 # ============================================================
 
-SPEC_VERSION: str = "0.2.0-v2"
+SPEC_VERSION: str = "0.4.0"
 GENERATOR_VERSION: str = SPEC_VERSION
 RENDERER_VERSION: str = SPEC_VERSION
 SCORING_VERSION: str = SPEC_VERSION

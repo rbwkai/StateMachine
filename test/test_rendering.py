@@ -118,6 +118,8 @@ def test_question_names_the_target_like_the_narrative(family, e, t, d):
         # "letter" where the question says "the duplicate key"/"letters".
         content = re.sub(r"^(a|an|the)\s+", "", phrase.lower()).strip()
         candidates = {content}
+        if content.endswith("es"):
+            candidates.add(content[:-2])
         if content.endswith("s"):
             candidates.add(content[:-1])
         narrative = " ".join(record["sentences"]).lower()
