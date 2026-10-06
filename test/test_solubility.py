@@ -77,7 +77,9 @@ def test_high_candidate_count_warns() -> None:
     inst["step_wise_gold_answers"] = [f"container {i}" for i in range(10)]
     result = check_answer_uniqueness(inst)
     
-    assert any("High candidate count" in issue for issue in result.issues)
+    # A large answer space is reported, but is not a solubility defect.
+    assert any("High candidate count" in w for w in result.warnings)
+    assert not any("High candidate count" in issue for issue in result.issues)
 
 
 def test_run_solubility_audit() -> None:

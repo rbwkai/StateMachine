@@ -89,12 +89,20 @@ def build_paraphrase_prompt(
 
 @dataclass
 class RobustnessResult:
-    """Result of a robustness check."""
+    """Result of a robustness check for one instance.
+
+    ``gap`` is the per-instance robustness gap:
+    - prompt sensitivity: max(acc) - min(acc) over ALL variants, so a wrong
+      baseline with a right variant counts as sensitivity too (always >= 0);
+    - paraphrase: orig_acc - para_acc, SIGNED in {-1, 0, 1}; -1 is a gain
+      (paraphrase right, original wrong). ``is_robust`` uses |gap|, so gains
+      and drops are both instability.
+    """
     instance_id: str
     baseline_accuracy: float
     variant_accuracies: Dict[str, float]
-    gap: float  # baseline - min(variant)
-    is_robust: bool  # gap < threshold
+    gap: float
+    is_robust: bool  # abs(gap) < threshold
 
 
 def evaluate_prompt_sensitivity(
@@ -130,9 +138,11 @@ def evaluate_prompt_sensitivity(
         accuracies[name] = 1.0 if extraction.strict_correct else 0.0
     
     baseline_acc = accuracies.get("v2_standard", 0.0)
-    min_acc = min(accuracies.values()) if accuracies else 0.0
-    gap = baseline_acc - min_acc
-    
+    # Spread over every variant, baseline included: "v2_standard minus min"
+    # was 0 whenever the baseline was wrong, hiding baseline-wrong /
+    # variant-right sensitivity.
+    gap = (max(accuracies.values()) - min(accuracies.values())) if accuracies else 0.0
+
     return RobustnessResult(
         instance_id=instance["instance_id"],
         baseline_accuracy=baseline_acc,
@@ -189,14 +199,16 @@ def evaluate_paraphrase_robustness(
     )
     para_acc = 1.0 if para_extraction.strict_correct else 0.0
     
+    # Signed: +1 drop, -1 gain. Robustness is judged on |gap| so a gain
+    # (an equally unstable outcome) no longer passes as robust.
     gap = orig_acc - para_acc
-    
+
     return RobustnessResult(
         instance_id=instance["instance_id"],
         baseline_accuracy=orig_acc,
         variant_accuracies={"original": orig_acc, "paraphrased": para_acc},
         gap=gap,
-        is_robust=gap < threshold,
+        is_robust=abs(gap) < threshold,
     )
 
 
@@ -214,19 +226,51 @@ def run_robustness_suite(
         prompt_results.append(evaluate_prompt_sensitivity(inst, predict_fn, chain_of_thought, threshold))
         paraphrase_results.append(evaluate_paraphrase_robustness(inst, predict_fn, chain_of_thought, threshold))
     
-    # Aggregate
-    def summarize(results: List[RobustnessResult]) -> Dict[str, float]:
-        if not results:
-            return {"mean_gap": 0.0, "robust_rate": 0.0, "max_gap": 0.0}
-        return {
-            "mean_gap": sum(r.gap for r in results) / len(results),
-            "robust_rate": sum(1 for r in results if r.is_robust) / len(results),
-            "max_gap": max(r.gap for r in results),
-        }
-    
     return {
-        "prompt_sensitivity": summarize(prompt_results),
-        "paraphrase_robustness": summarize(paraphrase_results),
+        "prompt_sensitivity": _summarize_prompt(prompt_results),
+        "paraphrase_robustness": _summarize_paraphrase(paraphrase_results),
         "per_instance_prompt": [vars(r) for r in prompt_results],
         "per_instance_paraphrase": [vars(r) for r in paraphrase_results],
+    }
+
+
+def _summarize_prompt(results: List[RobustnessResult]) -> Dict[str, float]:
+    """Aggregate prompt sensitivity.
+
+    ``mean_gap`` (== ``mean_sensitivity``) is the mean per-instance spread
+    max(acc) - min(acc) over all variants; it is non-negative.
+    """
+    if not results:
+        return {"mean_gap": 0.0, "mean_sensitivity": 0.0, "robust_rate": 0.0, "max_gap": 0.0}
+    n = len(results)
+    mean = sum(r.gap for r in results) / n
+    return {
+        "mean_gap": mean,
+        "mean_sensitivity": mean,
+        "robust_rate": sum(1 for r in results if r.is_robust) / n,
+        "max_gap": max(r.gap for r in results),
+    }
+
+
+def _summarize_paraphrase(results: List[RobustnessResult]) -> Dict[str, float]:
+    """Aggregate paraphrase robustness.
+
+    ``mean_gap`` is SIGNED (mean of orig - para): drops and gains cancel, so it
+    measures net accuracy change only. Instability is ``drop_rate`` (orig right,
+    para wrong) + ``gain_rate`` (orig wrong, para right) == ``mean_abs_gap``.
+    ``max_gap`` is max |gap|. ``robust_rate`` is the share with |gap| < threshold.
+    """
+    if not results:
+        return {
+            "mean_gap": 0.0, "mean_abs_gap": 0.0, "drop_rate": 0.0,
+            "gain_rate": 0.0, "robust_rate": 0.0, "max_gap": 0.0,
+        }
+    n = len(results)
+    return {
+        "mean_gap": sum(r.gap for r in results) / n,
+        "mean_abs_gap": sum(abs(r.gap) for r in results) / n,
+        "drop_rate": sum(1 for r in results if r.gap > 0) / n,
+        "gain_rate": sum(1 for r in results if r.gap < 0) / n,
+        "robust_rate": sum(1 for r in results if r.is_robust) / n,
+        "max_gap": max(abs(r.gap) for r in results),
     }
